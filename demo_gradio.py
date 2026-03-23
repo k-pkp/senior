@@ -15,10 +15,16 @@ from datetime import datetime
 import glob
 import gc
 import time
+import io
+from contextlib import redirect_stdout, redirect_stderr
 
 sys.path.append("vggt/")
+sys.path.append("clean")
 
-from visual_util import predictions_to_glb
+from visual_util import predictions_to_glb, export_point_cloud_to_ply
+from clean_ply import clean_point_cloud
+from recons import reconstruct_mesh
+from com_vol import compute_volume_from_mesh
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -175,9 +181,302 @@ def update_gallery_on_upload(input_video, input_images):
     If nothing is uploaded, returns "None" and empty list.
     """
     if not input_video and not input_images:
-        return None, None, None, None
+        return None, None, None, None, "Pipeline idle.", None, None, {"next_step": -1}
     target_dir, image_paths = handle_uploads(input_video, input_images)
-    return None, target_dir, image_paths, "Upload complete. Click 'Reconstruct' to begin 3D processing."
+    return (
+        None,
+        target_dir,
+        image_paths,
+        "Upload complete. Click 'Reconstruct' to begin 3D processing.",
+        "GLB step not started. Click Reconstruct.",
+        None,
+        None,
+        {"next_step": -1},
+    )
+
+
+def update_gallery_on_upload_with_logs(input_video, input_images):
+    """Capture upload handler terminal logs into UI log panel."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer), redirect_stderr(buffer):
+        recon, target_dir, gallery, log_msg, volume_msg, mesh_file, mesh_view, state = update_gallery_on_upload(
+            input_video, input_images
+        )
+    combined_log = f"{log_msg}\n\n{_format_terminal_log(buffer.getvalue())}"
+    return recon, target_dir, gallery, combined_log, volume_msg, mesh_file, mesh_view, state
+
+
+def run_volume_pipeline(
+    predictions,
+    target_dir,
+    conf_thres,
+    frame_filter,
+    mask_black_bg,
+    mask_white_bg,
+    mask_sky,
+    prediction_mode,
+    cube_size_cm,
+):
+    """Run clean/reconstruct/volume pipeline and return final volume message and mesh PLY path."""
+    clean_base_dir = "clean"
+    input_dir = os.path.join(clean_base_dir, "input")
+    clean_input_dir = os.path.join(clean_base_dir, "clean_input_ply")
+    output_dir = os.path.join(clean_base_dir, "output_ply")
+
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(clean_input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Step 2: Save as clean/input/input.ply
+    input_ply_path = os.path.join(input_dir, "input.ply")
+    export_point_cloud_to_ply(
+        predictions,
+        input_ply_path,
+        conf_thres=conf_thres,
+        filter_by_frames=frame_filter,
+        mask_black_bg=mask_black_bg,
+        mask_white_bg=mask_white_bg,
+        mask_sky=mask_sky,
+        target_dir=target_dir,
+        prediction_mode=prediction_mode,
+    )
+
+    # Step 3: Clean point cloud and save to clean_input_ply
+    cleaned_ply_path = clean_point_cloud(
+        input_path=input_ply_path,
+        output_folder=clean_input_dir,
+        output_name="clean_input.ply",
+    )
+
+    # Step 4: Reconstruct and save to output_ply (PLY + STL)
+    mesh_ply_path, _ = reconstruct_mesh(
+        input_path=cleaned_ply_path,
+        output_folder=output_dir,
+        base_name="input",
+    )
+
+    # Step 5: Compute volume from reconstructed mesh (PLY)
+    volume_result = compute_volume_from_mesh(
+        mesh_path=mesh_ply_path,
+        reference_ply_path=cleaned_ply_path,
+        real_cube_size_m=float(cube_size_cm) / 100.0,
+    )
+
+    volume_msg = (
+        f"Volume result: {volume_result['real_volume_cm3']:.2f} cm^3 "
+        f"({volume_result['real_volume_m3']:.6f} m^3). "
+        f"Scale factor: {volume_result['scale_factor']:.6f}. "
+        f"Watertight: {volume_result['is_watertight']}"
+    )
+
+    return volume_msg, mesh_ply_path
+
+
+def init_pipeline_state(target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, mask_sky, prediction_mode, cube_size_cm):
+    """Initialize step state right after GLB is generated."""
+    return {
+        "next_step": 0,
+        "target_dir": target_dir,
+        "conf_thres": conf_thres,
+        "frame_filter": frame_filter,
+        "mask_black_bg": mask_black_bg,
+        "mask_white_bg": mask_white_bg,
+        "mask_sky": mask_sky,
+        "prediction_mode": prediction_mode,
+        "cube_size_cm": cube_size_cm,
+        "input_ply_path": None,
+        "cleaned_ply_path": None,
+        "mesh_ply_path": None,
+    }
+
+
+def _prepare_step_paths():
+    clean_base_dir = "clean"
+    input_dir = os.path.join(clean_base_dir, "input")
+    clean_input_dir = os.path.join(clean_base_dir, "clean_input_ply")
+    output_dir = os.path.join(clean_base_dir, "output_ply")
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(clean_input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    return input_dir, clean_input_dir, output_dir
+
+
+def _load_predictions(target_dir):
+    predictions_path = os.path.join(target_dir, "predictions.npz")
+    if not os.path.exists(predictions_path):
+        raise FileNotFoundError("No predictions found. Please run Reconstruct first.")
+
+    key_list = [
+        "pose_enc",
+        "depth",
+        "depth_conf",
+        "world_points",
+        "world_points_conf",
+        "images",
+        "extrinsic",
+        "intrinsic",
+        "world_points_from_depth",
+    ]
+    loaded = np.load(predictions_path)
+    return {key: np.array(loaded[key]) for key in key_list}
+
+
+def continue_pipeline_step(
+    pipeline_state,
+    target_dir,
+    conf_thres,
+    frame_filter,
+    mask_black_bg,
+    mask_white_bg,
+    mask_sky,
+    prediction_mode,
+    cube_size_cm,
+):
+    """Run exactly one next pipeline step after GLB generation."""
+    if not isinstance(pipeline_state, dict):
+        pipeline_state = {"next_step": -1}
+
+    next_step = pipeline_state.get("next_step", -1)
+    if next_step < 0:
+        return pipeline_state, "Please click Reconstruct first.", None, None, "Pipeline not initialized."
+
+    pipeline_state.update(
+        {
+            "target_dir": target_dir,
+            "conf_thres": conf_thres,
+            "frame_filter": frame_filter,
+            "mask_black_bg": mask_black_bg,
+            "mask_white_bg": mask_white_bg,
+            "mask_sky": mask_sky,
+            "prediction_mode": prediction_mode,
+            "cube_size_cm": cube_size_cm,
+        }
+    )
+
+    input_dir, clean_input_dir, output_dir = _prepare_step_paths()
+
+    try:
+        if next_step == 0:
+            predictions = _load_predictions(target_dir)
+            input_ply_path = os.path.join(input_dir, "input.ply")
+            export_point_cloud_to_ply(
+                predictions,
+                input_ply_path,
+                conf_thres=conf_thres,
+                filter_by_frames=frame_filter,
+                mask_black_bg=mask_black_bg,
+                mask_white_bg=mask_white_bg,
+                mask_sky=mask_sky,
+                target_dir=target_dir,
+                prediction_mode=prediction_mode,
+            )
+            pipeline_state["input_ply_path"] = input_ply_path
+            pipeline_state["next_step"] = 1
+            msg = (
+                f"Step 1 done. Input used: {target_dir}/predictions.npz\n"
+                f"Output: {input_ply_path}\n"
+                "Click Continue Step."
+            )
+            return pipeline_state, msg, input_ply_path, None, "Step 1 completed."
+
+        if next_step == 1:
+            input_ply_path = pipeline_state.get("input_ply_path")
+            if not input_ply_path or not os.path.exists(input_ply_path):
+                raise FileNotFoundError("Step 1 output missing. Click Redo to rerun Step 1.")
+            cleaned_ply_path = clean_point_cloud(
+                input_path=input_ply_path,
+                output_folder=clean_input_dir,
+                output_name="clean_input.ply",
+            )
+            pipeline_state["cleaned_ply_path"] = cleaned_ply_path
+            pipeline_state["next_step"] = 2
+            msg = (
+                f"Step 2 done. Input used: {input_ply_path}\n"
+                f"Output: {cleaned_ply_path}\n"
+                "Click Continue Step."
+            )
+            return pipeline_state, msg, cleaned_ply_path, None, "Step 2 completed."
+
+        if next_step == 2:
+            cleaned_ply_path = pipeline_state.get("cleaned_ply_path")
+            if not cleaned_ply_path or not os.path.exists(cleaned_ply_path):
+                raise FileNotFoundError("Step 2 output missing. Click Redo to rerun Step 2.")
+            mesh_ply_path, _ = reconstruct_mesh(
+                input_path=cleaned_ply_path,
+                output_folder=output_dir,
+                base_name="input",
+            )
+            pipeline_state["mesh_ply_path"] = mesh_ply_path
+            pipeline_state["next_step"] = 3
+            msg = (
+                f"Step 3 done. Input used: {cleaned_ply_path}\n"
+                f"Output mesh PLY: {mesh_ply_path}\n"
+                "Click Continue Step."
+            )
+            return pipeline_state, msg, mesh_ply_path, mesh_ply_path, "Step 3 completed."
+
+        if next_step == 3:
+            mesh_ply_path = pipeline_state.get("mesh_ply_path")
+            cleaned_ply_path = pipeline_state.get("cleaned_ply_path")
+            if not mesh_ply_path or not os.path.exists(mesh_ply_path):
+                raise FileNotFoundError("Step 3 output missing. Click Redo to rerun Step 3.")
+            if not cleaned_ply_path or not os.path.exists(cleaned_ply_path):
+                raise FileNotFoundError("Step 2 output missing. Click Redo to rerun Step 2.")
+
+            volume_result = compute_volume_from_mesh(
+                mesh_path=mesh_ply_path,
+                reference_ply_path=cleaned_ply_path,
+                real_cube_size_m=float(cube_size_cm) / 100.0,
+            )
+            pipeline_state["next_step"] = 4
+            msg = (
+                f"Step 4 done. Inputs used: mesh={mesh_ply_path}, reference={cleaned_ply_path}\n"
+                f"Step 4 done: volume {volume_result['real_volume_cm3']:.2f} cm^3 "
+                f"({volume_result['real_volume_m3']:.6f} m^3). "
+                f"Scale factor: {volume_result['scale_factor']:.6f}. "
+                f"Watertight: {volume_result['is_watertight']}"
+            )
+            return pipeline_state, msg, mesh_ply_path, mesh_ply_path, "Pipeline finished."
+
+        mesh_ply_path = pipeline_state.get("mesh_ply_path")
+        return pipeline_state, "All steps already completed. Use Redo if needed.", mesh_ply_path, mesh_ply_path, "Pipeline finished."
+
+    except Exception as exc:
+        mesh_ply_path = pipeline_state.get("mesh_ply_path")
+        return pipeline_state, f"Step failed: {exc}", mesh_ply_path, mesh_ply_path, "Pipeline step failed."
+
+
+def redo_pipeline_step(
+    pipeline_state,
+    target_dir,
+    conf_thres,
+    frame_filter,
+    mask_black_bg,
+    mask_white_bg,
+    mask_sky,
+    prediction_mode,
+    cube_size_cm,
+):
+    """Redo the most recently completed step."""
+    if not isinstance(pipeline_state, dict):
+        pipeline_state = {"next_step": -1}
+
+    next_step = pipeline_state.get("next_step", -1)
+    if next_step <= 0:
+        return pipeline_state, "No completed post-GLB step to redo. Click Reconstruct, then Continue.", None, None, "Redo unavailable."
+
+    pipeline_state["next_step"] = next_step - 1
+    return continue_pipeline_step(
+        pipeline_state,
+        target_dir,
+        conf_thres,
+        frame_filter,
+        mask_black_bg,
+        mask_white_bg,
+        mask_sky,
+        prediction_mode,
+        cube_size_cm,
+    )
 
 
 # -------------------------------------------------------------------------
@@ -192,12 +491,21 @@ def gradio_demo(
     show_cam=True,
     mask_sky=False,
     prediction_mode="Pointmap Regression",
+    cube_size_cm=14.0,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
     """
     if not os.path.isdir(target_dir) or target_dir == "None":
-        return None, "No valid target directory found. Please upload first.", None, None
+        return (
+            None,
+            "No valid target directory found. Please upload first.",
+            None,
+            "GLB step failed. No valid target directory.",
+            None,
+            None,
+            {"next_step": -1},
+        )
 
     start_time = time.time()
     gc.collect()
@@ -241,6 +549,19 @@ def gradio_demo(
     )
     glbscene.export(file_obj=glbfile)
 
+    pipeline_state = init_pipeline_state(
+        target_dir,
+        conf_thres,
+        frame_filter,
+        mask_black_bg,
+        mask_white_bg,
+        mask_sky,
+        prediction_mode,
+        cube_size_cm,
+    )
+    volume_msg = "GLB saved. Click Continue Step to run Step 1."
+    mesh_ply_path = None
+
     # Cleanup
     del predictions
     gc.collect()
@@ -250,7 +571,15 @@ def gradio_demo(
     print(f"Total time: {end_time - start_time:.2f} seconds (including IO)")
     log_msg = f"Reconstruction Success ({len(all_files)} frames). Waiting for visualization."
 
-    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True)
+    return (
+        glbfile,
+        log_msg,
+        gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True),
+        volume_msg,
+        mesh_ply_path,
+        mesh_ply_path,
+        pipeline_state,
+    )
 
 
 # -------------------------------------------------------------------------
@@ -270,17 +599,107 @@ def update_log():
     return "Loading and Reconstructing..."
 
 
+def _format_terminal_log(log_text):
+    """Format captured stdout/stderr for Markdown display."""
+    if not log_text.strip():
+        return "(no terminal output captured)"
+    return f"```\n{log_text.strip()}\n```"
+
+
+def reconstruct_with_logs(
+    target_dir,
+    conf_thres,
+    frame_filter,
+    mask_black_bg,
+    mask_white_bg,
+    show_cam,
+    mask_sky,
+    prediction_mode,
+    cube_size_cm,
+):
+    """Run reconstruction and capture terminal logs into UI."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer), redirect_stderr(buffer):
+        recon_out, log_msg, dropdown, volume_msg, mesh_file, mesh_view, state = gradio_demo(
+            target_dir,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+            cube_size_cm,
+        )
+    combined_log = f"{log_msg}\n\n{_format_terminal_log(buffer.getvalue())}"
+    return recon_out, combined_log, dropdown, volume_msg, mesh_file, mesh_view, state
+
+
+def continue_pipeline_step_with_logs(
+    pipeline_state,
+    target_dir,
+    conf_thres,
+    frame_filter,
+    mask_black_bg,
+    mask_white_bg,
+    mask_sky,
+    prediction_mode,
+    cube_size_cm,
+):
+    """Run one continue step and capture terminal logs into UI."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer), redirect_stderr(buffer):
+        state, volume_msg, mesh_file, mesh_view, log_msg = continue_pipeline_step(
+            pipeline_state,
+            target_dir,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            mask_sky,
+            prediction_mode,
+            cube_size_cm,
+        )
+    combined_log = f"{log_msg}\n\n{_format_terminal_log(buffer.getvalue())}"
+    return state, volume_msg, mesh_file, mesh_view, combined_log
+
+
+def redo_pipeline_step_with_logs(
+    pipeline_state,
+    target_dir,
+    conf_thres,
+    frame_filter,
+    mask_black_bg,
+    mask_white_bg,
+    mask_sky,
+    prediction_mode,
+    cube_size_cm,
+):
+    """Redo one step and capture terminal logs into UI."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer), redirect_stderr(buffer):
+        state, volume_msg, mesh_file, mesh_view, log_msg = redo_pipeline_step(
+            pipeline_state,
+            target_dir,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            mask_sky,
+            prediction_mode,
+            cube_size_cm,
+        )
+    combined_log = f"{log_msg}\n\n{_format_terminal_log(buffer.getvalue())}"
+    return state, volume_msg, mesh_file, mesh_view, combined_log
+
+
 def update_visualization(
-    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, is_example
+    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
 ):
     """
     Reload saved predictions from npz, create (or reuse) the GLB for new parameters,
-    and return it for the 3D viewer. If is_example == "True", skip.
+    and return it for the 3D viewer.
     """
-
-    # If it's an example click, skip as requested
-    if is_example == "True":
-        return None, "No reconstruction available. Please click the Reconstruct button first."
 
     if not target_dir or target_dir == "None" or not os.path.isdir(target_dir):
         return None, "No reconstruction available. Please click the Reconstruct button first."
@@ -326,18 +745,31 @@ def update_visualization(
     return glbfile, "Updating Visualization"
 
 
-# -------------------------------------------------------------------------
-# Example images
-# -------------------------------------------------------------------------
-
-great_wall_video = "examples/videos/great_wall.mp4"
-colosseum_video = "examples/videos/Colosseum.mp4"
-room_video = "examples/videos/room.mp4"
-kitchen_video = "examples/videos/kitchen.mp4"
-fern_video = "examples/videos/fern.mp4"
-single_cartoon_video = "examples/videos/single_cartoon.mp4"
-single_oil_painting_video = "examples/videos/single_oil_painting.mp4"
-pyramid_video = "examples/videos/pyramid.mp4"
+def update_visualization_with_logs(
+    target_dir,
+    conf_thres,
+    frame_filter,
+    mask_black_bg,
+    mask_white_bg,
+    show_cam,
+    mask_sky,
+    prediction_mode,
+):
+    """Capture visualization-update terminal logs into UI log panel."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer), redirect_stderr(buffer):
+        recon, log_msg = update_visualization(
+            target_dir,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+        )
+    combined_log = f"{log_msg}\n\n{_format_terminal_log(buffer.getvalue())}"
+    return recon, combined_log
 
 
 # -------------------------------------------------------------------------
@@ -362,7 +794,7 @@ with gr.Blocks(
         color: transparent !important;
         text-align: center !important;
     }
-    
+
     .example-log * {
         font-style: italic;
         font-size: 16px !important;
@@ -390,10 +822,6 @@ with gr.Blocks(
     }
     """,
 ) as demo:
-    # Instead of gr.State, we use a hidden Textbox:
-    is_example = gr.Textbox(label="is_example", visible=False, value="None")
-    num_images = gr.Textbox(label="num_images", visible=False, value="None")
-
     gr.HTML(
         """
     <h1>🏛️ VGGT: Visual Geometry Grounded Transformer</h1>
@@ -407,24 +835,11 @@ with gr.Blocks(
 
     <h3>Getting Started:</h3>
     <ol>
-        <li><strong>Upload Your Data:</strong> Use the "Upload Video" or "Upload Images" buttons on the left to provide your input. Videos will be automatically split into individual frames (one frame per second).</li>
-        <li><strong>Preview:</strong> Your uploaded images will appear in the gallery on the left.</li>
-        <li><strong>Reconstruct:</strong> Click the "Reconstruct" button to start the 3D reconstruction process.</li>
-        <li><strong>Visualize:</strong> The 3D reconstruction will appear in the viewer on the right. You can rotate, pan, and zoom to explore the model, and download the GLB file. Note the visualization of 3D points may be slow for a large number of input images.</li>
-        <li>
-        <strong>Adjust Visualization (Optional):</strong>
-        After reconstruction, you can fine-tune the visualization using the options below
-        <details style="display:inline;">
-            <summary style="display:inline;">(<strong>click to expand</strong>):</summary>
-            <ul>
-            <li><em>Confidence Threshold:</em> Adjust the filtering of points based on confidence.</li>
-            <li><em>Show Points from Frame:</em> Select specific frames to display in the point cloud.</li>
-            <li><em>Show Camera:</em> Toggle the display of estimated camera positions.</li>
-            <li><em>Filter Sky / Filter Black Background:</em> Remove sky or black-background points.</li>
-            <li><em>Select a Prediction Mode:</em> Choose between "Depthmap and Camera Branch" or "Pointmap Branch."</li>
-            </ul>
-        </details>
-        </li>
+        <li><strong>Upload Data:</strong> Upload a video or image set. Video input is sampled into frames at 1 FPS.</li>
+        <li><strong>Reconstruct:</strong> Click "Reconstruct" to run VGGT and generate the GLB preview.</li>
+        <li><strong>Continue Steps:</strong> Click "Continue Step" to run stages in order: export PLY, clean PLY, reconstruct STL, compute volume.</li>
+        <li><strong>Redo If Needed:</strong> Click "Redo Step" to rerun the latest completed stage if a step fails.</li>
+        <li><strong>Read Results:</strong> View final volume in the result panel and download STL/PLY outputs from the file panels.</li>
     </ol>
     <p><strong style="color: #0ea5e9;">Please note:</strong> <span style="color: #0ea5e9; font-weight: bold;">VGGT typically reconstructs a scene in less than 1 second. However, visualizing 3D points may take tens of seconds due to third-party rendering, which are independent of VGGT's processing time. </span></p>
     </div>
@@ -432,6 +847,7 @@ with gr.Blocks(
     )
 
     target_dir_output = gr.Textbox(label="Target Dir", visible=False, value="None")
+    pipeline_state = gr.State(value={"next_step": -1})
 
     with gr.Row():
         with gr.Column(scale=2):
@@ -456,9 +872,33 @@ with gr.Blocks(
                 reconstruction_output = gr.Model3D(height=520, zoom_speed=0.5, pan_speed=0.5)
 
             with gr.Row():
+                mesh_ply_output = gr.File(label="Reconstructed Mesh PLY (download)", visible=True)
+
+            with gr.Row():
+                mesh_ply_viewer = gr.Model3D(height=320, label="Reconstructed Mesh Preview (PLY)")
+
+            with gr.Row():
+                cube_size_cm = gr.Number(label="Reference Cube Size (cm)", value=14.0, precision=3)
+
+            with gr.Row():
+                volume_output = gr.Markdown("Volume not computed.")
+
+            with gr.Row():
                 submit_btn = gr.Button("Reconstruct", scale=1, variant="primary")
+                continue_btn = gr.Button("Continue Step", scale=1, variant="secondary")
+                redo_btn = gr.Button("Redo Step", scale=1, variant="secondary")
                 clear_btn = gr.ClearButton(
-                    [input_video, input_images, reconstruction_output, log_output, target_dir_output, image_gallery],
+                    [
+                        input_video,
+                        input_images,
+                        reconstruction_output,
+                        log_output,
+                        target_dir_output,
+                        image_gallery,
+                        volume_output,
+                        mesh_ply_output,
+                        mesh_ply_viewer,
+                    ],
                     scale=1,
                 )
 
@@ -466,90 +906,31 @@ with gr.Blocks(
                 prediction_mode = gr.Radio(
                     ["Depthmap and Camera Branch", "Pointmap Branch"],
                     label="Select a Prediction Mode",
-                    value="Depthmap and Camera Branch",
+                    value="Pointmap Branch",
                     scale=1,
                     elem_id="my_radio",
                 )
 
             with gr.Row():
-                conf_thres = gr.Slider(minimum=0, maximum=100, value=50, step=0.1, label="Confidence Threshold (%)")
+                conf_thres = gr.Slider(minimum=0, maximum=100, value=60, step=0.1, label="Confidence Threshold (%)")
                 frame_filter = gr.Dropdown(choices=["All"], value="All", label="Show Points from Frame")
                 with gr.Column():
                     show_cam = gr.Checkbox(label="Show Camera", value=True)
-                    mask_sky = gr.Checkbox(label="Filter Sky", value=False)
-                    mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
-                    mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
-
-    # ---------------------- Examples section ----------------------
-    examples = [
-        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", "True"],
-        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-    ]
-
-    def example_pipeline(
-        input_video,
-        num_images_str,
-        input_images,
-        conf_thres,
-        mask_black_bg,
-        mask_white_bg,
-        show_cam,
-        mask_sky,
-        prediction_mode,
-        is_example_str,
-    ):
-        """
-        1) Copy example images to new target_dir
-        2) Reconstruct
-        3) Return model3D + logs + new_dir + updated dropdown + gallery
-        We do NOT return is_example. It's just an input.
-        """
-        target_dir, image_paths = handle_uploads(input_video, input_images)
-        # Always use "All" for frame_filter in examples
-        frame_filter = "All"
-        glbfile, log_msg, dropdown = gradio_demo(
-            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
-        )
-        return glbfile, log_msg, target_dir, dropdown, image_paths
-
-    gr.Markdown("Click any row to load an example.", elem_classes=["example-log"])
-
-    gr.Examples(
-        examples=examples,
-        inputs=[
-            input_video,
-            num_images,
-            input_images,
-            conf_thres,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
-        fn=example_pipeline,
-        cache_examples=False,
-        examples_per_page=50,
-    )
+                    mask_sky = gr.Checkbox(label="Filter Sky", value=True)
+                    mask_black_bg = gr.Checkbox(label="Filter Black Background", value=True)
+                    mask_white_bg = gr.Checkbox(label="Filter White Background", value=True)
 
     # -------------------------------------------------------------------------
     # "Reconstruct" button logic:
     #  - Clear fields
     #  - Update log
     #  - gradio_demo(...) with the existing target_dir
-    #  - Then set is_example = "False"
+    #  - Initialize staged pipeline state for Continue/Redo
     # -------------------------------------------------------------------------
     submit_btn.click(fn=clear_fields, inputs=[], outputs=[reconstruction_output]).then(
         fn=update_log, inputs=[], outputs=[log_output]
     ).then(
-        fn=gradio_demo,
+        fn=reconstruct_with_logs,
         inputs=[
             target_dir_output,
             conf_thres,
@@ -559,17 +940,48 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            cube_size_cm,
         ],
-        outputs=[reconstruction_output, log_output, frame_filter],
-    ).then(
-        fn=lambda: "False", inputs=[], outputs=[is_example]  # set is_example to "False"
+        outputs=[reconstruction_output, log_output, frame_filter, volume_output, mesh_ply_output, mesh_ply_viewer, pipeline_state],
+    )
+
+    continue_btn.click(
+        fn=continue_pipeline_step_with_logs,
+        inputs=[
+            pipeline_state,
+            target_dir_output,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            mask_sky,
+            prediction_mode,
+            cube_size_cm,
+        ],
+        outputs=[pipeline_state, volume_output, mesh_ply_output, mesh_ply_viewer, log_output],
+    )
+
+    redo_btn.click(
+        fn=redo_pipeline_step_with_logs,
+        inputs=[
+            pipeline_state,
+            target_dir_output,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            mask_sky,
+            prediction_mode,
+            cube_size_cm,
+        ],
+        outputs=[pipeline_state, volume_output, mesh_ply_output, mesh_ply_viewer, log_output],
     )
 
     # -------------------------------------------------------------------------
     # Real-time Visualization Updates
     # -------------------------------------------------------------------------
     conf_thres.change(
-        update_visualization,
+        update_visualization_with_logs,
         [
             target_dir_output,
             conf_thres,
@@ -579,12 +991,11 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
-            is_example,
         ],
         [reconstruction_output, log_output],
     )
     frame_filter.change(
-        update_visualization,
+        update_visualization_with_logs,
         [
             target_dir_output,
             conf_thres,
@@ -594,12 +1005,11 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
-            is_example,
         ],
         [reconstruction_output, log_output],
     )
     mask_black_bg.change(
-        update_visualization,
+        update_visualization_with_logs,
         [
             target_dir_output,
             conf_thres,
@@ -609,12 +1019,11 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
-            is_example,
         ],
         [reconstruction_output, log_output],
     )
     mask_white_bg.change(
-        update_visualization,
+        update_visualization_with_logs,
         [
             target_dir_output,
             conf_thres,
@@ -624,12 +1033,11 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
-            is_example,
         ],
         [reconstruction_output, log_output],
     )
     show_cam.change(
-        update_visualization,
+        update_visualization_with_logs,
         [
             target_dir_output,
             conf_thres,
@@ -639,12 +1047,11 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
-            is_example,
         ],
         [reconstruction_output, log_output],
     )
     mask_sky.change(
-        update_visualization,
+        update_visualization_with_logs,
         [
             target_dir_output,
             conf_thres,
@@ -654,12 +1061,11 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
-            is_example,
         ],
         [reconstruction_output, log_output],
     )
     prediction_mode.change(
-        update_visualization,
+        update_visualization_with_logs,
         [
             target_dir_output,
             conf_thres,
@@ -669,7 +1075,6 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
-            is_example,
         ],
         [reconstruction_output, log_output],
     )
@@ -678,14 +1083,32 @@ with gr.Blocks(
     # Auto-update gallery whenever user uploads or changes their files
     # -------------------------------------------------------------------------
     input_video.change(
-        fn=update_gallery_on_upload,
+        fn=update_gallery_on_upload_with_logs,
         inputs=[input_video, input_images],
-        outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
+        outputs=[
+            reconstruction_output,
+            target_dir_output,
+            image_gallery,
+            log_output,
+            volume_output,
+            mesh_ply_output,
+            mesh_ply_viewer,
+            pipeline_state,
+        ],
     )
     input_images.change(
-        fn=update_gallery_on_upload,
+        fn=update_gallery_on_upload_with_logs,
         inputs=[input_video, input_images],
-        outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
+        outputs=[
+            reconstruction_output,
+            target_dir_output,
+            image_gallery,
+            log_output,
+            volume_output,
+            mesh_ply_output,
+            mesh_ply_viewer,
+            pipeline_state,
+        ],
     )
 
     demo.queue(max_size=20).launch(show_error=True, share=True)

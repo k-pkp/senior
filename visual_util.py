@@ -433,6 +433,150 @@ def run_skyseg(onnx_session, input_size, image):
     return onnx_result
 
 
+def export_point_cloud_to_ply(
+    predictions,
+    output_path,
+    conf_thres=50.0,
+    filter_by_frames="all",
+    mask_black_bg=False,
+    mask_white_bg=False,
+    mask_sky=False,
+    target_dir=None,
+    prediction_mode="Pointmap Regression",
+):
+    """
+    Exports point cloud from VGGT predictions to a clean PLY file.
+    
+    Args:
+        predictions (dict): Dictionary containing model predictions
+        output_path (str): Path where to save the PLY file
+        conf_thres (float): Percentage of low-confidence points to filter out (default: 50.0)
+        filter_by_frames (str): Frame filter specification (default: "all")
+        mask_black_bg (bool): Mask out black background pixels (default: False)
+        mask_white_bg (bool): Mask out white background pixels (default: False)
+        mask_sky (bool): Apply sky segmentation mask (default: False)
+        target_dir (str): Output directory for intermediate files (default: None)
+        prediction_mode (str): Prediction mode selector (default: "Pointmap Regression")
+    
+    Returns:
+        str: Path to the exported PLY file
+    """
+    print("Exporting point cloud to PLY...")
+    
+    # Select prediction source based on mode
+    if "Pointmap" in prediction_mode:
+        print("Using Pointmap Branch")
+        if "world_points" in predictions:
+            pred_world_points = predictions["world_points"]
+            pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
+        else:
+            print("Warning: world_points not found, falling back to depth-based points")
+            pred_world_points = predictions["world_points_from_depth"]
+            pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+    else:
+        print("Using Depthmap and Camera Branch")
+        pred_world_points = predictions["world_points_from_depth"]
+        pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+    
+    # Get images
+    images = predictions["images"]
+    
+    # Apply sky mask if enabled
+    if mask_sky and target_dir is not None:
+        if not os.path.exists("skyseg.onnx"):
+            print("Downloading skyseg.onnx...")
+            download_file_from_url(
+                "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
+            )
+        
+        import onnxruntime
+        skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
+        target_dir_images = target_dir + "/images"
+        image_list = sorted(os.listdir(target_dir_images))
+        
+        S, H, W = (
+            pred_world_points_conf.shape
+            if hasattr(pred_world_points_conf, "shape")
+            else (len(images), images.shape[1], images.shape[2])
+        )
+        
+        sky_mask_list = []
+        for i, image_name in enumerate(image_list):
+            image_filepath = os.path.join(target_dir_images, image_name)
+            mask_filepath = os.path.join(target_dir, "sky_masks", image_name)
+            
+            if os.path.exists(mask_filepath):
+                sky_mask = cv2.imread(mask_filepath, cv2.IMREAD_GRAYSCALE)
+            else:
+                sky_mask = segment_sky(image_filepath, skyseg_session, mask_filepath)
+            
+            if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
+                sky_mask = cv2.resize(sky_mask, (W, H))
+            
+            sky_mask_list.append(sky_mask)
+        
+        sky_mask_array = np.array(sky_mask_list)
+        sky_mask_binary = (sky_mask_array > 0.1).astype(np.float32)
+        pred_world_points_conf = pred_world_points_conf * sky_mask_binary
+    
+    # Filter by frame if specified
+    selected_frame_idx = None
+    if filter_by_frames != "all" and filter_by_frames != "All":
+        try:
+            selected_frame_idx = int(filter_by_frames.split(":")[0])
+        except (ValueError, IndexError):
+            pass
+    
+    if selected_frame_idx is not None:
+        pred_world_points = pred_world_points[selected_frame_idx][None]
+        pred_world_points_conf = pred_world_points_conf[selected_frame_idx][None]
+        images = images[selected_frame_idx][None]
+    
+    # Flatten and extract points and colors
+    vertices_3d = pred_world_points.reshape(-1, 3)
+    
+    # Handle different image formats
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
+        colors_rgb = np.transpose(images, (0, 2, 3, 1))
+    else:  # NHWC format
+        colors_rgb = images
+    colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
+    
+    conf = pred_world_points_conf.reshape(-1)
+    
+    # Calculate confidence threshold
+    if conf_thres == 0.0:
+        conf_threshold = 0.0
+    else:
+        conf_threshold = np.percentile(conf, conf_thres)
+    
+    conf_mask = (conf >= conf_threshold) & (conf > 1e-5)
+    
+    # Apply background masks
+    if mask_black_bg:
+        black_bg_mask = colors_rgb.sum(axis=1) >= 16
+        conf_mask = conf_mask & black_bg_mask
+    
+    if mask_white_bg:
+        white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
+        conf_mask = conf_mask & white_bg_mask
+    
+    vertices_3d = vertices_3d[conf_mask]
+    colors_rgb = colors_rgb[conf_mask]
+    
+    if vertices_3d.size == 0:
+        print("Warning: No points after filtering. Creating dummy point cloud.")
+        vertices_3d = np.array([[0, 0, 0]])
+        colors_rgb = np.array([[255, 255, 255]])
+    
+    # Export to PLY using trimesh
+    point_cloud = trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
+    point_cloud.export(output_path)
+    
+    print(f"Point cloud exported to {output_path} with {len(vertices_3d)} points")
+    return output_path
+
+
 def download_file_from_url(url, filename):
     """Downloads a file from a Hugging Face model repo, handling redirects."""
     try:

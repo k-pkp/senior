@@ -147,3 +147,23 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+# 3d models
+.obj
+.fbx
+.stl
+.ply
+.stl
+.glb
+
+#output
+input_images*
+
+#claude
+.claude
+
+#data
+clean/input/
+clear/input_ply/
+clean/output_mesh/
+clean/output/ply/

@@ -25,10 +25,18 @@ from visual_util import predictions_to_glb, export_point_cloud_to_ply
 from clean_ply import clean_point_cloud
 from recons import reconstruct_mesh
 from com_vol import compute_volume_from_mesh
+from segment_sam import (
+    load_sam_model,
+    segment_frame,
+    extract_points_by_mask,
+    save_class_ply,
+    create_segmentation_overlay,
+)
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
+import open3d as o3d
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -42,6 +50,21 @@ model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
 
 model.eval()
 model = model.to(device)
+
+# SAM model — loaded lazily on first segmentation request
+_sam_model = None
+
+
+def _get_sam_model(model_type="vit_b"):
+    """Return the cached SAM model, loading it on first call.
+
+    SAM runs on CPU to avoid GPU OOM (VGGT already occupies most VRAM).
+    """
+    global _sam_model
+    if _sam_model is None:
+        print("Loading SAM model (first use, on CPU to save GPU memory)...")
+        _sam_model = load_sam_model(model_type=model_type, device="cpu")
+    return _sam_model
 
 
 # -------------------------------------------------------------------------
@@ -262,11 +285,21 @@ def run_volume_pipeline(
         real_cube_size_m=float(cube_size_cm) / 100.0,
     )
 
+    """
+    real volume (box) = 14 cm
+    output (box) = 30 units 
+
+    scale factor = (14/30) = 0.467
+
+    output (leg) = 10 units
+    real volume (leg) = 10 * 0.467 = 4.67
+    """
+
     volume_msg = (
-        f"Volume result: {volume_result['real_volume_cm3']:.2f} cm^3 "
-        f"({volume_result['real_volume_m3']:.6f} m^3). "
-        f"Scale factor: {volume_result['scale_factor']:.6f}. "
-        f"Watertight: {volume_result['is_watertight']}"
+        f"Volume result: {volume_result['real_volume_cm3']:.2f} cm^3 \n"
+        f"({volume_result['real_volume_m3']:.6f} m^3). \n"
+        f"Scale factor: {volume_result['scale_factor']:.6f}. \n"
+        f"Watertight: {volume_result['is_watertight']}\n"
     )
 
     return volume_msg, mesh_ply_path
@@ -284,9 +317,15 @@ def init_pipeline_state(target_dir, conf_thres, frame_filter, mask_black_bg, mas
         "mask_sky": mask_sky,
         "prediction_mode": prediction_mode,
         "cube_size_cm": cube_size_cm,
-        "input_ply_path": None,
-        "cleaned_ply_path": None,
-        "mesh_ply_path": None,
+        # SAM pipeline paths
+        "box_ply_path": None,
+        "leg_ply_path": None,
+        "box_clean_path": None,
+        "leg_clean_path": None,
+        "box_mesh_path": None,
+        "leg_mesh_path": None,
+        "scale_factor": None,
+        "seg_overlay_path": None,
     }
 
 
@@ -332,7 +371,14 @@ def continue_pipeline_step(
     prediction_mode,
     cube_size_cm,
 ):
-    """Run exactly one next pipeline step after GLB generation."""
+    """
+    Run exactly one next pipeline step after GLB generation.
+
+    SAM-based pipeline steps:
+        Step 0 — SAM segmentation → export box.ply + leg.ply (floor discarded)
+        Step 1 — Clean box + reconstruct → compute scale factor from reference cube
+        Step 2 — Clean leg + reconstruct → compute real-world volume using scale factor
+    """
     if not isinstance(pipeline_state, dict):
         pipeline_state = {"next_step": -1}
 
@@ -356,94 +402,181 @@ def continue_pipeline_step(
     input_dir, clean_input_dir, output_dir = _prepare_step_paths()
 
     try:
+        # ==================================================================
+        # Step 0: SAM Segmentation → box.ply + leg.ply
+        # ==================================================================
         if next_step == 0:
             predictions = _load_predictions(target_dir)
-            input_ply_path = os.path.join(input_dir, "input.ply")
-            export_point_cloud_to_ply(
-                predictions,
-                input_ply_path,
-                conf_thres=conf_thres,
-                filter_by_frames=frame_filter,
-                mask_black_bg=mask_black_bg,
-                mask_white_bg=mask_white_bg,
-                mask_sky=mask_sky,
-                target_dir=target_dir,
-                prediction_mode=prediction_mode,
+
+            # Choose world-point source
+            if "Pointmap" in prediction_mode:
+                wp = predictions.get("world_points", predictions["world_points_from_depth"])
+                conf = predictions.get("world_points_conf", predictions.get("depth_conf"))
+            else:
+                wp = predictions["world_points_from_depth"]
+                conf = predictions.get("depth_conf")
+
+            # Pick first image for segmentation
+            target_images_dir = os.path.join(target_dir, "images")
+            image_list = sorted(os.listdir(target_images_dir))
+            seg_frame = 0
+            image_path = os.path.join(target_images_dir, image_list[seg_frame])
+
+            # Run SAM
+            sam = _get_sam_model()
+            mask_dict = segment_frame(
+                image_path, sam,
+                world_points_frame=wp[seg_frame],
+                conf_frame=conf[seg_frame] if conf is not None else None,
             )
-            pipeline_state["input_ply_path"] = input_ply_path
+            if mask_dict is None:
+                raise RuntimeError("SAM could not produce enough masks. Try different images.")
+
+            # Extract per-class 3D points
+            images = predictions["images"]
+            class_points = extract_points_by_mask(wp, images, conf, mask_dict, frame_idx=seg_frame)
+
+            # Save per-class PLYs
+            box_ply = os.path.join(input_dir, "box.ply")
+            leg_ply = os.path.join(input_dir, "leg.ply")
+            save_class_ply(class_points["box"]["points"], class_points["box"]["colors"], box_ply)
+            save_class_ply(class_points["leg"]["points"], class_points["leg"]["colors"], leg_ply)
+
+            # Save segmentation overlay
+            seg_img = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+            overlay = create_segmentation_overlay(seg_img, mask_dict)
+            overlay_path = os.path.join(target_dir, "seg_overlay.png")
+            cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+            pipeline_state["box_ply_path"] = box_ply
+            pipeline_state["leg_ply_path"] = leg_ply
+            pipeline_state["seg_overlay_path"] = overlay_path
             pipeline_state["next_step"] = 1
-            msg = (
-                f"Step 1 done. Input used: {target_dir}/predictions.npz\n"
-                f"Output: {input_ply_path}\n"
-                "Click Continue Step."
-            )
-            return pipeline_state, msg, input_ply_path, None, "Step 1 completed."
 
+            n_box = len(class_points["box"]["points"])
+            n_leg = len(class_points["leg"]["points"])
+            n_floor = len(class_points["floor"]["points"])
+            msg = (
+                f"Step 1/3 done — SAM Segmentation\n"
+                f"  Box: {n_box:,} pts → {box_ply}\n"
+                f"  Leg: {n_leg:,} pts → {leg_ply}\n"
+                f"  Floor: {n_floor:,} pts (discarded)\n"
+                f"  Overlay: {overlay_path}\n"
+                f"Click Continue Step."
+            )
+            return pipeline_state, msg, box_ply, None, "Step 1/3 completed."
+
+        # ==================================================================
+        # Step 1: Box → clean + reconstruct → scale factor
+        # ==================================================================
         if next_step == 1:
-            input_ply_path = pipeline_state.get("input_ply_path")
-            if not input_ply_path or not os.path.exists(input_ply_path):
-                raise FileNotFoundError("Step 1 output missing. Click Redo to rerun Step 1.")
-            cleaned_ply_path = clean_point_cloud(
-                input_path=input_ply_path,
-                output_folder=clean_input_dir,
-                output_name="clean_input.ply",
+            box_ply = pipeline_state.get("box_ply_path")
+            if not box_ply or not os.path.exists(box_ply):
+                raise FileNotFoundError("Box PLY missing. Click Redo to rerun Step 1.")
+
+            # Clean
+            box_clean_dir = os.path.join(clean_input_dir, "box")
+            os.makedirs(box_clean_dir, exist_ok=True)
+            box_clean = clean_point_cloud(
+                input_path=box_ply,
+                output_folder=box_clean_dir,
+                output_name="box_clean.ply",
+                skip_plane_removal=True,
             )
-            pipeline_state["cleaned_ply_path"] = cleaned_ply_path
+
+            # Reconstruct
+            box_mesh_dir = os.path.join(output_dir, "box")
+            os.makedirs(box_mesh_dir, exist_ok=True)
+            box_mesh_ply, _ = reconstruct_mesh(
+                input_path=box_clean,
+                output_folder=box_mesh_dir,
+                base_name="box",
+            )
+
+            # Measure box → scale factor
+            box_pcd = o3d.io.read_point_cloud(box_clean)
+            extent = box_pcd.get_axis_aligned_bounding_box().get_extent()
+            estimated_side = float(np.median(extent))
+            real_m = float(cube_size_cm) / 100.0
+            scale_factor = real_m / estimated_side
+
+            pipeline_state["box_clean_path"] = box_clean
+            pipeline_state["box_mesh_path"] = box_mesh_ply
+            pipeline_state["scale_factor"] = scale_factor
             pipeline_state["next_step"] = 2
-            msg = (
-                f"Step 2 done. Input used: {input_ply_path}\n"
-                f"Output: {cleaned_ply_path}\n"
-                "Click Continue Step."
-            )
-            return pipeline_state, msg, cleaned_ply_path, None, "Step 2 completed."
 
+            msg = (
+                f"Step 2/3 done — Box → Scale Factor\n"
+                f"  Box extent: [{extent[0]:.5f}, {extent[1]:.5f}, {extent[2]:.5f}]\n"
+                f"  Estimated side: {estimated_side:.6f} mesh units\n"
+                f"  Real cube: {cube_size_cm} cm\n"
+                f"  Scale factor: {scale_factor:.6f}\n"
+                f"Click Continue Step."
+            )
+            return pipeline_state, msg, box_mesh_ply, box_mesh_ply, "Step 2/3 completed."
+
+        # ==================================================================
+        # Step 2: Leg → clean + reconstruct → volume (with scale)
+        # ==================================================================
         if next_step == 2:
-            cleaned_ply_path = pipeline_state.get("cleaned_ply_path")
-            if not cleaned_ply_path or not os.path.exists(cleaned_ply_path):
-                raise FileNotFoundError("Step 2 output missing. Click Redo to rerun Step 2.")
-            mesh_ply_path, _ = reconstruct_mesh(
-                input_path=cleaned_ply_path,
-                output_folder=output_dir,
-                base_name="input",
+            leg_ply = pipeline_state.get("leg_ply_path")
+            scale_factor = pipeline_state.get("scale_factor")
+            if not leg_ply or not os.path.exists(leg_ply):
+                raise FileNotFoundError("Leg PLY missing. Click Redo to rerun Step 1.")
+            if scale_factor is None:
+                raise RuntimeError("Scale factor missing. Rerun Step 2 (box).")
+
+            # Clean
+            leg_clean_dir = os.path.join(clean_input_dir, "leg")
+            os.makedirs(leg_clean_dir, exist_ok=True)
+            leg_clean = clean_point_cloud(
+                input_path=leg_ply,
+                output_folder=leg_clean_dir,
+                output_name="leg_clean.ply",
+                skip_plane_removal=True,
             )
-            pipeline_state["mesh_ply_path"] = mesh_ply_path
+
+            # Reconstruct
+            leg_mesh_dir = os.path.join(output_dir, "leg")
+            os.makedirs(leg_mesh_dir, exist_ok=True)
+            leg_mesh_ply, _ = reconstruct_mesh(
+                input_path=leg_clean,
+                output_folder=leg_mesh_dir,
+                base_name="leg",
+            )
+
+            # Compute volume
+            mesh = o3d.io.read_triangle_mesh(leg_mesh_ply)
+            if not mesh.is_watertight():
+                pcd_tmp = mesh.sample_points_uniformly(number_of_points=50_000)
+                mesh, _ = pcd_tmp.compute_convex_hull()
+
+            raw_vol = mesh.get_volume()
+            mesh.scale(scale_factor, center=mesh.get_center())
+            real_m3 = mesh.get_volume()
+            real_cm3 = real_m3 * 1e6
+
+            pipeline_state["leg_clean_path"] = leg_clean
+            pipeline_state["leg_mesh_path"] = leg_mesh_ply
             pipeline_state["next_step"] = 3
+
             msg = (
-                f"Step 3 done. Input used: {cleaned_ply_path}\n"
-                f"Output mesh PLY: {mesh_ply_path}\n"
-                "Click Continue Step."
+                f"Step 3/3 done — Leg Volume\n"
+                f"  Raw volume: {raw_vol:.6f} mesh-units³\n"
+                f"  Scale factor: {scale_factor:.6f}\n"
+                f"  Real volume: {real_cm3:.2f} cm³ ({real_m3:.6f} m³)\n"
+                f"  Watertight: {mesh.is_watertight()}\n"
+                f"Pipeline finished."
             )
-            return pipeline_state, msg, mesh_ply_path, mesh_ply_path, "Step 3 completed."
+            return pipeline_state, msg, leg_mesh_ply, leg_mesh_ply, "Pipeline finished."
 
-        if next_step == 3:
-            mesh_ply_path = pipeline_state.get("mesh_ply_path")
-            cleaned_ply_path = pipeline_state.get("cleaned_ply_path")
-            if not mesh_ply_path or not os.path.exists(mesh_ply_path):
-                raise FileNotFoundError("Step 3 output missing. Click Redo to rerun Step 3.")
-            if not cleaned_ply_path or not os.path.exists(cleaned_ply_path):
-                raise FileNotFoundError("Step 2 output missing. Click Redo to rerun Step 2.")
-
-            volume_result = compute_volume_from_mesh(
-                mesh_path=mesh_ply_path,
-                reference_ply_path=cleaned_ply_path,
-                real_cube_size_m=float(cube_size_cm) / 100.0,
-            )
-            pipeline_state["next_step"] = 4
-            msg = (
-                f"Step 4 done. Inputs used: mesh={mesh_ply_path}, reference={cleaned_ply_path}\n"
-                f"Step 4 done: volume {volume_result['real_volume_cm3']:.2f} cm^3 "
-                f"({volume_result['real_volume_m3']:.6f} m^3). "
-                f"Scale factor: {volume_result['scale_factor']:.6f}. "
-                f"Watertight: {volume_result['is_watertight']}"
-            )
-            return pipeline_state, msg, mesh_ply_path, mesh_ply_path, "Pipeline finished."
-
-        mesh_ply_path = pipeline_state.get("mesh_ply_path")
-        return pipeline_state, "All steps already completed. Use Redo if needed.", mesh_ply_path, mesh_ply_path, "Pipeline finished."
+        # All steps done
+        mesh_path = pipeline_state.get("leg_mesh_path") or pipeline_state.get("box_mesh_path")
+        return pipeline_state, "All steps completed. Use Redo if needed.", mesh_path, mesh_path, "Pipeline finished."
 
     except Exception as exc:
-        mesh_ply_path = pipeline_state.get("mesh_ply_path")
-        return pipeline_state, f"Step failed: {exc}", mesh_ply_path, mesh_ply_path, "Pipeline step failed."
+        mesh_path = pipeline_state.get("leg_mesh_path") or pipeline_state.get("box_mesh_path")
+        return pipeline_state, f"Step failed: {exc}", mesh_path, mesh_path, "Pipeline step failed."
 
 
 def redo_pipeline_step(
@@ -835,11 +968,17 @@ with gr.Blocks(
 
     <h3>Getting Started:</h3>
     <ol>
-        <li><strong>Upload Data:</strong> Upload a video or image set. Video input is sampled into frames at 1 FPS.</li>
+        <li><strong>Upload Data:</strong> Upload a video or image set showing the scene with a reference cube and the leg. Video input is sampled at 1 FPS.</li>
         <li><strong>Reconstruct:</strong> Click "Reconstruct" to run VGGT and generate the GLB preview.</li>
-        <li><strong>Continue Steps:</strong> Click "Continue Step" to run stages in order: export PLY, clean PLY, reconstruct STL, compute volume.</li>
-        <li><strong>Redo If Needed:</strong> Click "Redo Step" to rerun the latest completed stage if a step fails.</li>
-        <li><strong>Read Results:</strong> View final volume in the result panel and download STL/PLY outputs from the file panels.</li>
+        <li><strong>Continue Steps (SAM Pipeline):</strong> Click "Continue Step" to run each stage:
+            <ul>
+                <li><em>Step 1/3 — SAM Segmentation:</em> Segments the scene into box (reference cube), leg (target), and floor (discarded).</li>
+                <li><em>Step 2/3 — Box → Scale Factor:</em> Cleans and reconstructs the box mesh, computes the mesh-to-real-world scale using the known cube size.</li>
+                <li><em>Step 3/3 — Leg → Volume:</em> Cleans and reconstructs the leg mesh, computes real-world volume using the scale factor.</li>
+            </ul>
+        </li>
+        <li><strong>Redo If Needed:</strong> Click "Redo Step" to rerun the latest completed stage.</li>
+        <li><strong>Read Results:</strong> View final volume in the result panel and download mesh outputs.</li>
     </ol>
     <p><strong style="color: #0ea5e9;">Please note:</strong> <span style="color: #0ea5e9; font-weight: bold;">VGGT typically reconstructs a scene in less than 1 second. However, visualizing 3D points may take tens of seconds due to third-party rendering, which are independent of VGGT's processing time. </span></p>
     </div>

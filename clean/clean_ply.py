@@ -9,6 +9,7 @@ def clean_point_cloud(
     input_path: str,
     output_folder: str = "clean_input_ply",
     output_name: str = None,
+    skip_plane_removal: bool = False,
 ) -> str:
     """Clean a point cloud and save the cleaned result as PLY.
 
@@ -16,6 +17,9 @@ def clean_point_cloud(
         input_path: Path to source point cloud file.
         output_folder: Folder for cleaned output.
         output_name: Output file name. If None, uses clean_<input_stem>.ply.
+        skip_plane_removal: If True, skip RANSAC plane segmentation.
+            Use this for already-segmented objects (e.g. from SAM) where the
+            dominant plane is the object's own surface, not the floor.
 
     Returns:
         Path to cleaned PLY file.
@@ -40,11 +44,14 @@ def clean_point_cloud(
         raise ValueError("No points left after voxel downsampling.")
     print("Downsampled")
 
-    _, inliers = pcd.segment_plane(distance_threshold=0.02, ransac_n=3, num_iterations=1000)
-    pcd = pcd.select_by_index(inliers, invert=True)
-    if len(pcd.points) == 0:
-        raise ValueError("No points left after plane removal.")
-    print("Plane removed")
+    if not skip_plane_removal:
+        _, inliers = pcd.segment_plane(distance_threshold=0.02, ransac_n=3, num_iterations=1000)
+        pcd = pcd.select_by_index(inliers, invert=True)
+        if len(pcd.points) == 0:
+            raise ValueError("No points left after plane removal.")
+        print("Plane removed")
+    else:
+        print("Plane removal skipped (pre-segmented object)")
 
     labels = np.array(pcd.cluster_dbscan(eps=0.03, min_points=25))
     valid = labels >= 0

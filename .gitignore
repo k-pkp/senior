@@ -164,6 +164,10 @@ input_images*
 
 #data
 clean/input/
-clear/input_ply/
+clean/input_ply/
 clean/output_mesh/
-clean/output/ply/
+clean/output_ply/
+clean/clean_input_ply/
+
+#checkpoints
+checkpoints/

@@ -179,3 +179,5 @@ checkpoints/
 #detected data
 detect/checkpoints/
 detect/input/
+
+examples/

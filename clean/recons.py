@@ -3,6 +3,7 @@ import subprocess
 import sys
 import numpy as np
 import open3d as o3d
+import time
 
 
 _RECONS_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recons_worker.py")
@@ -104,8 +105,11 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
 
     meshes = []
     watertight_paths = []
+    time_sleep = 15
 
     for i, recon_path in enumerate(recon_paths):
+        print('='*20+f'resting for {time_sleep} second(s)'+'='*20)
+        time.sleep(time_sleep) # rest computer from compute for 10 seconds
         print(f"\nRepairing: {recon_path}")
 
         wt_ply = os.path.join(output_folder, f"object_{i}.ply")

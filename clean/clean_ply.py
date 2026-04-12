@@ -145,7 +145,7 @@ def clean_and_extract_objects(
         # (if the plane IS the object, don't remove it)
         try:
             plane_model, inliers = pcd.segment_plane(
-                distance_threshold=0.015,
+                distance_threshold=0.007,
                 ransac_n=3,
                 num_iterations=1000
             )

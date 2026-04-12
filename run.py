@@ -10,7 +10,6 @@ Usage:
     python run.py --image_folder ./baam/ --evaluate          # auto-screenshot with viewer.py
 
 Supports CUDA, MPS (Apple Silicon), and CPU backends automatically.
-Integrates the full demo_gradio pipeline: inference → export PLY → clean → reconstruct mesh.
 """
 
 import os
@@ -38,12 +37,11 @@ from vggt.utils.device import get_device, is_mps, autocast_on, aggressive_cleanu
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="VGGT — run full pipeline: segment → inference → PLY → clean → mesh",
+        description="VGGT — run full pipeline: inference → PLY → clean → mesh",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python run.py                                  # default: ./baam/ input
-  python run.py --image_folder ./data/train/images/ --segment
   python run.py --image_folder ./baam/ --evaluate
   python run.py --image_folder examples/kitchen/images/ --conf_thres 30
   python run.py --skip_mesh                      # PLY only
@@ -70,94 +68,9 @@ Examples:
                    help="Max frames to process (auto-set to 7 on MPS to avoid OOM)")
     p.add_argument("--evaluate", action="store_true",
                    help="Auto-capture screenshots of outputs with viewer.py")
-    # Segmentation options
-    p.add_argument("--segment", action="store_true",
-                   help="Pre-segment images to isolate target object before reconstruction")
-    p.add_argument("--seg_target", type=str, default="vase",
-                   choices=["vase", "aruco", "both"],
-                   help="Which object(s) to reconstruct: vase, aruco, or both (default: vase)")
-    p.add_argument("--seg_checkpoint", type=str,
-                   default=os.path.join(_SCRIPT_DIR, "detect", "checkpoints", "best_seg_model.pt"),
-                   help="Path to segmentation model checkpoint")
-    p.add_argument("--seg_img_size", type=int, default=256,
-                   help="Segmentation model input size (default: 256)")
+    p.add_argument("--no-watertight", action="store_true",
+                   help="Skip watertight repair (export only Poisson reconstruction)")
     return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-#  Stage 0: Segmentation — isolate target object in images
-# ---------------------------------------------------------------------------
-def generate_seg_masks(image_folder, output_dir, args, device):
-    """Generate multi-class segmentation masks using trained Transformer-CNN model.
-
-    Saves full multi-class masks (0=bg, 1=ArUco, 2=Vase) so both objects
-    are reconstructed together and separated at the mesh stage.
-
-    Returns path to mask directory.
-    """
-    print()
-    print("=" * 60)
-    print("STAGE 0: Generating multi-class segmentation masks")
-    print("=" * 60)
-
-    sys.path.insert(0, os.path.join(_SCRIPT_DIR, "detect"))
-    from segment_pipeline import load_seg_model, segment_image
-    import cv2
-
-    mask_dir = os.path.join(output_dir, "seg_masks")
-    os.makedirs(mask_dir, exist_ok=True)
-
-    device_str = str(device)
-    model, num_classes = load_seg_model(args.seg_checkpoint, device_str)
-
-    img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
-    image_files = sorted([
-        f for f in os.listdir(image_folder)
-        if os.path.splitext(f)[1].lower() in img_exts
-    ])
-
-    # Also save visual overlays on real images
-    vis_dir = os.path.join(output_dir, "masks")
-    os.makedirs(vis_dir, exist_ok=True)
-
-    count = 0
-    for fname in image_files:
-        img_path = os.path.join(image_folder, fname)
-        img = cv2.imread(img_path)
-        if img is None:
-            continue
-        # Save full multi-class mask: 0=bg, 1=ArUco, 2=Vase
-        full_mask = segment_image(model, img, img_size=args.seg_img_size, device=device_str)
-        mask_path = os.path.join(mask_dir, os.path.splitext(fname)[0] + ".npy")
-        np.save(mask_path, full_mask.astype(np.uint8))
-
-        # Generate overlay visualization on real image
-        h, w = img.shape[:2]
-        mask_resized = cv2.resize(full_mask.astype(np.uint8), (w, h),
-                                  interpolation=cv2.INTER_NEAREST)
-        overlay = img.copy()
-        # Dim background
-        overlay[mask_resized == 0] = (overlay[mask_resized == 0] * 0.3).astype(np.uint8)
-        # Color overlays: ArUco=blue, Vase=green
-        aruco_mask = mask_resized == 1
-        vase_mask = mask_resized == 2
-        overlay[aruco_mask] = (overlay[aruco_mask] * 0.5 + np.array([200, 100, 0]) * 0.5).astype(np.uint8)
-        overlay[vase_mask] = (overlay[vase_mask] * 0.5 + np.array([0, 200, 100]) * 0.5).astype(np.uint8)
-        # Draw contours
-        for cls_id, color in [(1, (255, 150, 0)), (2, (0, 255, 100))]:
-            binary = (mask_resized == cls_id).astype(np.uint8)
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, color, 2)
-
-        vis_path = os.path.join(vis_dir, os.path.splitext(fname)[0] + ".jpg")
-        cv2.imwrite(vis_path, overlay)
-        count += 1
-
-    print(f"  Generated {count} multi-class masks → {mask_dir}")
-    print(f"  Overlay visualizations → {vis_dir}")
-    print(f"  Classes: 0=background, 1=ArUco (blue), 2=Vase (green)")
-    del model
-    return mask_dir, count
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +217,8 @@ def _remove_spatial_outliers(points, colors, conf, k=20, std_ratio=2.5):
         return points, colors, conf
 
 
-def export_ply(predictions, output_dir, args, seg_masks=None):
-    """Filter and export point cloud as PLY with adaptive confidence and outlier removal.
-
-    If seg_masks is provided (multi-class: 0=bg, 1=ArUco, 2=Vase),
-    keeps all object pixels and saves per-point class labels for mesh separation.
-    """
+def export_ply(predictions, output_dir, args):
+    """Filter and export point cloud as PLY with adaptive confidence and outlier removal."""
     print()
     print("=" * 60)
     print("STAGE 2: Exporting PLY point cloud")
@@ -328,7 +237,6 @@ def export_ply(predictions, output_dir, args, seg_masks=None):
     imgs_np = predictions["images"]
     colors = imgs_np.transpose(0, 2, 3, 1)
 
-    S, H, W, _ = world_points.shape
     points_flat = world_points.reshape(-1, 3)
     colors_flat = (colors.reshape(-1, 3) * 255).clip(0, 255).astype(np.uint8)
     conf_flat = conf.reshape(-1)
@@ -336,23 +244,6 @@ def export_ply(predictions, output_dir, args, seg_masks=None):
     # Adaptive confidence filter
     threshold_val = _adaptive_confidence_filter(conf_flat, args.conf_thres)
     mask = (conf_flat >= threshold_val) & (conf_flat > 1e-5)
-
-    # Apply segmentation masks: keep both object classes, store per-pixel class IDs
-    class_labels_flat = None
-    if seg_masks is not None:
-        import cv2
-        seg_class_flat = np.zeros(S * H * W, dtype=np.uint8)
-        for i in range(min(S, len(seg_masks))):
-            m = seg_masks[i]  # (orig_H, orig_W) with values 0, 1, 2
-            m_resized = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
-            seg_class_flat[i * H * W : (i + 1) * H * W] = m_resized.reshape(-1)
-        mask &= (seg_class_flat > 0)  # keep both ArUco (1) and Vase (2)
-        class_labels_flat = seg_class_flat
-        n_aruco = (seg_class_flat == 1).sum()
-        n_vase = (seg_class_flat == 2).sum()
-        n_total = S * H * W
-        print(f"  Segmentation: ArUco={n_aruco:,}, Vase={n_vase:,}, "
-              f"total kept={(n_aruco+n_vase):,}/{n_total:,} ({100*(n_aruco+n_vase)/n_total:.1f}%)")
 
     # Color masks
     if args.mask_black_bg:
@@ -369,8 +260,6 @@ def export_ply(predictions, output_dir, args, seg_masks=None):
     print(f"  After filtering: {points_flat.shape[0]:,} → {points_out.shape[0]:,}")
 
     # Remove spatial outliers (points flying far from the cluster)
-    # Track which indices survive for class label alignment
-    pre_outlier_count = len(points_out)
     points_out, colors_out, conf_out = _remove_spatial_outliers(points_out, colors_out, conf_out)
 
     print(f"  Final point count: {points_out.shape[0]:,}")
@@ -380,31 +269,13 @@ def export_ply(predictions, output_dir, args, seg_masks=None):
     pc.export(ply_path)
     print(f"  Exported: {ply_path}")
 
-    # Save per-point class labels for mesh separation
-    if class_labels_flat is not None:
-        labels_out = class_labels_flat[mask]
-        # If outlier removal changed the count, re-align via nearest neighbor
-        if len(labels_out) != len(points_out):
-            from scipy.spatial import KDTree
-            pre_points = points_flat[mask]
-            tree = KDTree(pre_points)
-            _, idx = tree.query(points_out)
-            labels_out = labels_out[idx]
-        labels_path = os.path.join(output_dir, "point_labels.npz")
-        np.savez_compressed(labels_path, points=points_out, labels=labels_out,
-                            colors=colors_out)
-        n_a = (labels_out == 1).sum()
-        n_v = (labels_out == 2).sum()
-        print(f"  Class labels saved: ArUco={n_a:,}, Vase={n_v:,} → {labels_path}")
-
     return ply_path
 
 
 # ---------------------------------------------------------------------------
 #  Stage 3: Clean point cloud and extract objects
 # ---------------------------------------------------------------------------
-def clean_and_extract(ply_path, output_dir, num_objects=2, skip_plane=False,
-                      merge_clusters=False):
+def clean_and_extract(ply_path, output_dir, num_objects=2):
     """Clean point cloud, extract top-k objects."""
     print()
     print("=" * 60)
@@ -427,8 +298,6 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, skip_plane=False,
             output_folder=clean_output_dir,
             k=num_objects,
             visualize=False,
-            skip_plane=skip_plane,
-            merge_clusters=merge_clusters,
         )
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:
@@ -443,161 +312,106 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, skip_plane=False,
 #  Stage 4: Reconstruct mesh from cleaned objects
 # ---------------------------------------------------------------------------
 def reconstruct_mesh_stage(object_paths, output_dir):
-    """Reconstruct mesh from cleaned object point clouds."""
+    """STAGE 4: Reconstruct each object point cloud into a (non-watertight) mesh.
+
+    Returns (scene_recon_path, recon_mesh_paths).
+    """
     print()
     print("=" * 60)
-    print("STAGE 4: Reconstructing mesh from objects")
+    print("STAGE 4: Reconstructing mesh (Poisson)")
     print("=" * 60)
 
     try:
         from recons import reconstruct_multiple_objects
     except ImportError:
         print("  WARNING: recons module not found. Skipping reconstruction.")
-        print("  Make sure ./clean/recons.py exists.")
-        return None
+        return None, []
 
     mesh_output_dir = os.path.join(output_dir, "mesh")
     os.makedirs(mesh_output_dir, exist_ok=True)
 
     try:
-        mesh_path, _ = reconstruct_multiple_objects(
+        scene_recon, _, recon_paths = reconstruct_multiple_objects(
             input_paths=object_paths,
             output_folder=mesh_output_dir,
-            base_name="scene",
+            base_name="scene_recon",
         )
-        print(f"  Reconstructed mesh: {mesh_path}")
-        return mesh_path
+        print(f"  Scene recon mesh: {scene_recon}")
+        for p in recon_paths:
+            print(f"  Object recon mesh: {p}")
+        return scene_recon, recon_paths
     except Exception as e:
         print(f"  ERROR during reconstruction: {e}")
-        return None
-
-
+        return None, []
+    
 # ---------------------------------------------------------------------------
-#  Stage 4.5: Separate mesh into per-class meshes (Vase / ArUco)
+#  Stage 5: Making meshes watertight (PyMeshFix)
 # ---------------------------------------------------------------------------
-def separate_mesh(mesh_path, labels_path, output_dir):
-    """Separate reconstructed mesh into per-class meshes using point class labels.
 
-    Uses KDTree to assign each mesh vertex to the nearest class-labeled point,
-    then splits faces by majority vote of vertex labels.
+
+def watertight_stage(recon_paths, output_dir):
+    """STAGE 5: Fill each reconstructed mesh to be watertight (PyMeshFix + color transfer).
+
+    Returns (scene_watertight_path, watertight_mesh_paths).
     """
     print()
     print("=" * 60)
-    print("STAGE 4.5: Separating mesh into Vase and ArUco")
+    print("STAGE 5: Making meshes watertight (PyMeshFix)")
     print("=" * 60)
 
-    import open3d as o3d
-    from scipy.spatial import KDTree
+    try:
+        from recons import make_watertight_meshes
+    except ImportError:
+        print("  WARNING: recons module not found. Skipping watertight step.")
+        return None, []
 
-    if not os.path.exists(labels_path):
-        print(f"  WARNING: Point labels not found at {labels_path}. Skipping separation.")
-        return {}
+    mesh_output_dir = os.path.join(output_dir, "mesh")
 
-    # Load mesh
-    mesh = o3d.io.read_triangle_mesh(mesh_path)
-    mesh.compute_vertex_normals()
-    vertices = np.asarray(mesh.vertices)
-    triangles = np.asarray(mesh.triangles)
-    has_colors = mesh.has_vertex_colors()
-    vertex_colors = np.asarray(mesh.vertex_colors) if has_colors else None
-
-    print(f"  Combined mesh: {len(vertices):,} vertices, {len(triangles):,} faces")
-
-    # Load class-labeled points
-    data = np.load(labels_path)
-    labeled_points = data["points"]
-    labels = data["labels"]
-    print(f"  Labeled points: {len(labeled_points):,} "
-          f"(ArUco={int((labels==1).sum()):,}, Vase={int((labels==2).sum()):,})")
-
-    # Build KD-tree and assign each vertex to nearest labeled point's class
-    tree = KDTree(labeled_points)
-    dists, indices = tree.query(vertices)
-    vertex_labels = labels[indices]
-
-    sep_dir = os.path.join(output_dir, "separated")
-    os.makedirs(sep_dir, exist_ok=True)
-
-    class_names = {1: "aruco", 2: "vase"}
-    results = {}
-
-    for cls_id, cls_name in class_names.items():
-        # Majority vote: face belongs to class if >=2 of 3 vertices have that class
-        face_vertex_labels = vertex_labels[triangles]  # (F, 3)
-        face_mask = (face_vertex_labels == cls_id).sum(axis=1) >= 2
-
-        cls_faces = triangles[face_mask]
-        if len(cls_faces) == 0:
-            print(f"  {cls_name}: no faces — skipped")
-            continue
-
-        # Re-index vertices used by these faces
-        unique_verts, inverse = np.unique(cls_faces.ravel(), return_inverse=True)
-        new_verts = vertices[unique_verts]
-        new_faces = inverse.reshape(-1, 3)
-
-        cls_mesh = o3d.geometry.TriangleMesh()
-        cls_mesh.vertices = o3d.utility.Vector3dVector(new_verts)
-        cls_mesh.triangles = o3d.utility.Vector3iVector(new_faces)
-        cls_mesh.compute_vertex_normals()
-
-        if has_colors:
-            cls_mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors[unique_verts])
-
-        # Remove small disconnected components (boundary artifacts)
-        components = cls_mesh.cluster_connected_triangles()
-        cluster_ids = np.asarray(components[0])
-        cluster_areas = np.asarray(components[2])
-        if len(cluster_areas) > 1:
-            largest = np.argmax(cluster_areas)
-            keep_mask = cluster_ids == largest
-            cls_mesh.remove_triangles_by_mask(~keep_mask)
-            cls_mesh.remove_unreferenced_vertices()
-            removed_components = len(cluster_areas) - 1
-            print(f"  {cls_name}: removed {removed_components} small components")
-
-        out_path = os.path.join(sep_dir, f"{cls_name}.ply")
-        o3d.io.write_triangle_mesh(out_path, cls_mesh)
-        results[cls_name] = out_path
-
-        final_verts = len(np.asarray(cls_mesh.vertices))
-        final_faces = len(np.asarray(cls_mesh.triangles))
-        size_mb = os.path.getsize(out_path) / (1024 * 1024)
-        print(f"  {cls_name}: {final_faces:,} faces, {final_verts:,} vertices "
-              f"→ {out_path} ({size_mb:.1f} MB)")
-
-    return results
+    try:
+        scene_wt, _, wt_paths = make_watertight_meshes(
+            recon_paths=recon_paths,
+            output_folder=mesh_output_dir,
+            base_name="scene",
+        )
+        print(f"  Scene watertight mesh: {scene_wt}")
+        for p in wt_paths:
+            print(f"  Object watertight mesh: {p}")
+        return scene_wt, wt_paths
+    except Exception as e:
+        print(f"  ERROR during watertight repair: {e}")
+        return None, []
 
 
 # ---------------------------------------------------------------------------
-#  Stage 5: Evaluate — auto-screenshot using viewer.py
+#  Stage 6: Evaluate — auto-screenshot using viewer.py
 # ---------------------------------------------------------------------------
-def _capture_screenshot(viewer_script, file_path, screenshot_path, extra_args=None):
-    """Helper to capture a screenshot of a 3D file using viewer.py."""
+def _capture_multi_view(viewer_script, file_path, output_dir, label, extra_args=None):
+    """Capture multi-perspective screenshots of a 3D file using viewer.py --multi-view."""
     import subprocess
     cmd = [
         sys.executable, viewer_script,
         file_path,
-        "--auto-screenshot",
-        "--screenshot", screenshot_path,
+        "--multi-view",
+        "--screenshot", output_dir,
         "--bg-color", "0.05", "0.05", "0.05",
     ]
     if extra_args:
         cmd.extend(extra_args)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode == 0:
-        print(f"    ✓ Saved: {screenshot_path}")
+        count = result.stdout.strip().count("Saved:")
+        print(f"    ✓ {label}: {count} views → {output_dir}")
         return True
     else:
-        print(f"    ✗ Failed: {result.stderr[:200] if result.stderr else 'unknown error'}")
+        print(f"    ✗ {label} failed: {result.stderr[:200] if result.stderr else 'unknown error'}")
         return False
 
 
-def evaluate_with_viewer(output_dir, ply_path, mesh_path=None, separated_meshes=None):
-    """Capture screenshots of PLY, combined mesh, and separated meshes."""
+def evaluate_with_viewer(output_dir, ply_path, mesh_path=None, object_mesh_paths=None):
+    """Capture multi-perspective screenshots of PLY, scene mesh, and each object mesh."""
     print()
     print("=" * 60)
-    print("STAGE 5: Evaluation — capturing screenshots")
+    print("STAGE 6: Evaluation — multi-perspective screenshots")
     print("=" * 60)
 
     viewer_script = os.path.join(_SCRIPT_DIR, "viewer.py")
@@ -608,40 +422,120 @@ def evaluate_with_viewer(output_dir, ply_path, mesh_path=None, separated_meshes=
     eval_dir = os.path.join(output_dir, "evaluation")
     os.makedirs(eval_dir, exist_ok=True)
 
-    # Screenshot point cloud
+    # Multi-view screenshots for point cloud
     if ply_path and os.path.exists(ply_path):
-        print(f"  Capturing point cloud screenshot...")
-        _capture_screenshot(viewer_script, ply_path,
-                            os.path.join(eval_dir, "pointcloud.png"),
-                            ["--point-size", "2.0"])
+        print(f"  Point cloud (6 views)...")
+        _capture_multi_view(viewer_script, ply_path,
+                            os.path.join(eval_dir, "pointcloud"),
+                            "Point cloud", ["--point-size", "2.0"])
 
-    # Screenshot combined mesh
+    # Multi-view screenshots for scene mesh
     if mesh_path and os.path.exists(mesh_path):
-        print(f"  Capturing combined mesh screenshot...")
-        _capture_screenshot(viewer_script, mesh_path,
-                            os.path.join(eval_dir, "mesh_combined.png"))
+        print(f"  Scene mesh (6 views)...")
+        _capture_multi_view(viewer_script, mesh_path,
+                            os.path.join(eval_dir, "scene"),
+                            "Scene mesh")
 
-    # Screenshot separated meshes
-    if separated_meshes:
-        for cls_name, cls_path in separated_meshes.items():
-            if os.path.exists(cls_path):
-                print(f"  Capturing {cls_name} mesh screenshot...")
-                _capture_screenshot(viewer_script, cls_path,
-                                    os.path.join(eval_dir, f"mesh_{cls_name}.png"))
+    # Multi-view screenshots for each individual object mesh
+    if object_mesh_paths:
+        for i, obj_path in enumerate(object_mesh_paths):
+            if os.path.exists(obj_path):
+                print(f"  Object {i} mesh (6 views)...")
+                _capture_multi_view(viewer_script, obj_path,
+                                    os.path.join(eval_dir, f"object_{i}"),
+                                    f"Object {i}")
 
     # Print file info for all outputs
     print()
     print("  --- Output Summary ---")
-    all_outputs = [("Point Cloud", ply_path), ("Combined Mesh", mesh_path)]
-    if separated_meshes:
-        for cls_name, cls_path in separated_meshes.items():
-            all_outputs.append((f"Mesh ({cls_name})", cls_path))
+    all_outputs = [("Point Cloud", ply_path), ("Scene Mesh", mesh_path)]
+    if object_mesh_paths:
+        for i, p in enumerate(object_mesh_paths):
+            all_outputs.append((f"Object {i} Mesh", p))
     for label, path in all_outputs:
         if path and os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             print(f"  {label}: {path} ({size_mb:.1f} MB)")
         else:
             print(f"  {label}: (not generated)")
+
+
+# ---------------------------------------------------------------------------
+#  Stage 7: Compute real-world volumes using ArUco reference
+# ---------------------------------------------------------------------------
+# Hard-coded: Object 1 is the ArUco marker, a 14x14x14 cm cube.
+# Object 0 is the unknown object (e.g., vase) whose volume we want to measure.
+REFERENCE_OBJECT_INDEX = 1        # which object is the ArUco reference
+REFERENCE_REAL_SIZE_CM = 14.0     # real linear size of reference in cm
+
+
+def compute_volumes(object_mesh_paths):
+    """Compute real-world volume of each object using ArUco reference for scale.
+
+    Uses object at REFERENCE_OBJECT_INDEX as the reference (known 14x14x14 cm cube).
+    Scale factor k = mesh_max_extent / real_size.
+    Real volume = mesh_volume / k^3.
+    """
+    print()
+    print("=" * 60)
+    print(f"STAGE 7: Computing real-world volumes "
+          f"(ref: object_{REFERENCE_OBJECT_INDEX} = {REFERENCE_REAL_SIZE_CM}cm ArUco)")
+    print("=" * 60)
+
+    if len(object_mesh_paths) <= REFERENCE_OBJECT_INDEX:
+        print(f"  Not enough meshes (need object_{REFERENCE_OBJECT_INDEX} as reference). Skipping.")
+        return
+
+    infos = []
+    for i, path in enumerate(object_mesh_paths):
+        if not os.path.exists(path):
+            print(f"  [{i}] {path}: missing, skipping")
+            continue
+        mesh = trimesh.load(path, force="mesh")
+        extents = mesh.bounds[1] - mesh.bounds[0]
+        max_extent = float(np.max(extents))
+        if mesh.is_watertight:
+            volume = float(abs(mesh.volume))
+            method = "watertight"
+        else:
+            try:
+                volume = float(abs(mesh.convex_hull.volume))
+                method = "convex_hull (not watertight)"
+            except Exception:
+                volume = 0.0
+                method = "FAILED"
+        infos.append({
+            "idx": i, "name": os.path.basename(path), "volume": volume,
+            "max_extent": max_extent, "extents": extents, "method": method,
+        })
+        print(f"  [{i}] {infos[-1]['name']}: "
+              f"mesh_vol={volume:.6f} units^3, max_extent={max_extent:.4f} units ({method})")
+
+    # Compute scale factor from reference object
+    ref = next((x for x in infos if x["idx"] == REFERENCE_OBJECT_INDEX), None)
+    if ref is None or ref["max_extent"] <= 0:
+        print(f"  Reference object_{REFERENCE_OBJECT_INDEX} not available. Skipping.")
+        return
+
+    k = ref["max_extent"] / REFERENCE_REAL_SIZE_CM
+    k3 = k ** 3
+
+    print(f"\n  Scale factor:")
+    print(f"    k   = mesh_extent / real_size = {ref['max_extent']:.4f} / "
+          f"{REFERENCE_REAL_SIZE_CM} = {k:.6f}")
+    print(f"    k^3 = {k3:.6f}")
+
+    # Report real-world values
+    print(f"\n  Real-world dimensions and volumes:")
+    print(f"  {'IDX':>4} {'NAME':<20} {'SIZE (cm)':<24} {'VOLUME (cm^3)':>14}")
+    print("  " + "-" * 68)
+    for info in infos:
+        ext_cm = info["extents"] / k
+        real_vol = info["volume"] / k3
+        size_str = f"{ext_cm[0]:6.2f} x {ext_cm[1]:6.2f} x {ext_cm[2]:6.2f}"
+        marker = "  <- REF" if info["idx"] == REFERENCE_OBJECT_INDEX else ""
+        print(f"  {info['idx']:>4} {info['name']:<20} {size_str:<24} "
+              f"{real_vol:>14.2f}{marker}")
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +554,7 @@ def main():
     print(f"║  Pred. mode    : {args.prediction_mode:<40}║")
     print(f"║  Conf. thresh  : {args.conf_thres:<40}║")
     print(f"║  Skip mesh     : {str(args.skip_mesh):<40}║")
-    print(f"║  Segment       : {str(args.segment):<40}║")
+    print(f"║  Watertight    : {str(not args.no_watertight):<40}║")
     print(f"║  Evaluate      : {str(args.evaluate):<40}║")
     print(f"╚{'═' * 58}╝")
 
@@ -688,16 +582,7 @@ def main():
         if not os.path.exists(dst):
             shutil.copy2(src, dst)
 
-    # ── Stage 0: Segmentation masks (optional) ──
-    mask_dir = None
-    if args.segment:
-        if not os.path.exists(args.seg_checkpoint):
-            print(f"\nERROR: Segmentation checkpoint not found: {args.seg_checkpoint}")
-            print("Train the model first: python detect/train_seg.py --data_dir ./data")
-            sys.exit(1)
-        mask_dir, _ = generate_seg_masks(args.image_folder, args.output_dir, args, device)
-
-    # ── Stage 1: Inference (on ORIGINAL images for better correspondences) ──
+    # ── Stage 1: Inference ──
     predictions, inference_time = run_inference(args.image_folder, device, args.max_frames)
 
     # Save predictions (compatible with demo_gradio)
@@ -710,49 +595,40 @@ def main():
     npz_path2 = os.path.join(args.output_dir, "predictions.npz")
     shutil.copy2(npz_path, npz_path2)
 
-    # ── Stage 2: Export PLY (with segmentation mask filtering if enabled) ──
-    seg_masks_for_ply = None
-    if args.segment:
-        # Load multi-class masks (.npy) in the same order as the selected frames
-        image_names = sorted(glob.glob(os.path.join(args.image_folder, "*")))
-        image_names = [p for p in image_names
-                       if p.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))]
-        image_names = _select_frames(image_names, args.max_frames)
-        seg_masks_for_ply = []
-        for img_path in image_names:
-            stem = os.path.splitext(os.path.basename(img_path))[0]
-            mask_path = os.path.join(mask_dir, stem + ".npy")
-            if os.path.exists(mask_path):
-                m = np.load(mask_path)  # multi-class: 0=bg, 1=ArUco, 2=Vase
-                seg_masks_for_ply.append(m)
-            else:
-                # No mask found — include all points (mark as bg=0, will be excluded)
-                seg_masks_for_ply.append(np.zeros((518, 518), dtype=np.uint8))
-        print(f"  Loaded {len(seg_masks_for_ply)} multi-class masks for point filtering")
+    # ── Stage 2: Export PLY ──
+    ply_path = export_ply(predictions, args.output_dir, args)
 
-    ply_path = export_ply(predictions, args.output_dir, args, seg_masks=seg_masks_for_ply)
+    # ── Stage 3: Clean + Extract ──
+    scene_recon_path = None
+    recon_mesh_paths = []
+    scene_wt_path = None
+    wt_mesh_paths = []
 
-    # ── Stage 3 & 4: Clean + Reconstruct combined mesh (both objects) ──
-    mesh_path = None
-    separated_meshes = {}
     if not args.skip_mesh:
-        # Merge all clusters into one combined cloud for joint reconstruction
-        object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects,
-                                          skip_plane=args.segment,
-                                          merge_clusters=args.segment)
+        object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects)
         if object_paths:
-            mesh_path = reconstruct_mesh_stage(object_paths, args.output_dir)
+            # ── Stage 4: Reconstruct (Poisson, non-watertight) ──
+            scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
+                object_paths, args.output_dir)
 
-        # ── Stage 4.5: Separate combined mesh into Vase / ArUco ──
-        labels_path = os.path.join(args.output_dir, "point_labels.npz")
-        if mesh_path and args.segment and os.path.exists(labels_path):
-            separated_meshes = separate_mesh(mesh_path, labels_path, args.output_dir)
+            # ── Stage 5: Make watertight (default; skip with --no-watertight) ──
+            if recon_mesh_paths and not args.no_watertight:
+                scene_wt_path, wt_mesh_paths = watertight_stage(
+                    recon_mesh_paths, args.output_dir)
     else:
         print("\n  (Skipping mesh stages — --skip_mesh was set)")
 
-    # ── Stage 5: Evaluate ──
+    # Use watertight meshes for evaluation and volume if available, else recon meshes
+    eval_scene = scene_wt_path or scene_recon_path
+    eval_objects = wt_mesh_paths or recon_mesh_paths
+
+    # ── Stage 6: Evaluate ──
     if args.evaluate:
-        evaluate_with_viewer(args.output_dir, ply_path, mesh_path, separated_meshes)
+        evaluate_with_viewer(args.output_dir, ply_path, eval_scene, eval_objects)
+
+    # ── Stage 7: Compute real-world volumes (uses ArUco as reference) ──
+    if eval_objects:
+        compute_volumes(eval_objects)
 
     # ── Summary ──
     total_time = time.time() - total_t0
@@ -765,20 +641,28 @@ def main():
     print(f"╠{'═' * 58}╣")
     print(f"║  Outputs:                                                ║")
     print(f"║    PLY         : {ply_path:<40}║")
-    if mesh_path:
-        print(f"║    Combined    : {mesh_path:<40}║")
-    for cls_name, cls_path in separated_meshes.items():
-        print(f"║    {cls_name:<13}: {cls_path:<40}║")
+    if scene_recon_path:
+        print(f"║    Scene recon : {scene_recon_path:<40}║")
+    for i, p in enumerate(recon_mesh_paths):
+        print(f"║    Recon {i}     : {p:<40}║")
+    if scene_wt_path:
+        print(f"║    Scene wt    : {scene_wt_path:<40}║")
+    for i, p in enumerate(wt_mesh_paths):
+        print(f"║    Wt {i}        : {p:<40}║")
     print(f"║    Predictions : {npz_path2:<40}║")
     print(f"║    Target dir  : {target_dir:<40}║")
     print(f"╚{'═' * 58}╝")
     print()
     print("To view results interactively:")
     print(f"  python viewer.py {ply_path}")
-    if mesh_path:
-        print(f"  python viewer.py {mesh_path}")
-    for cls_name, cls_path in separated_meshes.items():
-        print(f"  python viewer.py {cls_path}  # {cls_name}")
+    if scene_recon_path:
+        print(f"  python viewer.py {scene_recon_path}  # recon scene")
+    for i, p in enumerate(recon_mesh_paths):
+        print(f"  python viewer.py {p}  # recon object {i}")
+    if scene_wt_path:
+        print(f"  python viewer.py {scene_wt_path}  # watertight scene")
+    for i, p in enumerate(wt_mesh_paths):
+        print(f"  python viewer.py {p}  # watertight object {i}")
     print()
     print("To use with demo_gradio.py:")
     print(f"  The predictions are saved at: {target_dir}/predictions.npz")

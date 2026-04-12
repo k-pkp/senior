@@ -54,6 +54,8 @@ def parse_args():
                    help="Subsample point cloud to at most N points for faster viewing")
     p.add_argument("--info", action="store_true",
                    help="Print file info (vertex count, bounds, etc.) and exit")
+    p.add_argument("--multi-view", action="store_true",
+                   help="Capture screenshots from 6 perspectives (front/back/left/right/top/bottom)")
     return p.parse_args()
 
 
@@ -191,6 +193,84 @@ def _screenshot_offscreen(o3d_geoms, screenshot_path, args):
     return True
 
 
+def _screenshot_multi_view(o3d_geoms, screenshot_dir, base_name, args):
+    """Capture screenshots from 16 camera perspectives around the geometry.
+
+    Orbital ring at 3 elevations (high/mid/low, 45-degree steps) + top + bottom.
+    """
+    import open3d.visualization.rendering as rendering
+
+    width, height = 1920, 1080
+    os.makedirs(screenshot_dir, exist_ok=True)
+
+    mat = rendering.MaterialRecord()
+    mat.shader = "defaultUnlit"
+    mat.point_size = args.point_size * 3.0
+
+    mat_mesh = rendering.MaterialRecord()
+    mat_mesh.shader = "defaultLit"
+
+    bbox = None
+    for g in o3d_geoms:
+        gb = g.get_axis_aligned_bounding_box()
+        bbox = gb if bbox is None else bbox + gb
+
+    if bbox is None:
+        print("  No geometry to render")
+        return []
+
+    center = bbox.get_center()
+    extent = bbox.get_extent()
+    dist = max(extent) * 1.3
+
+    up = np.array([0.0, -1.0, 0.0])
+    views = []
+
+    # 3 elevation rings x 12 azimuth steps = 36 orbital views
+    elevations = [
+        ("mid", 0.3),     # slight downward
+        ("high", 0.7),    # steep downward
+        ("low", -0.15),   # slightly upward
+    ]
+    for elev_name, elev in elevations:
+        for angle_deg in range(0, 360, 30):
+            angle = np.radians(angle_deg)
+            r = dist * (0.7 if elev_name == "high" else 1.0)
+            eye = np.array([
+                np.sin(angle) * r,
+                -dist * elev,
+                np.cos(angle) * r,
+            ])
+            views.append((f"{elev_name}_{angle_deg:03d}", eye, up))
+
+    # Top and bottom
+    views.append(("top", np.array([0.0, -dist, 0.0]), np.array([0.0, 0.0, 1.0])))
+    views.append(("bottom", np.array([0.0, dist, 0.0]), np.array([0.0, 0.0, -1.0])))
+
+    saved = []
+    for view_name, eye_offset, view_up in views:
+        renderer = rendering.OffscreenRenderer(width, height)
+        renderer.scene.set_background(np.array([*args.bg_color, 1.0]))
+
+        for i, g in enumerate(o3d_geoms):
+            name = f"geom_{i}"
+            if isinstance(g, o3d.geometry.PointCloud):
+                renderer.scene.add_geometry(name, g, mat)
+            else:
+                renderer.scene.add_geometry(name, g, mat_mesh)
+
+        eye = center + eye_offset
+        renderer.scene.camera.look_at(center, eye, view_up)
+
+        out_path = os.path.join(screenshot_dir, f"{base_name}_{view_name}.png")
+        img = renderer.render_to_image()
+        o3d.io.write_image(out_path, img)
+        saved.append(out_path)
+        del renderer
+
+    return saved
+
+
 def view_with_open3d(geometries_info, args):
     """View using Open3D (preferred — supports interactive rotation, screenshots)."""
     o3d_geoms = []
@@ -201,6 +281,17 @@ def view_with_open3d(geometries_info, args):
 
     if not o3d_geoms:
         print("No viewable geometry found.")
+        return
+
+    if args.multi_view:
+        screenshot_dir = args.screenshot or "multi_view"
+        base_name = os.path.splitext(os.path.basename(args.files[0]))[0]
+        try:
+            saved = _screenshot_multi_view(o3d_geoms, screenshot_dir, base_name, args)
+            for p in saved:
+                print(f"  Saved: {p}")
+        except Exception as e:
+            print(f"  Multi-view failed: {e}")
         return
 
     if args.auto_screenshot or args.screenshot:

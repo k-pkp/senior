@@ -171,7 +171,7 @@ clean/clean_input_ply/
 clean/output_objects/
 
 #data
-data
+data/
 
 #checkpoints
 checkpoints/
@@ -180,4 +180,4 @@ checkpoints/
 detect/checkpoints/
 detect/input/
 
-examples/
+.gradio/

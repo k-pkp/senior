@@ -129,13 +129,12 @@ def clean_and_extract_objects(
     print(f"Outlier removal: {initial_count:,} → {len(pcd.points):,} (std_ratio={std_ratio})")
 
     # ---- adaptive downsampling ----
-    # Only downsample if very dense; preserve detail for sparse clouds
     if len(pcd.points) > 100000:
         voxel_size = 0.002
         pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
         print(f"Downsampled to {len(pcd.points):,} (voxel={voxel_size})")
     else:
-        print(f"Skipping downsampling (only {len(pcd.points):,} points)")
+        print(f"Skipping downsampling ({len(pcd.points):,} points)")
 
     # ---- smart plane removal ----
     # Skip plane removal if segmentation already isolated the object
@@ -146,7 +145,7 @@ def clean_and_extract_objects(
         # (if the plane IS the object, don't remove it)
         try:
             plane_model, inliers = pcd.segment_plane(
-                distance_threshold=0.02,
+                distance_threshold=0.015,
                 ransac_n=3,
                 num_iterations=1000
             )

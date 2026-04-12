@@ -33,7 +33,6 @@ try:
     import matplotlib
     matplotlib.use("Agg")  # non-interactive backend for screenshot
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
@@ -55,13 +54,12 @@ def parse_args():
     p.add_argument("--info", action="store_true",
                    help="Print file info (vertex count, bounds, etc.) and exit")
     p.add_argument("--multi-view", action="store_true",
-                   help="Capture screenshots from 6 perspectives (front/back/left/right/top/bottom)")
+                   help="Capture 38 screenshots: 36 orbital views (3 elevations x 12 angles) + top + bottom")
     return p.parse_args()
 
 
 def load_geometry(filepath):
     """Load a 3D file and return (trimesh object, description string)."""
-    ext = os.path.splitext(filepath)[1].lower()
     scene_or_mesh = trimesh.load(filepath)
 
     if isinstance(scene_or_mesh, trimesh.Scene):
@@ -69,7 +67,6 @@ def load_geometry(filepath):
         if not geometries:
             print(f"  Warning: {filepath} contains an empty scene")
             return None, "empty scene"
-        # Merge all geometries
         combined = trimesh.util.concatenate(geometries)
         desc = f"scene with {len(geometries)} geometries"
     else:
@@ -130,9 +127,13 @@ def _trimesh_to_o3d(geom, args):
         mesh.vertices = o3d.utility.Vector3dVector(np.asarray(geom.vertices))
         mesh.triangles = o3d.utility.Vector3iVector(np.asarray(geom.faces))
 
-        if geom.visual and hasattr(geom.visual, "vertex_colors") and geom.visual.vertex_colors is not None:
-            vc = np.asarray(geom.visual.vertex_colors)[:, :3].astype(np.float64) / 255.0
-            mesh.vertex_colors = o3d.utility.Vector3dVector(vc)
+        try:
+            vc = np.asarray(geom.visual.vertex_colors)
+            if vc.ndim == 2 and vc.shape[0] == len(geom.vertices) and vc.shape[1] >= 3:
+                vc = vc[:, :3].astype(np.float64) / 255.0
+                mesh.vertex_colors = o3d.utility.Vector3dVector(vc)
+        except (AttributeError, TypeError, ValueError):
+            pass
 
         mesh.compute_vertex_normals()
         return mesh
@@ -290,6 +291,7 @@ def view_with_open3d(geometries_info, args):
             saved = _screenshot_multi_view(o3d_geoms, screenshot_dir, base_name, args)
             for p in saved:
                 print(f"  Saved: {p}")
+            print(f"  Total: {len(saved)} views saved to {screenshot_dir}")
         except Exception as e:
             print(f"  Multi-view failed: {e}")
         return
@@ -402,10 +404,19 @@ def view_with_matplotlib(geometries_info, args):
         print(f"Screenshot saved: {screenshot_path}")
         plt.close()
     else:
+        # Interactive display — need to switch backend before plt.show()
+        # matplotlib.use() must happen before figure creation to work reliably,
+        # so we save the figure, switch backend, and re-display.
         print("\nMatplotlib viewer (interactive).")
         print("  Drag to rotate, scroll to zoom. Close window to exit.")
-        matplotlib.use("TkAgg")  # switch to interactive backend
-        plt.show()
+        try:
+            plt.switch_backend("TkAgg")
+            plt.show()
+        except Exception as e:
+            print(f"  Interactive display failed: {e}")
+            print(f"  Saving to screenshot.png instead")
+            plt.savefig("screenshot.png", dpi=150, bbox_inches="tight")
+            plt.close()
 
 
 def main():
@@ -431,6 +442,11 @@ def main():
         for filepath, geom in geometries_info:
             print_info(filepath, geom)
         return
+
+    # Multi-view requires Open3D
+    if args.multi_view and not HAS_O3D:
+        print("ERROR: --multi-view requires Open3D. Install with: pip install open3d")
+        sys.exit(1)
 
     # Try Open3D first (best experience), fall back to matplotlib
     if HAS_O3D:

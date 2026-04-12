@@ -473,8 +473,18 @@ def compute_volumes(object_mesh_paths):
     """Compute real-world volume of each object using ArUco reference for scale.
 
     Uses object at REFERENCE_OBJECT_INDEX as the reference (known 14x14x14 cm cube).
-    Scale factor k = mesh_max_extent / real_size.
-    Real volume = mesh_volume / k^3.
+    Formula:
+        mesh_bbox_vol_ref = X_ref * Y_ref * Z_ref   (product of reference extents)
+        k = real_size^3 / mesh_bbox_vol_ref         (volume scale factor)
+        real_X = mesh_X * k^(1/3)
+        real_volume = mesh_volume * k
+    Example:
+        Ref ArUco is 14x14x14 cm cube → real_volume = 14^3 = 2744 cm^3.
+        Ref mesh bbox = 40 x 50 x 30 → bbox_vol = 60000.
+        k = 2744 / 60000 = 0.04573.
+        For object i with mesh bbox (X,Y,Z):
+          real_X = X * k^(1/3), real_Y = Y * k^(1/3), real_Z = Z * k^(1/3).
+        real_volume_i = mesh_volume_i * k.
     """
     print()
     print("=" * 60)
@@ -504,34 +514,41 @@ def compute_volumes(object_mesh_paths):
             except Exception:
                 volume = 0.0
                 method = "FAILED"
+        bbox_vol = float(extents[0] * extents[1] * extents[2])
         infos.append({
             "idx": i, "name": os.path.basename(path), "volume": volume,
-            "max_extent": max_extent, "extents": extents, "method": method,
+            "max_extent": max_extent, "extents": extents, "bbox_vol": bbox_vol,
+            "method": method,
         })
         print(f"  [{i}] {infos[-1]['name']}: "
-              f"mesh_vol={volume:.6f} units^3, max_extent={max_extent:.4f} units ({method})")
+              f"mesh_vol={volume:.6f}, bbox_vol={bbox_vol:.6f} "
+              f"(extents {extents[0]:.4f}x{extents[1]:.4f}x{extents[2]:.4f}) ({method})")
 
     # Compute scale factor from reference object
     ref = next((x for x in infos if x["idx"] == REFERENCE_OBJECT_INDEX), None)
-    if ref is None or ref["max_extent"] <= 0:
+    if ref is None or ref["bbox_vol"] <= 0:
         print(f"  Reference object_{REFERENCE_OBJECT_INDEX} not available. Skipping.")
         return
 
-    k = ref["max_extent"] / REFERENCE_REAL_SIZE_CM
-    k3 = k ** 3
+    real_ref_vol = REFERENCE_REAL_SIZE_CM ** 3   # e.g., 14^3 = 2744 cm^3
+    k = real_ref_vol / ref["bbox_vol"]            # volume scale factor
+    cube_root_k = k ** (1.0 / 3.0)                # linear scale factor
 
     print(f"\n  Scale factor:")
-    print(f"    k   = mesh_extent / real_size = {ref['max_extent']:.4f} / "
-          f"{REFERENCE_REAL_SIZE_CM} = {k:.6f}")
-    print(f"    k^3 = {k3:.6f}")
+    print(f"    ref bbox_vol = {ref['extents'][0]:.4f} * {ref['extents'][1]:.4f} * "
+          f"{ref['extents'][2]:.4f} = {ref['bbox_vol']:.6f}")
+    print(f"    real_ref_vol = {REFERENCE_REAL_SIZE_CM}^3 = {real_ref_vol:.2f} cm^3")
+    print(f"    k            = real_ref_vol / mesh_bbox_vol = "
+          f"{real_ref_vol:.2f} / {ref['bbox_vol']:.6f} = {k:.6f}")
+    print(f"    k^(1/3)      = {cube_root_k:.6f}")
 
-    # Report real-world values
+    # Report real-world values (volume = real_X * real_Y * real_Z = bbox_vol * k)
     print(f"\n  Real-world dimensions and volumes:")
     print(f"  {'IDX':>4} {'NAME':<20} {'SIZE (cm)':<24} {'VOLUME (cm^3)':>14}")
     print("  " + "-" * 68)
     for info in infos:
-        ext_cm = info["extents"] / k
-        real_vol = info["volume"] / k3
+        ext_cm = info["extents"] * cube_root_k
+        real_vol = float(ext_cm[0] * ext_cm[1] * ext_cm[2])
         size_str = f"{ext_cm[0]:6.2f} x {ext_cm[1]:6.2f} x {ext_cm[2]:6.2f}"
         marker = "  <- REF" if info["idx"] == REFERENCE_OBJECT_INDEX else ""
         print(f"  {info['idx']:>4} {info['name']:<20} {size_str:<24} "

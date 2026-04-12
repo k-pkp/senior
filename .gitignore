@@ -144,6 +144,9 @@ dmypy.json
 **/outputs/skyseg.onnx
 skyseg.onnx
 
+# Mac
+.DS_Store
+
 # pixi environments
 .pixi
 *.egg-info

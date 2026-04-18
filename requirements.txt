@@ -19,3 +19,5 @@ einops
 safetensors
 omegaconf
 tqdm
+pymeshfix
+pyvista

@@ -13,6 +13,53 @@ def compute_eps(pcd, factor=4.0):
     return avg_dist * factor
 
 
+def _detect_plane_ransac_deterministic(pcd, distance_threshold=0.015, num_iterations=1000, seed=42):
+    """Deterministic RANSAC plane detection using numpy (avoids Open3D's non-seedable RNG).
+
+    Returns (plane_model, inlier_indices) — same format as pcd.segment_plane().
+    """
+    pts = np.asarray(pcd.points)
+    n = len(pts)
+    if n < 3:
+        raise ValueError("Need at least 3 points for plane detection")
+
+    rng = np.random.RandomState(seed)
+    best_plane = None
+    best_inliers = np.array([], dtype=np.int64)
+
+    for _ in range(num_iterations):
+        # Pick 3 distinct random points
+        i, j, k = rng.choice(n, size=3, replace=False)
+        p1, p2, p3 = pts[i], pts[j], pts[k]
+
+        # Compute plane normal via cross product of two edges
+        v1 = p2 - p1
+        v2 = p3 - p1
+        normal = np.cross(v1, v2)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-12:
+            continue  # degenerate triangle
+        normal = normal / norm_len
+
+        # Plane equation: normal · x + d = 0  →  d = -normal · p1
+        d = -np.dot(normal, p1)
+        plane = np.array([normal[0], normal[1], normal[2], d])
+
+        # Count inliers
+        distances = np.abs(np.dot(pts, normal) + d)
+        inlier_mask = distances <= distance_threshold
+        inlier_count = np.sum(inlier_mask)
+
+        if inlier_count > len(best_inliers):
+            best_inliers = np.where(inlier_mask)[0]
+            best_plane = plane
+
+    if best_plane is None:
+        raise ValueError("Could not detect any plane")
+
+    return best_plane, best_inliers
+
+
 def get_cluster_info(cluster):
     """Return extent, density, and maximum dimension of one cluster."""
     bbox = cluster.get_axis_aligned_bounding_box()
@@ -93,7 +140,8 @@ def clean_and_extract_objects(
     k=2,
     visualize=False,
     skip_plane=False,
-    merge_clusters=False
+    merge_clusters=False,
+    seed=42,
 ):
     """Clean a point cloud, split into objects, and save each object as PLY.
 
@@ -144,10 +192,8 @@ def clean_and_extract_objects(
         # Only remove a plane if it accounts for a significant portion but NOT most of the cloud
         # (if the plane IS the object, don't remove it)
         try:
-            plane_model, inliers = pcd.segment_plane(
-                distance_threshold=0.015,
-                ransac_n=3,
-                num_iterations=1000
+            plane_model, inliers = _detect_plane_ransac_deterministic(
+                pcd, distance_threshold=0.015, num_iterations=1000, seed=seed
             )
             plane_ratio = len(inliers) / len(pcd.points)
 

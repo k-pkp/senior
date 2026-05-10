@@ -183,6 +183,21 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
     o3d.io.write_triangle_mesh(scene_ply, final_mesh)
     o3d.io.write_triangle_mesh(scene_stl, final_mesh)
 
+    # scene_colour.ply — merge per-object watertight meshes preserving vertex
+    # colors (o3d merge path drops them). process=False keeps PyMeshFix seam
+    # duplicates intact so each object stays watertight after concatenation.
+    import trimesh
+    tm_objs = [trimesh.load(p, process=False) for p in watertight_paths]
+    scene_colour = trimesh.util.concatenate(tm_objs)
+    scene_colour_ply = os.path.join(output_folder, f"{base_name}_colour.ply")
+    scene_colour_stl = os.path.join(output_folder, f"{base_name}_colour.stl")
+    scene_colour.export(scene_colour_ply)
+    scene_colour.export(scene_colour_stl)  # STL is geometry-only; colors dropped
+    cs_size_mb = os.path.getsize(scene_colour_ply) / (1024 * 1024)
+    print(f"Scene colour: {len(scene_colour.vertices):,} verts, "
+          f"{len(scene_colour.faces):,} faces ({cs_size_mb:.1f} MB) "
+          f"→ {scene_colour_ply} + {scene_colour_stl}")
+
     return scene_ply, scene_stl, watertight_paths
 
 

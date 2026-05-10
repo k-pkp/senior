@@ -17,6 +17,21 @@ import sys
 import argparse
 import numpy as np
 
+# Deterministic RNG for any subsampling.
+_RNG = np.random.default_rng(42)
+
+
+def _aabb_union(a, b):
+    """Union of two Open3D AABBs (operator+ unsupported)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    import open3d as _o3d
+    mn = np.minimum(a.get_min_bound(), b.get_min_bound())
+    mx = np.maximum(a.get_max_bound(), b.get_max_bound())
+    return _o3d.geometry.AxisAlignedBoundingBox(mn, mx)
+
 try:
     import trimesh
 except ImportError:
@@ -59,8 +74,13 @@ def parse_args():
 
 
 def load_geometry(filepath):
-    """Load a 3D file and return (trimesh object, description string)."""
-    scene_or_mesh = trimesh.load(filepath)
+    """Load a 3D file and return (trimesh object, description string).
+
+    process=False — preserves vertex count and watertight topology produced
+    by PyMeshFix (default process=True welds intentional seam duplicates and
+    breaks edge-manifoldness, falsely reporting non-watertight).
+    """
+    scene_or_mesh = trimesh.load(filepath, process=False)
 
     if isinstance(scene_or_mesh, trimesh.Scene):
         geometries = list(scene_or_mesh.geometry.values())
@@ -109,7 +129,7 @@ def _trimesh_to_o3d(geom, args):
         pcd = o3d.geometry.PointCloud()
 
         if args.subsample and len(pts) > args.subsample:
-            indices = np.random.choice(len(pts), args.subsample, replace=False)
+            indices = _RNG.choice(len(pts), args.subsample, replace=False)
             pts = pts[indices]
             colors = np.asarray(geom.colors)[indices] if geom.colors is not None and len(geom.colors) > 0 else None
         else:
@@ -168,11 +188,7 @@ def _screenshot_offscreen(o3d_geoms, screenshot_path, args):
         else:
             renderer.scene.add_geometry(name, g, mat_mesh)
 
-        gb = g.get_axis_aligned_bounding_box()
-        if bbox is None:
-            bbox = gb
-        else:
-            bbox = bbox + gb
+        bbox = _aabb_union(bbox, g.get_axis_aligned_bounding_box())
 
     if bbox is None:
         print("  No geometry to render")
@@ -195,10 +211,7 @@ def _screenshot_offscreen(o3d_geoms, screenshot_path, args):
 
 
 def _screenshot_multi_view(o3d_geoms, screenshot_dir, base_name, args):
-    """Capture screenshots from 16 camera perspectives around the geometry.
-
-    Orbital ring at 3 elevations (high/mid/low, 45-degree steps) + top + bottom.
-    """
+    """Capture 38 screenshots: 3 elevations × 12 azimuths + top + bottom."""
     import open3d.visualization.rendering as rendering
 
     width, height = 1920, 1080
@@ -213,8 +226,7 @@ def _screenshot_multi_view(o3d_geoms, screenshot_dir, base_name, args):
 
     bbox = None
     for g in o3d_geoms:
-        gb = g.get_axis_aligned_bounding_box()
-        bbox = gb if bbox is None else bbox + gb
+        bbox = _aabb_union(bbox, g.get_axis_aligned_bounding_box())
 
     if bbox is None:
         print("  No geometry to render")
@@ -361,7 +373,7 @@ def view_with_matplotlib(geometries_info, args):
         if isinstance(geom, trimesh.PointCloud):
             pts = np.asarray(geom.vertices)
             if args.subsample and len(pts) > args.subsample:
-                indices = np.random.choice(len(pts), args.subsample, replace=False)
+                indices = _RNG.choice(len(pts), args.subsample, replace=False)
                 pts = pts[indices]
                 colors = np.asarray(geom.colors)[indices] if geom.colors is not None and len(geom.colors) > 0 else None
             else:
@@ -381,7 +393,7 @@ def view_with_matplotlib(geometries_info, args):
             # Subsample faces for performance
             max_faces = 50000
             if len(faces) > max_faces:
-                indices = np.random.choice(len(faces), max_faces, replace=False)
+                indices = _RNG.choice(len(faces), max_faces, replace=False)
                 faces = faces[indices]
 
             poly = Poly3DCollection(verts[faces], alpha=0.3, edgecolor="gray", linewidth=0.1)

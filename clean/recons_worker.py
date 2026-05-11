@@ -17,6 +17,16 @@ import open3d as o3d
 def main():
     input_path = sys.argv[1]
     output_path = sys.argv[2]
+    seed = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--seed" and i + 1 < len(sys.argv):
+            seed = int(sys.argv[i + 1])
+            break
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        o3d.utility.random.seed(seed)
 
     pcd = o3d.io.read_point_cloud(input_path)
     num_points = len(pcd.points)

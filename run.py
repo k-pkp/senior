@@ -16,6 +16,7 @@ import os
 import sys
 import glob
 import time
+import random
 import shutil
 import argparse
 
@@ -70,6 +71,8 @@ Examples:
                    help="Auto-capture screenshots of outputs with viewer.py")
     p.add_argument("--no-watertight", action="store_true",
                    help="Skip watertight repair (export only Poisson reconstruction)")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed for reproducibility (default: 42)")
     return p.parse_args()
 
 
@@ -275,7 +278,7 @@ def export_ply(predictions, output_dir, args):
 # ---------------------------------------------------------------------------
 #  Stage 3: Clean point cloud and extract objects
 # ---------------------------------------------------------------------------
-def clean_and_extract(ply_path, output_dir, num_objects=2):
+def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42):
     """Clean point cloud, extract top-k objects."""
     print()
     print("=" * 60)
@@ -298,6 +301,7 @@ def clean_and_extract(ply_path, output_dir, num_objects=2):
             output_folder=clean_output_dir,
             k=num_objects,
             visualize=False,
+            seed=seed,
         )
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:
@@ -311,7 +315,7 @@ def clean_and_extract(ply_path, output_dir, num_objects=2):
 # ---------------------------------------------------------------------------
 #  Stage 4: Reconstruct mesh from cleaned objects
 # ---------------------------------------------------------------------------
-def reconstruct_mesh_stage(object_paths, output_dir):
+def reconstruct_mesh_stage(object_paths, output_dir, seed=42):
     """STAGE 4: Reconstruct each object point cloud into a (non-watertight) mesh.
 
     Returns (scene_recon_path, recon_mesh_paths).
@@ -335,6 +339,7 @@ def reconstruct_mesh_stage(object_paths, output_dir):
             input_paths=object_paths,
             output_folder=mesh_output_dir,
             base_name="scene_recon",
+            seed=seed,
         )
         print(f"  Scene recon mesh: {scene_recon}")
         for p in recon_paths:
@@ -501,7 +506,7 @@ def compute_volumes(object_mesh_paths):
         if not os.path.exists(path):
             print(f"  [{i}] {path}: missing, skipping")
             continue
-        mesh = trimesh.load(path, force="mesh")
+        mesh = trimesh.load(path, force="mesh", process=False)
         extents = mesh.bounds[1] - mesh.bounds[0]
         max_extent = float(np.max(extents))
         if mesh.is_watertight:
@@ -563,6 +568,19 @@ def main():
     device = get_device()
     total_t0 = time.time()
 
+    # ---- seed everything for reproducibility ----
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    try:
+        import open3d as o3d
+        o3d.utility.random.seed(args.seed)
+    except Exception:
+        pass
+
     print(f"╔{'═' * 58}╗")
     print(f"║  VGGT Full Pipeline                                      ║")
     print(f"╠{'═' * 58}╣")
@@ -573,6 +591,7 @@ def main():
     print(f"║  Skip mesh     : {str(args.skip_mesh):<40}║")
     print(f"║  Watertight    : {str(not args.no_watertight):<40}║")
     print(f"║  Evaluate      : {str(args.evaluate):<40}║")
+    print(f"║  Seed          : {args.seed:<40}║")
     print(f"╚{'═' * 58}╝")
 
     # Validate input folder
@@ -622,11 +641,11 @@ def main():
     wt_mesh_paths = []
 
     if not args.skip_mesh:
-        object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects)
+        object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects, seed=args.seed)
         if object_paths:
             # ── Stage 4: Reconstruct (Poisson, non-watertight) ──
             scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
-                object_paths, args.output_dir)
+                object_paths, args.output_dir, seed=args.seed)
 
             # ── Stage 5: Make watertight (default; skip with --no-watertight) ──
             if recon_mesh_paths and not args.no_watertight:

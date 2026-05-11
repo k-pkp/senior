@@ -26,13 +26,18 @@ def merge_meshes(mesh_list):
 
 
 def _verify_watertight(mesh_path):
-    """Verify watertightness using trimesh (standard definition)."""
+    """Verify watertightness using trimesh.
+
+    process=False — PyMeshFix's fill_holes leaves a few intentional duplicate
+    seam vertices that trimesh's default merge would collapse, breaking
+    edge-manifoldness. The on-disk mesh has 2 faces per edge by index.
+    """
     import trimesh
-    t = trimesh.load(mesh_path)
+    t = trimesh.load(mesh_path, process=False)
     return t.is_watertight
 
 
-def reconstruct_multiple_objects(input_paths, output_folder="output_mesh", base_name="scene_recon"):
+def reconstruct_multiple_objects(input_paths, output_folder="output_mesh", base_name="scene_recon", seed=42):
     """Stage 4: Reconstruct each object (Poisson only, non-watertight).
 
     Returns (scene_ply, scene_stl, recon_mesh_paths).
@@ -50,7 +55,7 @@ def reconstruct_multiple_objects(input_paths, output_folder="output_mesh", base_
         recon_stl = os.path.join(output_folder, f"object_{i}_recon.stl")
 
         result = subprocess.run(
-            [sys.executable, _RECONS_WORKER, path, recon_ply],
+            [sys.executable, _RECONS_WORKER, path, recon_ply, "--seed", str(seed)],
             capture_output=True, text=True, timeout=600,
         )
         for line in result.stdout.strip().split("\n"):
@@ -120,19 +125,32 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
             if os.path.exists(p):
                 os.remove(p)
 
-        # meshfix_worker.py takes (input, output, color_source)
-        result = subprocess.run(
-            [sys.executable, _MESHFIX_WORKER, recon_path, wt_ply, recon_path],
-            capture_output=True, text=True, timeout=300,
-        )
-        for line in result.stdout.strip().split("\n"):
-            if line.strip():
-                print(f"  {line}")
+        # meshfix_worker.py takes (input, output, color_source).
+        # Retry up to 3 times for transient subprocess failures (PyMeshFix
+        # C++ side has historically had random "double free" crashes).
+        # Exit codes: 0 = watertight OK, 2 = file written but not watertight,
+        # 1 = hard failure.
+        success = False
+        last_err = ""
+        for attempt in range(3):
+            result = subprocess.run(
+                [sys.executable, _MESHFIX_WORKER, recon_path, wt_ply, recon_path],
+                capture_output=True, text=True, timeout=600,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if line.strip():
+                    print(f"  {line}")
 
-        if result.returncode != 0 or not os.path.exists(wt_ply):
-            err = result.stderr.strip() or "unknown error"
-            print(f"  ERROR: MeshFix failed: {err[:500]}")
-            # Fallback: copy recon as output (mesh will NOT be watertight)
+            if result.returncode in (0, 2) and os.path.exists(wt_ply):
+                success = True
+                break
+
+            last_err = result.stderr.strip() or f"exit code {result.returncode}"
+            if attempt < 2:
+                print(f"  MeshFix attempt {attempt+1} failed ({last_err[:100]}), retrying...")
+
+        if not success:
+            print(f"  ERROR: MeshFix failed after 3 attempts: {last_err[:500]}")
             import shutil
             shutil.copy2(recon_path, wt_ply)
             print(f"  Fallback: saved recon mesh as output (NOT watertight)")
@@ -143,8 +161,9 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
 
         is_wt = _verify_watertight(wt_ply)
         size_mb = os.path.getsize(wt_ply) / (1024 * 1024)
-        print(f"  Watertight object {i}: {len(mesh.vertices):,} verts, "
-              f"{len(mesh.triangles):,} faces, watertight={is_wt} ({size_mb:.1f} MB)")
+        wt_status = "watertight" if is_wt else "NOT watertight (recon fallback)"
+        print(f"  Object {i}: {len(mesh.vertices):,} verts, "
+              f"{len(mesh.triangles):,} faces, {wt_status} ({size_mb:.1f} MB)")
 
         watertight_paths.append(wt_ply)
         meshes.append(mesh)
@@ -167,6 +186,21 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
     scene_stl = os.path.join(output_folder, f"{base_name}.stl")
     o3d.io.write_triangle_mesh(scene_ply, final_mesh)
     o3d.io.write_triangle_mesh(scene_stl, final_mesh)
+
+    # scene_colour.ply — merge per-object watertight meshes preserving vertex
+    # colors (o3d merge path drops them). process=False keeps PyMeshFix seam
+    # duplicates intact so each object stays watertight after concatenation.
+    import trimesh
+    tm_objs = [trimesh.load(p, process=False) for p in watertight_paths]
+    scene_colour = trimesh.util.concatenate(tm_objs)
+    scene_colour_ply = os.path.join(output_folder, f"{base_name}_colour.ply")
+    scene_colour_stl = os.path.join(output_folder, f"{base_name}_colour.stl")
+    scene_colour.export(scene_colour_ply)
+    scene_colour.export(scene_colour_stl)  # STL is geometry-only; colors dropped
+    cs_size_mb = os.path.getsize(scene_colour_ply) / (1024 * 1024)
+    print(f"Scene colour: {len(scene_colour.vertices):,} verts, "
+          f"{len(scene_colour.faces):,} faces ({cs_size_mb:.1f} MB) "
+          f"→ {scene_colour_ply} + {scene_colour_stl}")
 
     return scene_ply, scene_stl, watertight_paths
 

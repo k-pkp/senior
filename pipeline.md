@@ -1,5 +1,8 @@
 # VGGT 3D Reconstruction Pipeline
 
+End-to-end pipeline for reconstructing watertight 3D meshes from multi-view
+images using the VGGT (Visual Geometry Grounded Transformer) model and
+computing real-world volumes via an ArUco scale reference.
 End-to-end pipeline for reconstructing 3D meshes from multi-view images using the VGGT (Visual Geometry Grounded Transformer) model, then computing real-world volumes using a reference cube.
 
 ## Pipeline Stages
@@ -102,10 +105,10 @@ conda run -n vggt python run.py --image_folder ./baam/ --evaluate --no-watertigh
 # PLY only (skip mesh reconstruction + watertight)
 conda run -n vggt python run.py --skip_mesh
 
-# Adjust confidence threshold (lower = more points)
+# Lower confidence threshold (more points retained)
 conda run -n vggt python run.py --conf_thres 30 --evaluate
 
-# Use depth-based unprojection instead of pointmap
+# Depth-based unprojection instead of pointmap regression
 conda run -n vggt python run.py --prediction_mode depth --evaluate
 ```
 
@@ -115,7 +118,7 @@ conda run -n vggt python run.py --prediction_mode depth --evaluate
 |---|---|---|
 | `--image_folder` | `./baam/` | Input image directory |
 | `--output_dir` | `./output/` | Output directory |
-| `--conf_thres` | `45.0` | Confidence filter percentile (0-100) |
+| `--conf_thres` | `45.0` | Confidence filter percentile (0–100) |
 | `--prediction_mode` | `pointmap` | `pointmap` or `depth` |
 | `--mask_black_bg` | off | Mask dark background pixels |
 | `--mask_white_bg` | off | Mask bright background pixels |
@@ -170,6 +173,31 @@ conda run -n vggt python volume.py output/mesh/object_0.ply output/mesh/object_1
     --ref-index 1 --ref-size 14
 ```
 
+## Determinism
+
+All stages run with the seed from `--seed` (default `42`):
+
+- `random`, `numpy.random`, `torch.manual_seed`, `torch.cuda.manual_seed_all`,
+  `open3d.utility.random.seed` are all set
+- `viewer.py` uses an internal `np.random.default_rng(42)` for any subsampling
+- Stage 5 PyMeshFix + Open3D `fill_holes` have no RNG; identical input bytes
+  produce byte-identical output (verified by md5 across 3 sequential runs)
+
+Reproducibility check (Stage 5 only, recon meshes already on disk):
+
+```bash
+for i in 1 2 3; do
+  conda run -n vggt python -c "
+import sys; sys.path.insert(0,'clean')
+from recons import make_watertight_meshes
+make_watertight_meshes(['output/mesh/object_0_recon.ply',
+                        'output/mesh/object_1_recon.ply'],
+                       output_folder=f'/tmp/wt_run$i', base_name='scene')"
+done
+md5sum /tmp/wt_run{1,2,3}/object_0.ply
+md5sum /tmp/wt_run{1,2,3}/object_1.ply
+```
+
 ## Dependencies
 
 Core:
@@ -177,8 +205,8 @@ Core:
 - `numpy`, `open3d`, `trimesh`, `scipy`, `opencv-python`
 
 Watertight repair:
-- `pymeshfix` — mesh hole filling and manifold repair
-- `pyvista` — mesh I/O for PyMeshFix
+- `pymeshfix` (≥ 0.18) — boundary hole filling
+- `open3d` ≥ 0.19 — `t.geometry.TriangleMesh.fill_holes` fallback
 
 ## Key Files
 

@@ -5,10 +5,11 @@ Self-contained 3D reconstruction pipeline: images → point cloud → cleaned ob
 ## Layout
 
 ```
-new/
+senior/
 ├── run.py                       # entry point (executable)
 ├── viewer.py                    # PLY/STL viewer (executable)
 ├── requirements.txt
+├── inputs
 ├── README.md
 ├── vggt/                        # VGGT model package (bundled)
 ├── pipeline/
@@ -87,10 +88,13 @@ output/
 │   ├── object_0.ply
 │   └── object_1.ply
 ├── mesh/
-│   ├── object_0_recon.ply       # Poisson
-│   ├── object_0.ply             # watertight
-│   ├── scene_recon.ply
-│   └── scene.ply
+│   ├── object_0_recon.ply/.stl       # Poisson (object)
+│   ├── object_0.ply/.stl             # watertight (object)
+│   ├── object_1_recon.ply/.stl       # Poisson (ArUco)
+│   ├── object_1.ply/.stl             # watertight (ArUco)
+│   ├── scene_recon.ply/.stl
+│   ├── scene_colour.ply/.stl
+│   └── scene.ply/.stl
 ├── evaluation/                  # multi-view screenshots (--evaluate)
 └── target/                      # demo_gradio-compatible layout
 ```

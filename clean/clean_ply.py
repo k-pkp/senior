@@ -226,6 +226,10 @@ def clean_and_extract_objects(
 
             plane_model, inliers = _detect_plane_ransac_deterministic(
                 pcd, distance_threshold=distance_threshold, num_iterations=1000, seed=seed
+            plane_model, inliers = pcd.segment_plane(
+                distance_threshold=0.007,
+                ransac_n=3,
+                num_iterations=1000
             )
             plane_ratio = len(inliers) / len(pcd.points)
 

@@ -121,3 +121,6 @@ datasets/
 *.a
 *.dll
 *.dylib
+
+# test folder
+test/

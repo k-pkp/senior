@@ -37,6 +37,10 @@ Examples:
                    help="Auto-capture screenshots of outputs with viewer.py")
     p.add_argument("--no-watertight", action="store_true",
                    help="Skip watertight repair (export only Poisson reconstruction)")
+    p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg",
+                   help="Disable marker-based leg surface segmentation (enabled by default)")
+    p.add_argument("--segment-height-axis", type=str, default="z", choices=["x", "y", "z"],
+                   help="Height axis for leg cut (default: z, vertical after leveling)")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for reproducibility (default: 42)")
     return p.parse_args()

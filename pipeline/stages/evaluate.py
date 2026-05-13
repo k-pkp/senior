@@ -58,19 +58,21 @@ def evaluate_with_viewer(output_dir, ply_path, mesh_path=None,
                             "Scene mesh")
 
     if object_mesh_paths:
-        for i, obj_path in enumerate(object_mesh_paths):
+        for obj_path in object_mesh_paths:
             if os.path.exists(obj_path):
-                print(f"  Object {i} mesh (6 views)...")
+                name = os.path.splitext(os.path.basename(obj_path))[0]
+                print(f"  {name} mesh (6 views)...")
                 _capture_multi_view(viewer_script, obj_path,
-                                    os.path.join(eval_dir, f"object_{i}"),
-                                    f"Object {i}")
+                                     os.path.join(eval_dir, name),
+                                     name)
 
     print()
     print("  --- Output Summary ---")
     all_outputs = [("Point Cloud", ply_path), ("Scene Mesh", mesh_path)]
     if object_mesh_paths:
-        for i, p in enumerate(object_mesh_paths):
-            all_outputs.append((f"Object {i} Mesh", p))
+        for p in object_mesh_paths:
+            name = os.path.basename(p)
+            all_outputs.append((f"{name}", p))
     for label, path in all_outputs:
         if path and os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)

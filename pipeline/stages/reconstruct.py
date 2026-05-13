@@ -14,12 +14,18 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _RECONS_WORKER = os.path.join(_PROJECT_ROOT, "workers", "recons_worker.py")
 
 
+def _recon_name(input_path):
+    """Derive output base name from input PLY: box.ply → box_recon, obj.ply → obj_recon."""
+    base = os.path.splitext(os.path.basename(input_path))[0]
+    return f"{base}_recon"
+
+
 def reconstruct_multiple_objects(input_paths, output_folder="output_mesh",
-                                 base_name="scene_recon", seed=42):
+                                  base_name="scene_recon", seed=42):
     """Reconstruct each object PLY into a (non-watertight) Poisson mesh.
 
     Returns (scene_ply, scene_stl, recon_mesh_paths).
-    Each object is saved as `object_N_recon.ply`.
+    Files saved as box_recon.ply / obj_recon.ply based on input names.
     """
     os.makedirs(output_folder, exist_ok=True)
 
@@ -29,8 +35,9 @@ def reconstruct_multiple_objects(input_paths, output_folder="output_mesh",
     for i, path in enumerate(input_paths):
         print(f"\nProcessing: {path}")
 
-        recon_ply = os.path.join(output_folder, f"object_{i}_recon.ply")
-        recon_stl = os.path.join(output_folder, f"object_{i}_recon.stl")
+        name = _recon_name(path)
+        recon_ply = os.path.join(output_folder, f"{name}.ply")
+        recon_stl = os.path.join(output_folder, f"{name}.stl")
 
         result = subprocess.run(
             [sys.executable, _RECONS_WORKER, path, recon_ply, "--seed", str(seed)],
@@ -50,7 +57,7 @@ def reconstruct_multiple_objects(input_paths, output_folder="output_mesh",
         o3d.io.write_triangle_mesh(recon_stl, mesh)
 
         size_mb = os.path.getsize(recon_ply) / (1024 * 1024)
-        print(f"  Recon object {i}: {len(mesh.vertices):,} verts, "
+        print(f"  Recon {name}: {len(mesh.vertices):,} verts, "
               f"{len(mesh.triangles):,} faces ({size_mb:.1f} MB)")
 
         recon_paths.append(recon_ply)

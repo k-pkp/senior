@@ -1,9 +1,8 @@
 """Pipeline-wide configuration constants."""
 
 # Stage 7 volume calibration
-# Hard-coded: object at REFERENCE_OBJECT_INDEX is the ArUco marker.
-# The unknown object whose volume we want to measure is at the other index.
-REFERENCE_OBJECT_INDEX = 1        # which object is the ArUco reference
+# The ArUco marker is identified as the "obj" cluster (non-box).
+# REFERENCE_REAL_SIZE_CM is the real-world linear size of the ArUco marker cube.
 REFERENCE_REAL_SIZE_CM = 14.0     # real linear size of reference in cm
 
 # Stage 1 frame limits

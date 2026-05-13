@@ -1,4 +1,4 @@
-"""Stage 7 — Compute real-world volumes using the ArUco reference cube.
+"""Stage 7 — Compute real-world volumes using the ArUco reference (obj).
 
 Formula:
     mesh_bbox_vol_ref = X_ref * Y_ref * Z_ref     # product of reference extents
@@ -15,13 +15,20 @@ import os
 import numpy as np
 import trimesh
 
-from pipeline.config import REFERENCE_OBJECT_INDEX, REFERENCE_REAL_SIZE_CM
+from pipeline.config import REFERENCE_REAL_SIZE_CM
 
 
-def _measure_mesh(path, idx):
+def _is_ref_mesh(path):
+    """Identify reference (ArUco marker) by filename: 'obj' is the marker, 'box' is the target."""
+    base = os.path.basename(path).lower()
+    name = os.path.splitext(base)[0]
+    return "obj" in name and "box" not in name
+
+
+def _measure_mesh(path):
     """Load a mesh and return its volume/extent info, or None if missing."""
     if not os.path.exists(path):
-        print(f"  [{idx}] {path}: missing, skipping")
+        print(f"  {path}: missing, skipping")
         return None
 
     mesh = trimesh.load(path, force="mesh", process=False)
@@ -41,38 +48,39 @@ def _measure_mesh(path, idx):
 
     bbox_vol = float(extents[0] * extents[1] * extents[2])
     return {
-        "idx": idx, "name": os.path.basename(path), "volume": volume,
+        "name": os.path.basename(path), "volume": volume,
         "max_extent": max_extent, "extents": extents, "bbox_vol": bbox_vol,
-        "method": method,
+        "method": method, "is_ref": _is_ref_mesh(path),
     }
 
 
 def compute_volumes(object_mesh_paths):
-    """Compute real-world volume of each object using ArUco reference for scale."""
+    """Compute real-world volume of each object using ArUco reference (obj) for scale."""
     print()
     print("=" * 60)
     print(f"STAGE 7: Computing real-world volumes "
-          f"(ref: object_{REFERENCE_OBJECT_INDEX} = {REFERENCE_REAL_SIZE_CM}cm ArUco)")
+          f"(ref: obj mesh = {REFERENCE_REAL_SIZE_CM}cm ArUco)")
     print("=" * 60)
 
-    if len(object_mesh_paths) <= REFERENCE_OBJECT_INDEX:
-        print(f"  Not enough meshes (need object_{REFERENCE_OBJECT_INDEX} as reference). Skipping.")
-        return
-
     infos = []
-    for i, path in enumerate(object_mesh_paths):
-        info = _measure_mesh(path, i)
+    for path in object_mesh_paths:
+        info = _measure_mesh(path)
         if info is None:
             continue
         infos.append(info)
         ext = info["extents"]
-        print(f"  [{i}] {info['name']}: "
+        tag = "  <- REF" if info["is_ref"] else ""
+        print(f"  {info['name']}: "
               f"mesh_vol={info['volume']:.6f}, bbox_vol={info['bbox_vol']:.6f} "
-              f"(extents {ext[0]:.4f}x{ext[1]:.4f}x{ext[2]:.4f}) ({info['method']})")
+              f"(extents {ext[0]:.4f}x{ext[1]:.4f}x{ext[2]:.4f}) ({info['method']}){tag}")
 
-    ref = next((x for x in infos if x["idx"] == REFERENCE_OBJECT_INDEX), None)
-    if ref is None or ref["bbox_vol"] <= 0:
-        print(f"  Reference object_{REFERENCE_OBJECT_INDEX} not available. Skipping.")
+    ref = next((x for x in infos if x["is_ref"]), None)
+    if ref is None:
+        print("  No obj (reference) mesh found. Skipping volume computation.")
+        return
+
+    if ref["bbox_vol"] <= 0:
+        print(f"  Reference mesh {ref['name']} has zero volume. Skipping.")
         return
 
     real_ref_vol = REFERENCE_REAL_SIZE_CM ** 3        # e.g. 14^3 = 2744 cm^3
@@ -88,12 +96,12 @@ def compute_volumes(object_mesh_paths):
     print(f"    k^(1/3)      = {cube_root_k:.6f}")
 
     print("\n  Real-world dimensions and volumes:")
-    print(f"  {'IDX':>4} {'NAME':<20} {'SIZE (cm)':<24} {'VOLUME (cm^3)':>14}")
+    print(f"  {'NAME':<20} {'SIZE (cm)':<24} {'VOLUME (cm^3)':>14}")
     print("  " + "-" * 68)
     for info in infos:
         ext_cm = info["extents"] * cube_root_k
         real_vol = float(ext_cm[0] * ext_cm[1] * ext_cm[2])
         size_str = f"{ext_cm[0]:6.2f} x {ext_cm[1]:6.2f} x {ext_cm[2]:6.2f}"
-        marker = "  <- REF" if info["idx"] == REFERENCE_OBJECT_INDEX else ""
-        print(f"  {info['idx']:>4} {info['name']:<20} {size_str:<24} "
+        marker = "  <- REF" if info["is_ref"] else ""
+        print(f"  {info['name']:<20} {size_str:<24} "
               f"{real_vol:>14.2f}{marker}")

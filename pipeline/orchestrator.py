@@ -16,6 +16,7 @@ from pipeline.utils.seeding import seed_everything
 from pipeline.stages.inference import run_inference
 from pipeline.stages.pointcloud import export_ply
 from pipeline.stages.clean import clean_and_extract
+from pipeline.stages.segmentation import segment_leg_stage
 from pipeline.stages.reconstruct import reconstruct_mesh_stage
 from pipeline.stages.watertight import watertight_stage
 from pipeline.stages.evaluate import evaluate_with_viewer
@@ -37,6 +38,7 @@ def _print_banner(args, device):
     print(f"║  Watertight    : {str(not args.no_watertight):<40}║")
     print(f"║  Evaluate      : {str(args.evaluate):<40}║")
     print(f"║  Seed          : {args.seed:<40}║")
+    print(f"║  Leg segment   : {str(args.segment_leg):<40}║")
     print(f"╚{'═' * 58}╝")
 
 
@@ -64,12 +66,14 @@ def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
     print(f"║    PLY         : {ply_path:<40}║")
     if scene_recon_path:
         print(f"║    Scene recon : {scene_recon_path:<40}║")
-    for i, p in enumerate(recon_mesh_paths):
-        print(f"║    Recon {i}     : {p:<40}║")
+    for p in recon_mesh_paths:
+        name = os.path.basename(p)
+        print(f"║    Recon       : {name:<40}║")
     if scene_wt_path:
         print(f"║    Scene wt    : {scene_wt_path:<40}║")
-    for i, p in enumerate(wt_mesh_paths):
-        print(f"║    Wt {i}        : {p:<40}║")
+    for p in wt_mesh_paths:
+        name = os.path.basename(p)
+        print(f"║    Wt          : {name:<40}║")
     print(f"║    Predictions : {npz_path2:<40}║")
     print(f"║    Target dir  : {target_dir:<40}║")
     print(f"╚{'═' * 58}╝")
@@ -78,12 +82,12 @@ def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
     print(f"  python viewer.py {ply_path}")
     if scene_recon_path:
         print(f"  python viewer.py {scene_recon_path}  # recon scene")
-    for i, p in enumerate(recon_mesh_paths):
-        print(f"  python viewer.py {p}  # recon object {i}")
+    for p in recon_mesh_paths:
+        print(f"  python viewer.py {p}")
     if scene_wt_path:
         print(f"  python viewer.py {scene_wt_path}  # watertight scene")
-    for i, p in enumerate(wt_mesh_paths):
-        print(f"  python viewer.py {p}  # watertight object {i}")
+    for p in wt_mesh_paths:
+        print(f"  python viewer.py {p}")
     print()
     print("To use with demo_gradio.py:")
     print(f"  The predictions are saved at: {target_dir}/predictions.npz")
@@ -137,6 +141,10 @@ def main():
     if not args.skip_mesh:
         object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects, seed=args.seed)
         if object_paths:
+            if args.segment_leg:
+                object_paths = segment_leg_stage(
+                    object_paths, args.output_dir,
+                    height_axis=args.segment_height_axis, seed=args.seed)
             scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
                 object_paths, args.output_dir, seed=args.seed)
 

@@ -14,11 +14,20 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _MESHFIX_WORKER = os.path.join(_PROJECT_ROOT, "workers", "meshfix_worker.py")
 
 
+def _wt_name(recon_path):
+    """Derive output name from recon path: box_recon.ply → box, obj_recon.ply → obj."""
+    base = os.path.basename(recon_path)
+    name = os.path.splitext(base)[0]
+    if name.endswith("_recon"):
+        name = name[:-len("_recon")]
+    return name
+
+
 def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="scene"):
     """Fill each reconstructed mesh to be watertight (PyMeshFix + color transfer).
 
     Returns (scene_ply, scene_stl, watertight_mesh_paths).
-    Each object is saved as `object_N.ply` (watertight version).
+    Files saved as box.ply / obj.ply (watertight) based on input names.
     """
     os.makedirs(output_folder, exist_ok=True)
 
@@ -28,8 +37,9 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
     for i, recon_path in enumerate(recon_paths):
         print(f"\nRepairing: {recon_path}")
 
-        wt_ply = os.path.join(output_folder, f"object_{i}.ply")
-        wt_stl = os.path.join(output_folder, f"object_{i}.stl")
+        name = _wt_name(recon_path)
+        wt_ply = os.path.join(output_folder, f"{name}.ply")
+        wt_stl = os.path.join(output_folder, f"{name}.stl")
 
         # Remove stale files from previous runs so existence == success.
         for p in (wt_ply, wt_stl):
@@ -72,7 +82,7 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
         is_wt = verify_watertight(wt_ply)
         size_mb = os.path.getsize(wt_ply) / (1024 * 1024)
         wt_status = "watertight" if is_wt else "NOT watertight (recon fallback)"
-        print(f"  Object {i}: {len(mesh.vertices):,} verts, "
+        print(f"  {name}: {len(mesh.vertices):,} verts, "
               f"{len(mesh.triangles):,} faces, {wt_status} ({size_mb:.1f} MB)")
 
         watertight_paths.append(wt_ply)

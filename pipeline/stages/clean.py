@@ -1,12 +1,11 @@
-"""Stage 3 — Clean the point cloud and separate it into per-object PLYs.
+"""Stage 3 — Clean the point cloud and separate it into box + other object PLYs.
 
 Steps:
     1. RANSAC-based leveling so the ground plane is horizontal (Z up).
     2. Adaptive statistical-outlier removal.
     3. Voxel downsampling if very dense.
     4. Smart laser-cut floor removal (only if a horizontal bottom plane exists).
-    5. DBSCAN clustering + ArUco-aware ranking → top-k objects.
-    6. Save object_0.ply (target) and object_1.ply (ArUco reference).
+    5. DBSCAN clustering + box detection (cubeness) → box.ply + obj.ply.
 """
 import os
 
@@ -145,21 +144,36 @@ def clean_and_extract_objects(
         if np.any(~noise_mask):
             pcd = pcd.select_by_index(np.where(~noise_mask)[0])
             print(f"  Removed {noise_mask.sum():,} noise points, kept {len(pcd.points):,}")
-        objects = [pcd]
+        box_cluster = pcd
+        obj_cluster = None
     else:
-        objects = detect_top_k_objects(pcd, k=k, visualize=visualize)
+        box_cluster, obj_cluster = detect_top_k_objects(pcd, k=k, visualize=visualize)
 
-    # ---- STEP 6: SAVE ----
+    # ---- STEP 6: SAVE box.ply + obj.ply ----
     output_paths = []
-    for i, obj in enumerate(objects):
-        path = os.path.join(output_folder, f"object_{i}.ply")
-        o3d.io.write_point_cloud(path, obj)
+
+    if box_cluster is not None:
+        path = os.path.join(output_folder, "box.ply")
+        o3d.io.write_point_cloud(path, box_cluster)
         output_paths.append(path)
-        pts = np.asarray(obj.points)
-        rng_x = f"[{pts[:,0].min():.3f}, {pts[:,0].max():.3f}]"
-        rng_y = f"[{pts[:,1].min():.3f}, {pts[:,1].max():.3f}]"
-        rng_z = f"[{pts[:,2].min():.3f}, {pts[:,2].max():.3f}]"
-        print(f"Saved: {path} ({len(obj.points):,} pts) X{rng_x} Y{rng_y} Z{rng_z}")
+        pts = np.asarray(box_cluster.points)
+        print(f"Saved: {path} ({len(pts):,} pts) "
+              f"X[{pts[:,0].min():.3f}, {pts[:,0].max():.3f}] "
+              f"Y[{pts[:,1].min():.3f}, {pts[:,1].max():.3f}] "
+              f"Z[{pts[:,2].min():.3f}, {pts[:,2].max():.3f}]")
+
+    if obj_cluster is not None:
+        path = os.path.join(output_folder, "obj.ply")
+        o3d.io.write_point_cloud(path, obj_cluster)
+        output_paths.append(path)
+        pts = np.asarray(obj_cluster.points)
+        print(f"Saved: {path} ({len(pts):,} pts) "
+              f"X[{pts[:,0].min():.3f}, {pts[:,0].max():.3f}] "
+              f"Y[{pts[:,1].min():.3f}, {pts[:,1].max():.3f}] "
+              f"Z[{pts[:,2].min():.3f}, {pts[:,2].max():.3f}]")
+
+    if not output_paths:
+        print("WARNING: No clusters saved!")
 
     return output_paths
 
@@ -167,7 +181,7 @@ def clean_and_extract_objects(
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42):
     """Pipeline wrapper around clean_and_extract_objects.
 
-    Returns the list of per-object PLY paths, or None on failure.
+    Returns the list of per-object PLY paths [box.ply, obj.ply], or None on failure.
     """
     print()
     print("=" * 60)

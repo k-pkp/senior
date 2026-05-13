@@ -1,4 +1,4 @@
-"""DBSCAN clustering + ArUco-aware ranking."""
+"""DBSCAN clustering + box/obj detection."""
 import numpy as np
 
 
@@ -43,10 +43,12 @@ def aruco_bw_ratio(cluster):
 
 
 def detect_top_k_objects(pcd, k=2, visualize=False):
-    """Detect and rank top-k clusters from a point cloud.
+    """Detect top-k clusters, then identify which is the box and which is the other object.
 
-    Cluster order: object_0 = non-ArUco object(s), object_{k-1} = ArUco reference.
-    ArUco identified by combined cubeness + black/white color signature.
+    Returns: (box_cluster, obj_cluster)
+        box_cluster  — the dominant non-marker cluster (the target box)
+        obj_cluster  — the other cluster (ArUco marker or secondary object)
+        Returns (pcd, None) if only 1 cluster found.
     """
     del visualize  # currently unused; reserved for future debug viewer
     print("Running DBSCAN...")
@@ -58,47 +60,69 @@ def detect_top_k_objects(pcd, k=2, visualize=False):
 
     if not np.any(valid):
         print("No clusters found → using whole cloud as single object")
-        return [pcd]
+        return (pcd, None)
 
     unique_ids = np.unique(labels[valid])
     print(f"Total clusters found: {len(unique_ids)}")
+
+    min_points = 0.01 * len(pcd.points)
 
     clusters = []
     for cid in unique_ids:
         idx = np.where(labels == cid)[0]
         cluster = pcd.select_by_index(idx)
-        _extent, density, max_dim = get_cluster_info(cluster)
+        extent, density, max_dim = get_cluster_info(cluster)
+        npts = len(cluster.points)
 
-        if len(cluster.points) < 0.01 * len(pcd.points):
+        if npts < min_points:
             continue
 
-        score = (len(cluster.points) * 0.5 + density * 0.3 - max_dim * 0.2)
-        clusters.append((cluster, score, len(cluster.points)))
+        norm_pts = npts / 1000.0
+        norm_density = min(density, 5_000_000) / 1_000_000.0
+        score = norm_pts * 0.5 + norm_density * 0.3 - max_dim * 0.2
+        clusters.append((cluster, score, npts, extent, density, max_dim))
 
     if len(clusters) == 0:
         print("No valid clusters → using whole cloud")
-        return [pcd]
+        return (pcd, None)
 
     clusters.sort(key=lambda x: x[1], reverse=True)
-    top = clusters[:k]
+    top = clusters[:min(k, len(clusters))]
 
-    # Rank ArUco-likeness: cubeness (0.6) + B/W color signature (0.4)
-    aruco_scores = []
-    for cluster, _, _ in top:
+    if len(top) < 2:
+        print("Only 1 cluster → returning as box, no obj")
+        return (top[0][0], None)
+
+    # Box detection: which cluster has highest cubeness (most box-shaped)
+    # ArUco check: if one cluster is a strong marker, the other is the box
+    print("\n  Box detection (cubeness = min_extent / max_extent):")
+    info = []
+    for idx, (cluster, score, npts, extent, density, max_dim) in enumerate(top):
         cube = aruco_cubeness(cluster)
         bw = aruco_bw_ratio(cluster)
-        aruco_scores.append(cube * 0.6 + bw * 0.4)
+        aruco = cube * 0.6 + bw * 0.4
+        ext_str = f"({extent[0]:.4f},{extent[1]:.4f},{extent[2]:.4f})"
+        print(f"    cluster #{idx+1}: {npts:,} pts, cubeness={cube:.4f}, aruco={aruco:.3f} {ext_str}")
+        info.append((idx, cluster, score, npts, cube, bw, aruco))
 
-    # Reorder: lowest ArUco score first (object_0), highest last (object_{k-1})
-    order = np.argsort(aruco_scores)
-    selected = [top[i][0] for i in order]
+    aruco_scores = [x[6] for x in info]
+    has_marker = any(a > 0.7 for a in aruco_scores)
 
-    print("  ArUco-likeness reorder (cubeness*0.6 + bw*0.4):")
-    for new_idx, src_idx in enumerate(order):
-        _, score, npts = top[src_idx]
-        a = aruco_scores[src_idx]
-        tag = "  <- ArUco ref" if new_idx == len(order) - 1 else ""
-        print(f"    object_{new_idx}: {npts:,} pts, cluster_score={score:.1f}, "
-              f"aruco_score={a:.3f}{tag}")
+    if has_marker:
+        marker_idx = int(np.argmax(aruco_scores))
+        box_idx = 1 - marker_idx
+        print(f"    ArUco marker detected at cluster #{marker_idx+1} → other is box")
+    else:
+        cube_scores = [x[4] for x in info]
+        box_idx = int(np.argmax(cube_scores))
+        print(f"    No strong ArUco → highest cubeness = box")
 
-    return selected
+    obj_idx = 1 - box_idx
+
+    for i, (idx, cluster, score, npts, cube, bw, aruco) in enumerate(info):
+        if i == box_idx:
+            print(f"    → cluster #{idx+1}: {npts:,} pts — BOX (box.ply)")
+        else:
+            print(f"    → cluster #{idx+1}: {npts:,} pts — OBJ (obj.ply)")
+
+    return (top[box_idx][0], top[obj_idx][0])

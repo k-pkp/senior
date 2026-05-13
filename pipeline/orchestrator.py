@@ -11,6 +11,7 @@ from vggt.utils.device import get_device
 
 from pipeline.cli import parse_args
 from pipeline.config import IMAGE_EXTENSIONS
+from pipeline.utils.runlog import RunLogger
 from pipeline.utils.seeding import seed_everything
 
 from pipeline.stages.inference import run_inference
@@ -111,62 +112,72 @@ def main():
         args.output_dir = os.path.join(_PROJECT_ROOT, "output")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # target_dir mirrors demo_gradio's expected layout (predictions.npz + images/).
-    target_dir = os.path.join(args.output_dir, "target")
-    target_images_dir = os.path.join(target_dir, "images")
-    os.makedirs(target_images_dir, exist_ok=True)
-    _copy_images_to_target(args.image_folder, target_images_dir)
+    logger = None
+    inference_time = None
+    if args.log:
+        logger = RunLogger(os.path.join(_PROJECT_ROOT, "log.csv"), device)
+        logger.start()
 
-    # ── Stage 1: Inference ──
-    predictions, inference_time = run_inference(args.image_folder, device, args.max_frames)
+    try:
+        # target_dir mirrors demo_gradio's expected layout (predictions.npz + images/).
+        target_dir = os.path.join(args.output_dir, "target")
+        target_images_dir = os.path.join(target_dir, "images")
+        os.makedirs(target_images_dir, exist_ok=True)
+        _copy_images_to_target(args.image_folder, target_images_dir)
 
-    # Save predictions (compatible with demo_gradio)
-    npz_path = os.path.join(target_dir, "predictions.npz")
-    save_dict = {k: v for k, v in predictions.items() if v is not None}
-    np.savez_compressed(npz_path, **save_dict)
-    print(f"  Saved predictions: {npz_path}")
+        # ── Stage 1: Inference ──
+        predictions, inference_time = run_inference(args.image_folder, device, args.max_frames)
 
-    npz_path2 = os.path.join(args.output_dir, "predictions.npz")
-    shutil.copy2(npz_path, npz_path2)
+        # Save predictions (compatible with demo_gradio)
+        npz_path = os.path.join(target_dir, "predictions.npz")
+        save_dict = {k: v for k, v in predictions.items() if v is not None}
+        np.savez_compressed(npz_path, **save_dict)
+        print(f"  Saved predictions: {npz_path}")
 
-    # ── Stage 2: Export PLY ──
-    ply_path = export_ply(predictions, args.output_dir, args)
+        npz_path2 = os.path.join(args.output_dir, "predictions.npz")
+        shutil.copy2(npz_path, npz_path2)
 
-    # ── Stages 3-5: Clean + Reconstruct + Watertight ──
-    scene_recon_path = None
-    recon_mesh_paths = []
-    scene_wt_path = None
-    wt_mesh_paths = []
+        # ── Stage 2: Export PLY ──
+        ply_path = export_ply(predictions, args.output_dir, args)
 
-    if not args.skip_mesh:
-        object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects, seed=args.seed)
-        if object_paths:
-            if args.segment_leg:
-                object_paths = segment_leg_stage(
-                    object_paths, args.output_dir,
-                    height_axis=args.segment_height_axis, seed=args.seed)
-            scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
-                object_paths, args.output_dir, seed=args.seed)
+        # ── Stages 3-5: Clean + Reconstruct + Watertight ──
+        scene_recon_path = None
+        recon_mesh_paths = []
+        scene_wt_path = None
+        wt_mesh_paths = []
 
-            if recon_mesh_paths and not args.no_watertight:
-                scene_wt_path, wt_mesh_paths = watertight_stage(
-                    recon_mesh_paths, args.output_dir)
-    else:
-        print("\n  (Skipping mesh stages — --skip_mesh was set)")
+        if not args.skip_mesh:
+            object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects, seed=args.seed)
+            if object_paths:
+                if args.segment_leg:
+                    object_paths = segment_leg_stage(
+                        object_paths, args.output_dir,
+                        height_axis=args.segment_height_axis, seed=args.seed)
+                scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
+                    object_paths, args.output_dir, seed=args.seed)
 
-    # Use watertight meshes for evaluation and volume if available, else recon meshes
-    eval_scene = scene_wt_path or scene_recon_path
-    eval_objects = wt_mesh_paths or recon_mesh_paths
+                if recon_mesh_paths and not args.no_watertight:
+                    scene_wt_path, wt_mesh_paths = watertight_stage(
+                        recon_mesh_paths, args.output_dir)
+        else:
+            print("\n  (Skipping mesh stages — --skip_mesh was set)")
 
-    # ── Stage 6: Evaluate ──
-    if args.evaluate:
-        evaluate_with_viewer(args.output_dir, ply_path, eval_scene, eval_objects)
+        # Use watertight meshes for evaluation and volume if available, else recon meshes
+        eval_scene = scene_wt_path or scene_recon_path
+        eval_objects = wt_mesh_paths or recon_mesh_paths
 
-    # ── Stage 7: Volumes ──
-    if eval_objects:
-        compute_volumes(eval_objects)
+        # ── Stage 6: Evaluate ──
+        if args.evaluate:
+            evaluate_with_viewer(args.output_dir, ply_path, eval_scene, eval_objects)
 
-    total_time = time.time() - total_t0
-    _print_summary(total_time, inference_time, ply_path, scene_recon_path,
-                   recon_mesh_paths, scene_wt_path, wt_mesh_paths,
-                   npz_path2, target_dir, target_images_dir)
+        # ── Stage 7: Volumes ──
+        if eval_objects:
+            compute_volumes(eval_objects)
+
+        total_time = time.time() - total_t0
+        _print_summary(total_time, inference_time, ply_path, scene_recon_path,
+                       recon_mesh_paths, scene_wt_path, wt_mesh_paths,
+                       npz_path2, target_dir, target_images_dir)
+    finally:
+        if logger is not None:
+            logger.stop_and_write(args.image_folder, args.output_dir, inference_time)

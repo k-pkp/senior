@@ -1,0 +1,2 @@
+timestamp,command,input,output,device,gpu_name,platform,total_time_s,inference_time_s,cpu_count,cpu_load_pct,ram_used_gb,ram_peak_gb,vram_used_gb,vram_peak_gb
+2026-05-13T23:14:43,run.py -i inputs/small_leg,inputs/small_leg,/home/krist/Desktop/senior/output,cuda,NVIDIA GeForce RTX 5070,Linux-6.17.0-23-generic-x86_64-with-glibc2.39,72.40,1.50,16,683.7,2.41,10.25,0.01,7.39

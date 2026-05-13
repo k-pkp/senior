@@ -43,4 +43,6 @@ Examples:
                    help="Height axis for leg cut (default: z, vertical after leveling)")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for reproducibility (default: 42)")
+    p.add_argument("-l", "--log", action=argparse.BooleanOptionalAction, default=True,
+                   help="Append per-run metrics row to log.csv (default: on; use --no-log to disable)")
     return p.parse_args()

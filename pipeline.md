@@ -3,106 +3,129 @@
 End-to-end pipeline for reconstructing watertight 3D meshes from multi-view
 images using the VGGT (Visual Geometry Grounded Transformer) model and
 computing real-world volumes via an ArUco scale reference.
-End-to-end pipeline for reconstructing 3D meshes from multi-view images using the VGGT (Visual Geometry Grounded Transformer) model, then computing real-world volumes using a reference cube.
 
 ## Pipeline Stages
 
 ```
-Images → [1] Inference → [2] PLY Export → [3] Clean & Extract
-       → [4] Poisson Reconstruction → [5] Watertight Repair
-       → [6] Multi-Perspective Evaluation → [7] Volume Computation
+Input Images
+  → [1] Inference
+  → [2] PLY Export
+  → [3] Clean & Extract
+  → [4] Poisson Reconstruction
+  → [5] Watertight Repair
+  → [6] Multi-view Evaluation
+  → [7] Real-world Volume
 ```
 
 ### Stage 1: Model Inference
-- **File**: `run.py` → `run_inference()`
+- **File**: `pipeline/stages/inference.py` → `run_inference()`
 - **Model**: VGGT-1B (`facebook/VGGT-1B` from HuggingFace)
-- **Input**: Folder of images (JPG/PNG)
-- **Output**: Predictions dict with `world_points`, `world_points_conf`, `depth`, `depth_conf`, `extrinsic`, `intrinsic`
-- **Device**: Auto-detects CUDA, MPS, or CPU
+- **Input**: Folder of images (JPG/PNG/BMP/TIFF/WEBP)
+- **Output**: Predictions dict
+  - `world_points` (S, H, W, 3) — direct 3D point regression
+  - `world_points_conf` — per-point confidence
+  - `depth` / `depth_conf` — depth maps and confidence
+  - `extrinsic` / `intrinsic` — camera parameters
+  - `world_points_from_depth` — unprojected depth-based points
+- **Device**: Auto-detects CUDA, MPS, or CPU (`vggt/utils/device.py`)
 - **Frame limit**: Auto-limits to 6 frames on MPS to avoid OOM
 
 ### Stage 2: PLY Point Cloud Export
-- **File**: `run.py` → `export_ply()`
+- **File**: `pipeline/stages/pointcloud.py` → `export_ply()`
 - **Process**:
-  1. Adaptive confidence filtering (percentile-based, distribution-aware)
+  1. Adaptive confidence filter (percentile + distribution-aware absolute threshold)
   2. Optional background masking (`--mask_black_bg`, `--mask_white_bg`)
-  3. Statistical outlier removal (Open3D)
+  3. Statistical outlier removal (Open3D, k=20, std_ratio=2.5)
 - **Output**: `output/points.ply` — colored point cloud
 
 ### Stage 3: Clean & Extract Objects
-- **File**: `clean/clean_ply.py` → `clean_and_extract_objects()`
+- **File**: `pipeline/stages/clean.py` → `clean_and_extract()`
+- **Helpers**: `pipeline/core/filters.py`, `pipeline/core/plane.py`, `pipeline/core/cluster.py`
 - **Process**:
-  1. Statistical outlier removal (adaptive std_ratio by density)
+  1. Statistical outlier removal (std_ratio=2.0)
   2. Voxel downsampling (voxel=0.002)
-  3. RANSAC plane removal (`distance_threshold=0.015`)
+  3. RANSAC plane removal (drops dominant ground plane)
   4. DBSCAN clustering with adaptive epsilon
-  5. Select top-k clusters by score (points × density)
-- **Output**: `output/clean_objects/object_N.ply` (one per object)
+  5. Top-k selection by score (points × density)
+- **Output**: `output/clean_objects/object_0.ply`, `object_1.ply`, …
 
 ### Stage 4: Poisson Reconstruction (non-watertight)
-- **File**: `clean/recons.py` → `reconstruct_multiple_objects()` → subprocess `recons_worker.py`
-- **Process per object** (runs in an isolated subprocess for stability):
-  1. Downsample to ≤ 165K points (Poisson stability ceiling)
-  2. Normal estimation with tangent-plane orientation (progressive k fallback: 50 → 20 → 10 → camera-based)
-  3. Poisson reconstruction with depth fallback 9 → 8 → 7 (each depth runs in a sub-subprocess to survive C++ crashes)
-  4. Density filter at 5% quantile (removes far-field artifacts)
-  5. Cleanup (degenerate, duplicate, non-manifold triangles)
-  6. **Largest-connected-component filter** — keeps the main surface only, removing noise fragments that would confuse the watertight stage
-- **Output per object**: `output/mesh/object_N_recon.ply` and `.stl`
-- **Scene output**: `output/mesh/scene_recon.ply` and `.stl` (merged)
+- **File**: `pipeline/stages/reconstruct.py` → `reconstruct_mesh_stage()`
+  → `workers/recons_worker.py` (subprocess)
+- **Helpers**: `pipeline/core/mesh.py`
+- **Process** (per object):
+  1. Adaptive Poisson depth 7–11 by point count
+  2. Auto-downsample for >300k points
+  3. Adaptive normal estimation
+  4. Density filter (low-density artifact removal)
+  5. Cleanup: degenerate / duplicate triangles, non-manifold edges
+- **Output per object**: `output/mesh/object_N_recon.ply`, `object_N_recon.stl`
+- **Scene merge**: `output/mesh/scene_recon.ply`, `scene_recon.stl`
 
-### Stage 5: Watertight Repair (default; skip with `--no-watertight`)
-- **File**: `clean/recons.py` → `make_watertight_meshes()` → subprocess `meshfix_worker.py`
-- **Process per object**:
-  1. PyMeshFix repair (Attene 2010: "A lightweight approach to repairing digitized polygon meshes") — removes self-intersections, fills holes/base, enforces manifold topology
-  2. Vertex color transfer from the recon mesh via nearest-neighbor KDTree lookup
-  3. Runs in a separate subprocess to isolate PyMeshFix/pyvista from Open3D
-  4. If MeshFix fails, copies the recon mesh as a non-watertight fallback
-- **Output per object**: `output/mesh/object_N.ply` and `.stl` (watertight)
-- **Scene output**: `output/mesh/scene.ply` and `.stl` (merged watertight scene)
+### Stage 5: Watertight Repair
+- **File**: `pipeline/stages/watertight.py` → `watertight_stage()`
+  → `workers/meshfix_worker.py` (subprocess)
+- **Process** (per recon mesh):
+  1. **PyMeshFix `MeshFix.fill_holes()`** — closes boundary loops, never deletes faces
+     (shape preserved; retention typically >100% as faces are added)
+  2. **Open3D `TriangleMesh.fill_holes()`** fallback for residual gaps (deterministic earcut)
+  3. **Color transfer** — cKDTree nearest-neighbor from recon mesh vertices
+  4. Subprocess exit codes: `0` watertight, `2` written-not-watertight, `1` hard fail
+  5. Up to **3 retries** on hard fail (transient C++ crash isolation)
+- **Verification**: `trimesh.load(path, process=False)` + `is_watertight`
+  (`process=False` is required — default merge welds intentional PyMeshFix
+  seam duplicates and breaks edge-manifoldness)
+- **Output per object**: `output/mesh/object_N.ply`, `object_N.stl` (watertight)
+- **Scene merge (geometry only)**: `output/mesh/scene.ply`, `scene.stl`
+- **Scene merge (with vertex colors)**: `output/mesh/scene_colour.ply` +
+  `scene_colour.stl` (`trimesh.util.concatenate` of per-object watertight meshes,
+  `process=False` to keep PyMeshFix seam dups intact and preserve per-object
+  watertightness; STL is geometry-only — colors not stored in the format)
+- **Determinism**: PyMeshFix + Open3D `fill_holes` are pure C++ geometric algorithms,
+  no RNG → identical md5 across repeated runs (verified ×3)
 
 ### Stage 6: Multi-Perspective Evaluation
-- **File**: `run.py` → `evaluate_with_viewer()`, `viewer.py`
-- **Process**: 38 screenshots per output using Open3D OffscreenRenderer (headless-capable):
-  - **36 orbital views**: 3 elevations (high, mid, low) × 12 azimuth angles (every 30°)
-  - **Top** and **bottom** views
-- **Output**: `output/evaluation/`
-  - `pointcloud/` — 38 views of the raw point cloud
-  - `scene/` — 38 views of the watertight scene
-  - `object_N/` — 38 views per object
-- **Enabled by**: `--evaluate` flag
+- **File**: `pipeline/stages/evaluate.py` → `evaluate_with_viewer()`, `viewer.py`
+- **Process**: Captures **38 screenshots** per output:
+  - 3 elevation rings × 12 azimuths (every 30°) = 36 orbital views
+  - 1 top + 1 bottom view
+- **Renderer**: Open3D `OffscreenRenderer` (EGL headless on Linux)
+- **Output** (`output/evaluation/`):
+  - `pointcloud/` — point cloud (38 views)
+  - `scene/` — merged scene mesh (38 views)
+  - `object_0/`, `object_1/`, … — per-object meshes (38 views each)
 
-### Stage 7: Real-World Volume Computation
-- **File**: `run.py` → `compute_volumes()` (also standalone: `volume.py`)
-- **Input**: Watertight object meshes (falls back to convex hull if non-watertight)
-- **Formula** (uses reference cube of known real size):
+### Stage 7: Real-world Volume (ArUco-referenced)
+- **File**: `pipeline/stages/volume.py` → `compute_volumes()`
+- **Standalone tool**: `tools/com_vol.py` (CLI for volume-only computation against an existing scene)
+- **Reference**: `object_1` is the ArUco marker, a **14 × 14 × 14 cm cube**
+  (configurable via `REFERENCE_OBJECT_INDEX`, `REFERENCE_REAL_SIZE_CM` in `pipeline/config.py`)
+- **Formula**:
   ```
-  mesh_bbox_vol_ref  = X_ref × Y_ref × Z_ref       # product of ref bbox extents
-  real_ref_vol       = real_size³                   # e.g. 14³ = 2744 cm³
-  k                  = real_ref_vol / mesh_bbox_vol_ref
-
-  # For any object i:
-  real_X_i = mesh_X_i × k^(1/3)
-  real_Y_i = mesh_Y_i × k^(1/3)
-  real_Z_i = mesh_Z_i × k^(1/3)
-  real_volume_i = real_X_i × real_Y_i × real_Z_i   # = mesh_bbox_vol_i × k
+  k          = REAL_VOL / mesh_bbox_vol_ref      # volume scale
+  k^(1/3)    = linear scale
+  real_X     = mesh_X * k^(1/3)
+  real_vol_i = mesh_vol_i * k                    # cm^3
   ```
-- **Configuration**: Edit the constants at the top of the Stage 7 section in `run.py`:
-  ```python
-  REFERENCE_OBJECT_INDEX = 1        # which object is the reference
-  REFERENCE_REAL_SIZE_CM = 14.0     # real edge length of the reference cube
-  ```
+- **Volume source**: `mesh.volume` if watertight, else `convex_hull.volume`
+- **Mesh load**: `trimesh.load(path, force="mesh", process=False)` (same reason as Stage 5)
 
 ## Usage
 
 ```bash
-# Full pipeline (watertight by default)
-conda run -n vggt python run.py --image_folder ./baam/ --evaluate
+# Full pipeline (default — watertight ON, evaluation OFF)
+conda run -n vggt python run.py
 
-# Skip watertight repair — export only the Poisson recon mesh
-conda run -n vggt python run.py --image_folder ./baam/ --evaluate --no-watertight
+# Full pipeline + multi-view screenshots
+conda run -n vggt python run.py --evaluate
 
-# PLY only (skip mesh reconstruction + watertight)
+# Skip watertight repair (keep Poisson recon as final mesh)
+conda run -n vggt python run.py --no-watertight
+
+# Custom input folder
+conda run -n vggt python run.py --image_folder ./my_images/ --evaluate
+
+# PLY only — skip stages 3–7
 conda run -n vggt python run.py --skip_mesh
 
 # Lower confidence threshold (more points retained)
@@ -114,6 +137,8 @@ conda run -n vggt python run.py --prediction_mode depth --evaluate
 
 ## CLI Arguments
 
+CLI parsing lives in `pipeline/cli.py`.
+
 | Argument | Default | Description |
 |---|---|---|
 | `--image_folder` | `./baam/` | Input image directory |
@@ -122,60 +147,59 @@ conda run -n vggt python run.py --prediction_mode depth --evaluate
 | `--prediction_mode` | `pointmap` | `pointmap` or `depth` |
 | `--mask_black_bg` | off | Mask dark background pixels |
 | `--mask_white_bg` | off | Mask bright background pixels |
-| `--skip_mesh` | off | Skip stages 3-5, export PLY only |
+| `--skip_mesh` | off | Skip stages 3–7, export PLY only |
 | `--num_objects` | `2` | Number of objects to extract |
 | `--max_frames` | auto | Max input frames (auto=6 on MPS) |
-| `--evaluate` | off | Capture 38-view screenshots |
-| `--no-watertight` | off | Skip Stage 5 (export only recon meshes) |
+| `--evaluate` | off | Capture multi-perspective screenshots |
+| `--no-watertight` | off | Skip Stage 5; final mesh is Poisson recon only |
+| `--seed` | `42` | Seed for `random`, NumPy, PyTorch, Open3D |
 
 ## Output Structure
 
 ```
 output/
-  points.ply                         # Full filtered point cloud
-  predictions.npz                    # Raw model predictions
+  points.ply                       # Filtered point cloud (Stage 2)
+  predictions.npz                  # Raw model predictions
   clean_objects/
-    object_N.ply                     # Cleaned point cloud (per object)
+    object_0.ply / object_1.ply    # Cleaned point clouds (Stage 3)
   mesh/
-    scene_recon.ply / .stl           # Merged Poisson recon (non-watertight)
-    object_N_recon.ply / .stl        # Per-object Poisson recon
-    scene.ply / .stl                 # Merged watertight scene
-    object_N.ply / .stl              # Per-object watertight mesh
-  evaluation/
-    pointcloud/                      # 38 views
-    scene/                           # 38 views
-    object_N/                        # 38 views per object
+    object_N_recon.ply / .stl      # Poisson recon (Stage 4, non-watertight)
+    scene_recon.ply / .stl         # Merged recon scene
+    object_N.ply / .stl            # Watertight repair (Stage 5)
+    scene.ply / .stl               # Merged watertight scene (no colors)
+    scene_colour.ply / .stl        # Merged watertight scene (PLY: vertex colors; STL: geometry only)
+  evaluation/                      # Stage 6 (only if --evaluate)
+    pointcloud/                    # 38 views
+    scene/                         # 38 views
+    object_0/, object_1/, …        # 38 views per object
   target/
-    predictions.npz                  # Copy for demo_gradio compatibility
-    images/                          # Copy of input images
+    predictions.npz                # Copy for demo_gradio compatibility
+    images/                        # Copy of input images
 ```
 
-## Interactive Viewing & Volume Tools
+## Interactive Viewing
 
 ```bash
-# View any mesh or point cloud (interactive Open3D window)
+# Point cloud
+conda run -n vggt python viewer.py output/points.ply
+
+# Watertight object mesh
 conda run -n vggt python viewer.py output/mesh/object_0.ply
 
-# Print mesh info (watertight status, vertex/face count, bounds)
+# Scene mesh
+conda run -n vggt python viewer.py output/mesh/scene.ply
+
+# Mesh info (vertices, faces, watertight, bounds)
 conda run -n vggt python viewer.py output/mesh/object_0.ply --info
 
-# Overlay multiple files
-conda run -n vggt python viewer.py output/points.ply output/mesh/scene.ply
-
-# Batch 38-view screenshots (headless-capable)
+# Multi-view screenshots
 conda run -n vggt python viewer.py output/mesh/object_0.ply --multi-view --screenshot my_views/
-
-# Standalone volume tool (interactive reference selection)
-conda run -n vggt python volume.py output/mesh/object_0.ply output/mesh/object_1.ply
-
-# Volume with explicit reference (no interaction)
-conda run -n vggt python volume.py output/mesh/object_0.ply output/mesh/object_1.ply \
-    --ref-index 1 --ref-size 14
 ```
 
 ## Determinism
 
-All stages run with the seed from `--seed` (default `42`):
+All stages run with the seed from `--seed` (default `42`), applied in
+`pipeline/utils/seeding.py`:
 
 - `random`, `numpy.random`, `torch.manual_seed`, `torch.cuda.manual_seed_all`,
   `open3d.utility.random.seed` are all set
@@ -188,42 +212,84 @@ Reproducibility check (Stage 5 only, recon meshes already on disk):
 ```bash
 for i in 1 2 3; do
   conda run -n vggt python -c "
-import sys; sys.path.insert(0,'clean')
-from recons import make_watertight_meshes
-make_watertight_meshes(['output/mesh/object_0_recon.ply',
-                        'output/mesh/object_1_recon.ply'],
-                       output_folder=f'/tmp/wt_run$i', base_name='scene')"
+from pipeline.stages.watertight import watertight_stage
+watertight_stage(['output/mesh/object_0_recon.ply',
+                  'output/mesh/object_1_recon.ply'],
+                 output_dir=f'/tmp/wt_run$i')"
 done
-md5sum /tmp/wt_run{1,2,3}/object_0.ply
-md5sum /tmp/wt_run{1,2,3}/object_1.ply
+md5sum /tmp/wt_run{1,2,3}/mesh/object_0.ply
+md5sum /tmp/wt_run{1,2,3}/mesh/object_1.ply
 ```
 
 ## Dependencies
 
 Core:
 - `torch` ≥ 2.5.1, `torchvision` ≥ 0.20.1
-- `numpy`, `open3d`, `trimesh`, `scipy`, `opencv-python`
+- `numpy`, `open3d`, `trimesh`, `scipy`, `opencv-python`, `networkx`,
+  `matplotlib`, `Pillow`
 
 Watertight repair:
 - `pymeshfix` (≥ 0.18) — boundary hole filling
 - `open3d` ≥ 0.19 — `t.geometry.TriangleMesh.fill_holes` fallback
 
+## Project Layout
+
+```
+run.py                            # Entry point — calls pipeline.orchestrator.main()
+viewer.py                         # 3D viewer + multi-perspective screenshot capture
+requirements.txt
+pipeline/
+  orchestrator.py                 # Drives Stages 1–7 end to end
+  cli.py                          # argparse definitions
+  config.py                       # Constants (image exts, ArUco reference size, etc.)
+  utils/
+    seeding.py                    # seed_everything()
+  core/                           # Shared geometry primitives
+    filters.py                    # Confidence + spatial filters
+    plane.py                      # Deterministic RANSAC plane detection
+    cluster.py                    # DBSCAN clustering + ArUco-aware ranking
+    mesh.py                       # Mesh utilities for recon/watertight stages
+  stages/                         # One module per pipeline stage
+    inference.py                  # Stage 1
+    pointcloud.py                 # Stage 2
+    clean.py                      # Stage 3
+    reconstruct.py                # Stage 4 driver
+    watertight.py                 # Stage 5 driver
+    evaluate.py                   # Stage 6
+    volume.py                     # Stage 7
+workers/                          # Subprocess workers (isolate native crashes)
+  recons_worker.py                # Poisson reconstruction worker (Stage 4)
+  meshfix_worker.py               # PyMeshFix + Open3D fill_holes worker (Stage 5)
+tools/
+  com_vol.py                      # Standalone volume CLI (uses Stage 7 logic)
+vggt/                             # VGGT model + utilities
+  dependency/  heads/  layers/  models/  utils/
+inputs/                           # Sample input image sets
+output/                           # Pipeline artifacts (see Output Structure)
+```
+
 ## Key Files
 
 | File | Purpose |
 |---|---|
-| `run.py` | Main pipeline orchestrator (Stages 1-7) |
-| `volume.py` | Standalone volume-from-reference tool |
-| `viewer.py` | 3D viewer + 38-view screenshot tool |
-| `clean/clean_ply.py` | Point cloud cleaning and object extraction (Stage 3) |
-| `clean/recons.py` | Stage 4 + Stage 5 orchestration |
-| `clean/recons_worker.py` | Subprocess worker for Poisson reconstruction |
-| `clean/meshfix_worker.py` | Subprocess worker for PyMeshFix + color transfer |
-| `vggt/` | VGGT model and utilities |
-
-## Design Notes
-
-- **Subprocess isolation**: Open3D, PyMeshFix, and pyvista each link against their own OpenGL/VTK stacks that conflict when combined in the same process. Each unstable step (Poisson, normal orientation, MeshFix) runs in an isolated subprocess so a segfault in one doesn't break the whole pipeline.
-- **Largest-component filter**: Open3D's Poisson + density filter produces hundreds of disconnected fragments. Keeping only the largest component before MeshFix gives it a clean single surface to close (holes at base, top), instead of forcing it to discard real geometry as noise.
-- **Color preservation**: MeshFix strips vertex colors during repair. We transfer them back from the recon mesh via nearest-neighbor KDTree lookup inside the MeshFix worker subprocess.
-- **Watertight is default**: `--no-watertight` opts out. When on, `object_N.ply` is watertight; when off, it's the raw Poisson output with density filter (better visual detail but has boundary holes).
+| `run.py` | Entry point — delegates to `pipeline.orchestrator.main()` |
+| `viewer.py` | 3D viewer + multi-perspective screenshot capture |
+| `pipeline/orchestrator.py` | End-to-end pipeline driver (Stages 1–7) |
+| `pipeline/cli.py` | CLI argument parser |
+| `pipeline/config.py` | Pipeline-wide constants |
+| `pipeline/stages/inference.py` | Stage 1 — VGGT model inference |
+| `pipeline/stages/pointcloud.py` | Stage 2 — PLY export with adaptive filtering |
+| `pipeline/stages/clean.py` | Stage 3 — Point cloud cleaning + object extraction |
+| `pipeline/stages/reconstruct.py` | Stage 4 — Poisson reconstruction driver |
+| `pipeline/stages/watertight.py` | Stage 5 — Watertight repair driver |
+| `pipeline/stages/evaluate.py` | Stage 6 — Multi-view screenshot capture |
+| `pipeline/stages/volume.py` | Stage 7 — ArUco-referenced real-world volumes |
+| `pipeline/core/filters.py` | Confidence + spatial point cloud filters |
+| `pipeline/core/plane.py` | Deterministic RANSAC plane removal |
+| `pipeline/core/cluster.py` | DBSCAN clustering + ArUco-aware object ranking |
+| `pipeline/core/mesh.py` | Mesh-level utilities (cleanup, scene merge) |
+| `pipeline/utils/seeding.py` | `seed_everything()` for full reproducibility |
+| `workers/recons_worker.py` | Subprocess worker — Poisson reconstruction |
+| `workers/meshfix_worker.py` | Subprocess worker — PyMeshFix + Open3D fill_holes |
+| `tools/com_vol.py` | Standalone CLI for real-world volume computation |
+| `vggt/` | VGGT model + utilities |

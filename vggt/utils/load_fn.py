@@ -9,6 +9,12 @@ from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
 
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
 
 def load_and_preprocess_images_square(image_path_list, target_size=1024):
     """

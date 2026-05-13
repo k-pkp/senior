@@ -12,6 +12,7 @@ from vggt.utils.device import get_device
 from pipeline.cli import parse_args
 from pipeline.config import IMAGE_EXTENSIONS
 from pipeline.utils.seeding import seed_everything
+from pipeline.utils.resource_log import prime_counters, append_run
 
 from pipeline.stages.inference import run_inference
 from pipeline.stages.pointcloud import export_ply
@@ -97,6 +98,10 @@ def main():
 
     seed_everything(args.seed)
 
+    log_enabled = args.log and not args.no_log
+    if log_enabled:
+        prime_counters(device)
+
     _print_banner(args, device)
 
     if not os.path.isdir(args.image_folder):
@@ -162,3 +167,9 @@ def main():
     _print_summary(total_time, inference_time, ply_path, scene_recon_path,
                    recon_mesh_paths, scene_wt_path, wt_mesh_paths,
                    npz_path2, target_dir, target_images_dir)
+
+    if log_enabled:
+        log_path = args.log
+        if not os.path.isabs(log_path):
+            log_path = os.path.join(_PROJECT_ROOT, log_path)
+        append_run(log_path, args, device, total_time, inference_time)

@@ -16,7 +16,7 @@ Examples:
     )
     p.add_argument("-i", "--image_folder", type=str, default="./inputs/baam/",
                    help="Path to folder containing input images (default: ./baam/)")
-    p.add_argument("--output_dir", type=str, default=None,
+    p.add_argument("-o", "--output_dir", type=str, default=None,
                    help="Directory for output files (default: ./output/)")
     p.add_argument("--conf_thres", type=float, default=45.0,
                    help="Confidence threshold (percentile): filter bottom N%% of points (default: 45)")
@@ -39,4 +39,11 @@ Examples:
                    help="Skip watertight repair (export only Poisson reconstruction)")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for reproducibility (default: 42)")
+    p.add_argument("-l", "--log", nargs="?", const="log.csv", default="log.csv",
+                   metavar="PATH",
+                   help="Append run resource usage (time, CPU, RAM, VRAM) to a CSV. "
+                        "Default: ./log.csv at project root. -l PATH overrides path. "
+                        "Existing file is appended to, not overwritten.")
+    p.add_argument("--no-log", action="store_true",
+                   help="Disable run logging (overrides --log).")
     return p.parse_args()

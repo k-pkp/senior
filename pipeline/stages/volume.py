@@ -25,8 +25,11 @@ def _measure_mesh(path, idx):
         return None
 
     mesh = trimesh.load(path, force="mesh", process=False)
-    extents = mesh.bounds[1] - mesh.bounds[0]
-    max_extent = float(np.max(extents))
+    # Oriented bbox: extents reflect true object dimensions even if the mesh
+    # is tilted in world frame. AABB would over-report for any rotated mesh.
+    obb_extents = np.asarray(mesh.bounding_box_oriented.extents)
+    extents = np.sort(obb_extents)[::-1]   # longest, mid, short
+    max_extent = float(extents[0])
 
     if mesh.is_watertight:
         volume = float(abs(mesh.volume))
@@ -87,12 +90,14 @@ def compute_volumes(object_mesh_paths):
           f"{real_ref_vol:.2f} / {ref['bbox_vol']:.6f} = {k:.6f}")
     print(f"    k^(1/3)      = {cube_root_k:.6f}")
 
+    # Linear dims = OBB extents * k^(1/3).
+    # Volume = actual mesh volume (watertight / convex hull) * k, NOT bbox*k.
     print("\n  Real-world dimensions and volumes:")
-    print(f"  {'IDX':>4} {'NAME':<20} {'SIZE (cm)':<24} {'VOLUME (cm^3)':>14}")
+    print(f"  {'IDX':>4} {'NAME':<20} {'L x W x H (cm)':<24} {'VOLUME (cm^3)':>14}")
     print("  " + "-" * 68)
     for info in infos:
         ext_cm = info["extents"] * cube_root_k
-        real_vol = float(ext_cm[0] * ext_cm[1] * ext_cm[2])
+        real_vol = info["volume"] * k
         size_str = f"{ext_cm[0]:6.2f} x {ext_cm[1]:6.2f} x {ext_cm[2]:6.2f}"
         marker = "  <- REF" if info["idx"] == REFERENCE_OBJECT_INDEX else ""
         print(f"  {info['idx']:>4} {info['name']:<20} {size_str:<24} "

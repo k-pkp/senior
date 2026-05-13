@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 
+import numpy as np
 import open3d as o3d
 
 from pipeline.core.mesh import merge_meshes, verify_watertight, clean_merged_scene
@@ -14,11 +15,35 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _MESHFIX_WORKER = os.path.join(_PROJECT_ROOT, "workers", "meshfix_worker.py")
 
 
-def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="scene"):
+def _compute_alignment_transform(ref_mesh_path):
+    """4x4 transform mapping world frame → reference OBB frame.
+
+    Axes permuted so the reference's longest extent → X, mid → Y, short → Z.
+    Right-handed. Lets X/Y/Z report true object dimensions instead of arbitrary
+    recon-frame axes.
+    """
+    import trimesh
+    m = trimesh.load(ref_mesh_path, process=False)
+    obb = m.bounding_box_oriented
+    T_inv = np.linalg.inv(obb.primitive.transform)   # world → OBB-local
+
+    ext = np.asarray(obb.extents)
+    order = np.argsort(ext)[::-1]
+    P = np.eye(4)
+    P[:3, :3] = np.eye(3)[order]
+    if np.linalg.det(P[:3, :3]) < 0:
+        P[:3, :3] = P[:3, :3] @ np.diag([1.0, 1.0, -1.0])
+    return P @ T_inv
+
+
+def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="scene", ref_index=None):
     """Fill each reconstructed mesh to be watertight (PyMeshFix + color transfer).
 
     Returns (scene_ply, scene_stl, watertight_mesh_paths).
     Each object is saved as `object_N.ply` (watertight version).
+
+    If ``ref_index`` is given, all output meshes are rotated into the reference
+    object's oriented-bounding-box frame so X/Y/Z align with the reference cube.
     """
     os.makedirs(output_folder, exist_ok=True)
 
@@ -81,6 +106,27 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
     if len(meshes) == 0:
         raise ValueError("No watertight meshes produced")
 
+    # ---- Axis alignment: rotate everything into reference-OBB frame ----
+    if ref_index is not None and 0 <= ref_index < len(watertight_paths):
+        import trimesh
+        T_align = _compute_alignment_transform(watertight_paths[ref_index])
+        print(f"\nAligning meshes to OBB frame of object_{ref_index} "
+              f"(longest→X, mid→Y, short→Z)")
+
+        # Rewrite each watertight PLY/STL in the aligned frame.
+        # trimesh preserves vertex colors; o3d STL write drops them anyway.
+        for p in watertight_paths:
+            tm = trimesh.load(p, process=False)
+            tm.apply_transform(T_align)
+            tm.export(p)
+            tm.export(os.path.splitext(p)[0] + ".stl")
+
+        # Apply same transform to the o3d meshes used for scene merge.
+        for m in meshes:
+            m.transform(T_align)
+            m.compute_vertex_normals()
+            m.compute_triangle_normals()
+
     print("\nMerging watertight meshes...")
     final_mesh = merge_meshes(meshes)
     final_mesh = clean_merged_scene(final_mesh)
@@ -119,10 +165,12 @@ def watertight_stage(recon_paths, output_dir):
     mesh_output_dir = os.path.join(output_dir, "mesh")
 
     try:
+        from pipeline.config import REFERENCE_OBJECT_INDEX
         scene_wt, _, wt_paths = make_watertight_meshes(
             recon_paths=recon_paths,
             output_folder=mesh_output_dir,
             base_name="scene",
+            ref_index=REFERENCE_OBJECT_INDEX,
         )
         print(f"  Scene watertight mesh: {scene_wt}")
         for p in wt_paths:

@@ -21,3 +21,5 @@ omegaconf
 tqdm
 pymeshfix
 pyvista
+pillow-heif>=0.15.0
+psutil>=5.9.0

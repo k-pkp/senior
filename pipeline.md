@@ -20,7 +20,11 @@ Input Images
 ### Stage 1: Model Inference
 - **File**: `pipeline/stages/inference.py` → `run_inference()`
 - **Model**: VGGT-1B (`facebook/VGGT-1B` from HuggingFace)
-- **Input**: Folder of images (JPG/PNG/BMP/TIFF/WEBP)
+- **Input**: Folder of images (JPG/PNG/BMP/TIFF/WEBP/HEIC/HEIF)
+  HEIC/HEIF requires the optional `pillow-heif` package; if installed,
+  `register_heif_opener()` is called at module import so PIL transparently
+  decodes `.heic`/`.heif`. Without it, those files trigger PIL's usual
+  `UnidentifiedImageError`. To pre-convert instead, see `convert.py`.
 - **Output**: Predictions dict
   - `world_points` (S, H, W, 3) — direct 3D point regression
   - `world_points_conf` — per-point confidence
@@ -81,6 +85,16 @@ Input Images
   `scene_colour.stl` (`trimesh.util.concatenate` of per-object watertight meshes,
   `process=False` to keep PyMeshFix seam dups intact and preserve per-object
   watertightness; STL is geometry-only — colors not stored in the format)
+- **Axis alignment (post-repair)**: after all objects are watertight, an
+  alignment transform `T_align` is computed from the **oriented bounding box**
+  of the reference object (`REFERENCE_OBJECT_INDEX`, default `1` = ArUco).
+  `T_align = P · obb⁻¹` where `obb` maps OBB-local→world and `P` permutes axes
+  so the reference's longest extent → X, mid → Y, short → Z (right-handed).
+  Applied to every per-object PLY/STL on disk **and** to the o3d meshes used
+  for `scene.ply`/`scene_colour.ply`. Effect: world axes of all watertight
+  outputs are physically meaningful (lined up with the ArUco cube) instead of
+  the arbitrary VGGT recon frame. Only Stage-5 outputs are aligned; Stage-4
+  `object_N_recon.*` files remain in raw recon frame.
 - **Determinism**: PyMeshFix + Open3D `fill_holes` are pure C++ geometric algorithms,
   no RNG → identical md5 across repeated runs (verified ×3)
 
@@ -97,18 +111,44 @@ Input Images
 
 ### Stage 7: Real-world Volume (ArUco-referenced)
 - **File**: `pipeline/stages/volume.py` → `compute_volumes()`
-- **Standalone tool**: `tools/com_vol.py` (CLI for volume-only computation against an existing scene)
+- **Standalone tool**: `tools/com_vol.py` — independent Open3D-based CLI for
+  ad-hoc volume against an existing mesh + reference PLY. Note: it does **not**
+  share Stage 7 code and uses AABB/convex-hull scaling, no OBB alignment.
 - **Reference**: `object_1` is the ArUco marker, a **14 × 14 × 14 cm cube**
   (configurable via `REFERENCE_OBJECT_INDEX`, `REFERENCE_REAL_SIZE_CM` in `pipeline/config.py`)
+- **Extents**: each mesh's size is taken from the **oriented bounding box**
+  (`mesh.bounding_box_oriented.extents`), sorted longest→shortest. AABB is
+  ignored because it over-reports size for any tilted mesh — a 14 cm cube
+  rotated 30° has AABB ≈ 19 × 19 × 14, ≈1.9× wrong scale.
 - **Formula**:
   ```
-  k          = REAL_VOL / mesh_bbox_vol_ref      # volume scale
-  k^(1/3)    = linear scale
-  real_X     = mesh_X * k^(1/3)
-  real_vol_i = mesh_vol_i * k                    # cm^3
+  obb_ext_ref       = sort(OBB_extents(ref), descending)   # (L, W, H)
+  mesh_bbox_vol_ref = L * W * H                            # OBB-based
+  k                 = REAL_VOL / mesh_bbox_vol_ref         # volume scale
+  k^(1/3)           = linear scale
+  real_L_i          = L_i * k^(1/3)                        # per axis
+  real_vol_i        = mesh_vol_i * k                       # cm^3 (NOT bbox*k)
   ```
+  The final per-object volume uses `mesh.volume` (or `convex_hull.volume`),
+  not the scaled bounding box, so concave shapes (vases, etc.) report their
+  true interior-excluded volume rather than the bounding-box volume.
 - **Volume source**: `mesh.volume` if watertight, else `convex_hull.volume`
 - **Mesh load**: `trimesh.load(path, force="mesh", process=False)` (same reason as Stage 5)
+- **Caveat**: a watertight mesh with inverted/inconsistent face normals can
+  produce `mesh.volume` that is off by ~½ or signed-cancelling; the reference
+  cube then prints e.g. 1387 cm³ instead of 2744. Linear `L × W × H` is
+  unaffected (always derived from OBB extents). To verify, inspect the ref:
+  ```bash
+  python -c "
+  import trimesh
+  m = trimesh.load('output/mesh/object_1.ply', process=False)
+  print('watertight :', m.is_watertight)
+  print('mesh.vol   :', m.volume)
+  print('hull vol   :', m.convex_hull.volume)
+  print('OBB vol    :', m.bounding_box_oriented.volume)"
+  ```
+  If `mesh.vol` ≈ ½ × `hull vol`, re-orient normals in MeshLab
+  (`Filters > Normals > Re-Orient all normals coherently`) and re-run.
 
 ## Usage
 
@@ -153,6 +193,8 @@ CLI parsing lives in `pipeline/cli.py`.
 | `--evaluate` | off | Capture multi-perspective screenshots |
 | `--no-watertight` | off | Skip Stage 5; final mesh is Poisson recon only |
 | `--seed` | `42` | Seed for `random`, NumPy, PyTorch, Open3D |
+| `-l`, `--log [PATH]` | `log.csv` | Append run resource usage to CSV. Default `log.csv` at project root; existing file is appended to. |
+| `--no-log` | off | Disable run logging (overrides `--log`). |
 
 ## Output Structure
 

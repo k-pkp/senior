@@ -15,6 +15,14 @@ from vggt.utils.device import is_mps, autocast_on, aggressive_cleanup
 
 from pipeline.config import DEFAULT_MAX_FRAMES_MPS, IMAGE_EXTENSIONS, VGGT_MODEL_URL
 
+# Register HEIC/HEIF support in PIL once at import time. Optional dep; if
+# pillow-heif is missing, .heic inputs raise the usual PIL UnidentifiedImageError.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
 
 def _select_frames(image_names, max_frames):
     """Uniformly subsample frames if there are more than max_frames, keeping first and last."""

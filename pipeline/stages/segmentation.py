@@ -2,7 +2,8 @@
 
 Runs after cleaning (Stage 3) and before reconstruction (Stage 4).
 Takes the obj.ply output from clean, detects colored markers, and cuts
-the leg surface horizontally between marker positions.
+the leg surface using signed distance to SVD-fitted marker planes
+(handles slanted/tilted markers).
 """
 
 import os

@@ -1,4 +1,4 @@
-"""Stage 7 — Compute real-world volumes using the ArUco reference (obj).
+"""Stage 7 — Compute real-world volumes using the ArUco reference (box).
 
 Formula:
     mesh_bbox_vol_ref = X_ref * Y_ref * Z_ref     # product of reference extents
@@ -19,10 +19,10 @@ from pipeline.config import REFERENCE_REAL_SIZE_CM
 
 
 def _is_ref_mesh(path):
-    """Identify reference (ArUco marker) by filename: 'obj' is the marker, 'box' is the target."""
+    """Identify reference (ArUco marker) by filename: 'box' is the marker."""
     base = os.path.basename(path).lower()
     name = os.path.splitext(base)[0]
-    return "obj" in name and "box" not in name
+    return "box" in name
 
 
 def _measure_mesh(path):
@@ -55,11 +55,11 @@ def _measure_mesh(path):
 
 
 def compute_volumes(object_mesh_paths):
-    """Compute real-world volume of each object using ArUco reference (obj) for scale."""
+    """Compute real-world volume of each object using ArUco reference (box) for scale."""
     print()
     print("=" * 60)
     print(f"STAGE 7: Computing real-world volumes "
-          f"(ref: obj mesh = {REFERENCE_REAL_SIZE_CM}cm ArUco)")
+          f"(ref: box mesh = {REFERENCE_REAL_SIZE_CM}cm ArUco)")
     print("=" * 60)
 
     infos = []
@@ -76,7 +76,7 @@ def compute_volumes(object_mesh_paths):
 
     ref = next((x for x in infos if x["is_ref"]), None)
     if ref is None:
-        print("  No obj (reference) mesh found. Skipping volume computation.")
+        print("  No box (reference) mesh found. Skipping volume computation.")
         return
 
     if ref["bbox_vol"] <= 0:

@@ -3,8 +3,8 @@
 Steps:
     1. Detect marker points via HSV color thresholding + Excess Green Index.
     2. Cluster markers spatially with DBSCAN.
-    3. Compute per-cluster position along the height axis.
-    4. Cut the point cloud between the lowest and highest marker clusters.
+    3. Fit a plane to each marker cluster via SVD to capture tilt/slant.
+    4. Cut the point cloud using signed distance to the tilted marker planes.
 
 Axis convention: After pipeline leveling (Stage 3), Z is the vertical axis.
 Use ``height_axis="z"`` for post-leveled point clouds.
@@ -110,14 +110,19 @@ def cluster_markers(coords, eps=0.03, min_samples=10):
     return labels, n_clusters
 
 
-def compute_cluster_centers(coords, labels, colors_uint8, axis_idx, min_cluster_size=50):
-    """Compute per-cluster centroid position along the height axis.
+def compute_cluster_planes(coords, labels, colors_uint8, axis_idx, min_cluster_size=50):
+    """Compute per-cluster centroid and SVD-based plane normal.
 
-    Returns list of (cluster_id, height_pos, n_points, center_xyz, color_mean)
-    sorted by height position ascending. Noise (label == -1) and clusters smaller
-    than min_cluster_size are excluded.
+    For each marker cluster, fits a best-fit plane via Singular Value
+    Decomposition.  The normal vector captures the tilt/slant of the
+    marker surface.
+
+    Returns list of (cluster_id, centroid, normal, n_points, color_mean)
+    sorted by centroid position along the height axis ascending.
+    Noise (label == -1) and clusters smaller than min_cluster_size are
+    excluded.
     """
-    centers = []
+    planes = []
     skipped = 0
     for cid in sorted(set(labels)):
         if cid == -1:
@@ -128,51 +133,95 @@ def compute_cluster_centers(coords, labels, colors_uint8, axis_idx, min_cluster_
             skipped += 1
             continue
         cluster_coords = coords[mask]
-        height_pos = float(np.mean(cluster_coords[:, axis_idx]))
-        center_xyz = cluster_coords.mean(axis=0)
+        centroid = cluster_coords.mean(axis=0)
+
+        centered = cluster_coords - centroid
+        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        normal = Vt[-1]
+
+        if normal[axis_idx] < 0:
+            normal = -normal
+
         color_mean = colors_uint8[mask].mean(axis=0)
-        centers.append((cid, height_pos, npts, center_xyz, color_mean))
+        planes.append((cid, centroid, normal, npts, color_mean))
 
     if skipped:
         print(f"    (skipped {skipped} cluster(s) with < {min_cluster_size} points)")
 
-    centers.sort(key=lambda x: x[1])
-    return centers
+    planes.sort(key=lambda x: x[1][axis_idx])
+    return planes
 
 
-def cut_surface(coords, centers, axis_idx, axis_name="Z"):
-    """Create keep-mask based on marker positions along the height axis.
+def cut_surface_plane(coords, planes, axis_idx, axis_name="Z"):
+    """Create keep-mask based on signed distance to tilted marker planes.
+
+    Uses the SVD-fitted plane for each marker cluster so that slanted
+    and tilted markers are handled correctly.
+
+    For point P and plane (centroid C, unit normal N):
+        signed_distance(P) = dot(P - C, N)
+
+    Normal is oriented so that positive N[axis_idx] points "upward".
+    Therefore:
+        distance < 0  ->  below the plane
+        distance > 0  ->  above the plane
 
     Case logic:
         0 markers -> keep all points
-        1 marker  -> keep points below the marker (axis < pos)
-        2 markers -> keep points between low and high
-        3+ markers -> keep points between lowest and highest
+        1 marker  -> keep points *below* the tilted plane (distance < 0)
+        2 markers -> keep points *above* bottom plane (dist > 0) AND
+                     *below* top plane (dist < 0)
+        3+ markers -> keep points between lowest and highest marker planes
 
     Returns boolean mask of points to keep.
     """
-    n = len(centers)
+    n = len(planes)
 
     if n == 0:
         return np.ones(len(coords), dtype=bool), {"case": 0}
 
-    height_coords = coords[:, axis_idx]
-    height_markers = [c[1] for c in centers]
-
     if n == 1:
-        h0 = height_markers[0]
-        keep = height_coords < h0
-        info = {"case": 1, "height_low": float(h0)}
+        cid, centroid, normal, npts, clr = planes[0]
+        dist = np.dot(coords - centroid, normal)
+        keep = dist < 0
+        info = {
+            "case": 1,
+            "centroid": centroid.tolist(),
+            "normal": normal.tolist(),
+        }
 
     elif n == 2:
-        h_low, h_high = height_markers[0], height_markers[1]
-        keep = (height_coords > h_low) & (height_coords < h_high)
-        info = {"case": 2, "height_low": float(h_low), "height_high": float(h_high)}
+        cid_low, centroid_low, normal_low, npts_low, clr_low = planes[0]
+        cid_high, centroid_high, normal_high, npts_high, clr_high = planes[1]
+
+        dist_low = np.dot(coords - centroid_low, normal_low)
+        dist_high = np.dot(coords - centroid_high, normal_high)
+
+        keep = (dist_low > 0) & (dist_high < 0)
+        info = {
+            "case": 2,
+            "centroid_low": centroid_low.tolist(),
+            "normal_low": normal_low.tolist(),
+            "centroid_high": centroid_high.tolist(),
+            "normal_high": normal_high.tolist(),
+        }
 
     else:
-        h_low, h_high = height_markers[0], height_markers[-1]
-        keep = (height_coords > h_low) & (height_coords < h_high)
-        info = {"case": 3, "height_low": float(h_low), "height_high": float(h_high), "n_markers": n}
+        cid_low, centroid_low, normal_low, npts_low, clr_low = planes[0]
+        cid_high, centroid_high, normal_high, npts_high, clr_high = planes[-1]
+
+        dist_low = np.dot(coords - centroid_low, normal_low)
+        dist_high = np.dot(coords - centroid_high, normal_high)
+
+        keep = (dist_low > 0) & (dist_high < 0)
+        info = {
+            "case": 3,
+            "n_markers": n,
+            "centroid_low": centroid_low.tolist(),
+            "normal_low": normal_low.tolist(),
+            "centroid_high": centroid_high.tolist(),
+            "normal_high": normal_high.tolist(),
+        }
 
     info["kept"] = int(keep.sum())
     info["total"] = len(coords)
@@ -182,10 +231,21 @@ def cut_surface(coords, centers, axis_idx, axis_name="Z"):
 def segment_point_cloud(pcd, height_axis="z", verbose=True):
     """Run full marker-based leg segmentation on an Open3D point cloud.
 
+    Marker planes are fitted via SVD so that slanted/tilted markers
+    are handled by cutting with signed distance to the tilted plane.
+
+    Steps:
+        1. HSV + ExG color detection (same universal marker logic).
+        2. DBSCAN spatial clustering.
+        3. SVD plane fitting per cluster (centroid + normal vector).
+        4. Signed-distance cut using the tilted marker planes.
+
     Args:
         pcd: Open3D PointCloud with colors.
-        height_axis: axis for height-based cut ("x", "y", "z"). Default "z"
-                     (vertical after pipeline leveling).
+        height_axis: axis used for normal orientation and sorting ("x","y","z").
+                     Normal is flipped to point positively along this axis,
+                     so that "below plane" = negative signed distance.
+                     Default "z" (vertical after pipeline leveling).
         verbose: print progress messages.
 
     Returns:
@@ -254,22 +314,22 @@ def segment_point_cloud(pcd, height_axis="z", verbose=True):
         summary["n_kept"] = n_total
         return segmented_pcd, summary
 
-    # --- Step 3: Compute cluster centers ---
-    centers = compute_cluster_centers(marker_coords, labels, marker_colors, axis_idx)
+    # --- Step 3: SVD plane fitting per cluster ---
+    planes = compute_cluster_planes(marker_coords, labels, marker_colors, axis_idx)
 
     if verbose:
-        print(f"  Marker clusters (sorted by {axis_name}):")
-        for cid, height_pos, npts, center_xyz, color_mean in centers:
-            print(f"    cluster {cid}: {axis_name}={height_pos:.4f}  "
-                  f"center=({center_xyz[0]:.4f},{center_xyz[1]:.4f},{center_xyz[2]:.4f})  "
-                  f"{npts} pts  RGB=({color_mean[0]:.0f},{color_mean[1]:.0f},{color_mean[2]:.0f})")
-        print(f"    height range [{centers[0][1]:.4f}, {centers[-1][1]:.4f}]")
+        print(f"  Marker planes (sorted by {axis_name} centroid):")
+        for cid, centroid, normal, npts, color_mean in planes:
+            print(f"    cluster {cid}: centroid=({centroid[0]:.4f},{centroid[1]:.4f},"
+                  f"{centroid[2]:.4f})  normal=({normal[0]:+.4f},{normal[1]:+.4f},"
+                  f"{normal[2]:+.4f})  {npts} pts  "
+                  f"RGB=({color_mean[0]:.0f},{color_mean[1]:.0f},{color_mean[2]:.0f})")
 
-    # --- Step 4: Cut surface ---
+    # --- Step 4: Cut using signed distance to tilted planes ---
     if verbose:
-        print("  Cutting surface...")
+        print("  Cutting surface via plane signed-distance...")
 
-    keep_mask, cut_info = cut_surface(coords, centers, axis_idx, axis_name)
+    keep_mask, cut_info = cut_surface_plane(coords, planes, axis_idx, axis_name)
     summary["cut"] = cut_info
 
     if verbose:

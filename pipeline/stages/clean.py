@@ -1,4 +1,4 @@
-"""Stage 3 — Clean the point cloud and separate it into box + other object PLYs.
+"""Stage 3 — Clean the point cloud, extract objects, and optionally segment legs.
 
 Steps:
     1. RANSAC-based leveling so the ground plane is horizontal (Z up).
@@ -6,6 +6,7 @@ Steps:
     3. Voxel downsampling if very dense.
     4. Smart laser-cut floor removal (only if a horizontal bottom plane exists).
     5. DBSCAN clustering + box detection (cubeness) → box.ply + obj.ply.
+    6. (Optional) Marker-based leg surface segmentation on obj.ply.
 """
 import os
 
@@ -18,6 +19,81 @@ from pipeline.core.plane import (
     get_rotation_to_z_axis,
 )
 from pipeline.core.cluster import compute_eps, detect_top_k_objects
+from pipeline.core.segmentation import segment_point_cloud
+
+
+def _segment_leg(object_paths, output_dir, height_axis="z", seed=42):
+    """Apply marker-based leg segmentation to the obj.ply in object_paths.
+
+    Args:
+        object_paths: List of PLY paths from the clean stage (box.ply, obj.ply).
+        output_dir: Base output directory for the pipeline.
+        height_axis: Axis for height-based cut ("z" by default, vertical after leveling).
+        seed: Random seed (unused, kept for API consistency).
+
+    Returns:
+        new_paths: List of PLY paths with obj.ply replaced by segmented_obj.ply.
+                   If no obj.ply is found or segmentation produces too few points,
+                   returns the original list unchanged.
+    """
+    print()
+    print("-" * 40)
+    print("Leg segmentation (Stage 3)")
+    print("-" * 40)
+
+    seg_dir = os.path.join(output_dir, "segmented")
+    os.makedirs(seg_dir, exist_ok=True)
+
+    new_paths = list(object_paths)
+    obj_ply = None
+    obj_idx = None
+
+    for i, p in enumerate(object_paths):
+        if os.path.basename(p).lower().startswith("obj"):
+            obj_ply = p
+            obj_idx = i
+            break
+
+    if obj_ply is None:
+        print("  No obj.ply found in clean outputs — skipping segmentation")
+        return new_paths
+
+    print(f"  Input: {obj_ply}")
+
+    try:
+        pcd = o3d.io.read_point_cloud(obj_ply)
+        if len(pcd.points) == 0:
+            print("  Empty point cloud — skipping")
+            return new_paths
+
+        segmented_pcd, summary = segment_point_cloud(pcd, height_axis=height_axis, verbose=True)
+
+    except Exception as e:
+        print(f"  ERROR during segmentation: {e}")
+        return new_paths
+
+    cut_info = summary.get("cut", {})
+    if cut_info.get("case") == 0:
+        reason = cut_info.get("reason", "no_markers")
+        print(f"  No cut applied ({reason}) — keeping original obj.ply for reconstruction")
+        return new_paths
+
+    n_kept = summary.get("n_kept", 0)
+    if n_kept < 100:
+        print(f"  Only {n_kept} points after cut (< 100) — keeping original obj.ply")
+        return new_paths
+
+    seg_path = os.path.join(seg_dir, "segmented_obj.ply")
+    o3d.io.write_point_cloud(seg_path, segmented_pcd, write_ascii=False)
+
+    seg_pts = np.asarray(segmented_pcd.points)
+    print(f"  Saved: {seg_path} ({n_kept:,} pts) "
+          f"X[{seg_pts[:,0].min():.3f},{seg_pts[:,0].max():.3f}] "
+          f"Y[{seg_pts[:,1].min():.3f},{seg_pts[:,1].max():.3f}] "
+          f"Z[{seg_pts[:,2].min():.3f},{seg_pts[:,2].max():.3f}]")
+
+    new_paths[obj_idx] = seg_path
+    return new_paths
 
 
 def clean_and_extract_objects(
@@ -178,10 +254,12 @@ def clean_and_extract_objects(
     return output_paths
 
 
-def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42):
+def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
+                      segment_leg=False, segment_height_axis="z"):
     """Pipeline wrapper around clean_and_extract_objects.
 
-    Returns the list of per-object PLY paths [box.ply, obj.ply], or None on failure.
+    Optionally runs marker-based leg segmentation on obj.ply after cleaning.
+    Returns the list of per-object PLY paths, or None on failure.
     """
     print()
     print("=" * 60)
@@ -202,6 +280,12 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42):
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:
             print(f"    → {p}")
+
+        if object_paths and segment_leg:
+            object_paths = _segment_leg(
+                object_paths, output_dir,
+                height_axis=segment_height_axis, seed=seed)
+
         return object_paths
     except Exception as e:
         print(f"  ERROR during cleaning: {e}")

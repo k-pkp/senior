@@ -38,16 +38,22 @@ Input Images
   3. Statistical outlier removal (Open3D, k=20, std_ratio=2.5)
 - **Output**: `output/points.ply` — colored point cloud
 
-### Stage 3: Clean & Extract Objects
+### Stage 3: Clean & Extract Objects (+ Optional Leg Segmentation)
 - **File**: `pipeline/stages/clean.py` → `clean_and_extract()`
-- **Helpers**: `pipeline/core/filters.py`, `pipeline/core/plane.py`, `pipeline/core/cluster.py`
+- **Helpers**: `pipeline/core/filters.py`, `pipeline/core/plane.py`, `pipeline/core/cluster.py`,
+  `pipeline/core/segmentation.py`
 - **Process**:
-  1. Statistical outlier removal (std_ratio=2.0)
-  2. Voxel downsampling (voxel=0.002)
-  3. RANSAC plane removal (drops dominant ground plane)
-  4. DBSCAN clustering with adaptive epsilon
-  5. Top-k selection by score (points × density)
-- **Output**: `output/clean_objects/object_0.ply`, `object_1.ply`, …
+  1. RANSAC-based leveling (ground plane → horizontal)
+  2. Adaptive statistical-outlier removal
+  3. Voxel downsampling if very dense (>100k points)
+  4. Smart laser-cut floor removal (horizontal bottom plane)
+  5. DBSCAN clustering with adaptive epsilon + ArUco-aware box detection
+  6. (Optional) Marker-based leg surface segmentation on `obj.ply`
+     - HSV + Excess Green color detection for markers
+     - DBSCAN spatial clustering of marker points
+     - SVD plane fitting + signed-distance cutting (handles slanted markers)
+- **Output**: `output/clean_objects/box.ply`, `obj.ply`
+  (if `--segment-leg` enabled: `output/segmented/segmented_obj.ply` replaces `obj.ply`)
 
 ### Stage 4: Poisson Reconstruction (non-watertight)
 - **File**: `pipeline/stages/reconstruct.py` → `reconstruct_mesh_stage()`
@@ -152,6 +158,8 @@ CLI parsing lives in `pipeline/cli.py`.
 | `--max_frames` | auto | Max input frames (auto=6 on MPS) |
 | `--evaluate` | off | Capture multi-perspective screenshots |
 | `--no-watertight` | off | Skip Stage 5; final mesh is Poisson recon only |
+| `--no-segment-leg` | off | Disable marker-based leg segmentation in Stage 3 (enabled by default) |
+| `--segment-height-axis` | `z` | Height axis for leg cut (`x`, `y`, or `z`) |
 | `--seed` | `42` | Seed for `random`, NumPy, PyTorch, Open3D |
 
 ## Output Structure
@@ -161,7 +169,9 @@ output/
   points.ply                       # Filtered point cloud (Stage 2)
   predictions.npz                  # Raw model predictions
   clean_objects/
-    object_0.ply / object_1.ply    # Cleaned point clouds (Stage 3)
+    box.ply / obj.ply                # Cleaned point clouds (Stage 3)
+  segmented/
+    segmented_obj.ply                 # Leg-segmented obj (Stage 3, optional)
   mesh/
     object_N_recon.ply / .stl      # Poisson recon (Stage 4, non-watertight)
     scene_recon.ply / .stl         # Merged recon scene
@@ -249,10 +259,11 @@ pipeline/
     plane.py                      # Deterministic RANSAC plane detection
     cluster.py                    # DBSCAN clustering + ArUco-aware ranking
     mesh.py                       # Mesh utilities for recon/watertight stages
+    segmentation.py               # Marker-based leg surface segmentation
   stages/                         # One module per pipeline stage
     inference.py                  # Stage 1
     pointcloud.py                 # Stage 2
-    clean.py                      # Stage 3
+    clean.py                      # Stage 3 (clean + extract + optional seg)
     reconstruct.py                # Stage 4 driver
     watertight.py                 # Stage 5 driver
     evaluate.py                   # Stage 6
@@ -279,7 +290,8 @@ output/                           # Pipeline artifacts (see Output Structure)
 | `pipeline/config.py` | Pipeline-wide constants |
 | `pipeline/stages/inference.py` | Stage 1 — VGGT model inference |
 | `pipeline/stages/pointcloud.py` | Stage 2 — PLY export with adaptive filtering |
-| `pipeline/stages/clean.py` | Stage 3 — Point cloud cleaning + object extraction |
+| `pipeline/stages/clean.py` | Stage 3 — Point cloud cleaning + object extraction + optional leg segmentation |
+| `pipeline/core/segmentation.py` | HSV+ExG marker detection + SVD plane cutting |
 | `pipeline/stages/reconstruct.py` | Stage 4 — Poisson reconstruction driver |
 | `pipeline/stages/watertight.py` | Stage 5 — Watertight repair driver |
 | `pipeline/stages/evaluate.py` | Stage 6 — Multi-view screenshot capture |

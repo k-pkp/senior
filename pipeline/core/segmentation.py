@@ -110,7 +110,7 @@ def cluster_markers(coords, eps=0.03, min_samples=10):
     return labels, n_clusters
 
 
-def compute_cluster_planes(coords, labels, colors_uint8, axis_idx, min_cluster_size=50):
+def compute_cluster_planes(coords, labels, colors_uint8, axis_idx, min_cluster_size=150):
     """Compute per-cluster centroid and SVD-based plane normal.
 
     For each marker cluster, fits a best-fit plane via Singular Value
@@ -182,6 +182,20 @@ def cut_surface_plane(coords, planes, axis_idx, axis_name="Z"):
 
     if n == 1:
         cid, centroid, normal, npts, clr = planes[0]
+
+        heights = coords[:, axis_idx]
+        min_h = heights.min()
+        max_h = heights.max()
+        threshold = min_h + 0.3 * (max_h - min_h)
+
+        if centroid[axis_idx] < threshold:
+            return np.ones(len(coords), dtype=bool), {
+                "case": 0,
+                "reason": "marker_below_30pct",
+                "marker_height": float(centroid[axis_idx]),
+                "threshold": float(threshold),
+            }
+
         dist = np.dot(coords - centroid, normal)
         keep = dist < 0
         info = {

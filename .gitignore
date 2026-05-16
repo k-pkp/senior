@@ -97,7 +97,7 @@ outputs/
 results/
 data/
 datasets/
-*.csv
+
 
 # 3D assets (large)
 *.ply

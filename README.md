@@ -27,13 +27,15 @@ senior/
 │   ├── core/
 │   │   ├── plane.py             # RANSAC + leveling primitives
 │   │   ├── cluster.py           # DBSCAN + ArUco-aware ranking
+│   │   ├── fill.py              # bottom cap fill (alpha-shape hull)
 │   │   ├── filters.py           # confidence + spatial outlier filters
 │   │   └── mesh.py              # merge_meshes, verify_watertight, cleanup
 │   └── utils/
 │       └── seeding.py           # seed_everything (random / numpy / torch / o3d)
 ├── workers/
-│   ├── recons_worker.py         # Poisson reconstruction subprocess (executable)
-│   └── meshfix_worker.py        # PyMeshFix subprocess (executable)
+│   ├── recons_worker.py         # Poisson reconstruction subprocess
+│   ├── recons_methods_worker.py # multi-method reconstruction subprocess
+│   └── meshfix_worker.py        # PyMeshFix subprocess
 └── tools/
     └── com_vol.py               # standalone mesh-vs-reference volume tool
 ```
@@ -62,6 +64,30 @@ Or:
 ```bash
 python run.py --image_folder ./baam/
 ```
+
+### All flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-i`, `--image_folder` | str | `./inputs/baam/` | Input image folder |
+| `--output_dir` | str | `./output/` | Output directory |
+| `--conf_thres` | float | 45.0 | Confidence threshold percentile |
+| `--prediction_mode` | choice | `pointmap` | `pointmap` or `depth` |
+| `--mask_black_bg` | flag | off | Mask near-black background |
+| `--mask_white_bg` | flag | off | Mask near-white background |
+| `--skip_mesh` | flag | off | Skip clean+reconstruct (PLY only) |
+| `--num_objects` | int | 2 | Objects to extract during cleaning |
+| `--max_frames` | int | auto | Max frames (auto-set to 7 on MPS) |
+| `--evaluate` | flag | off | Auto-capture screenshots |
+| `--no-watertight` | flag | off | Skip watertight repair |
+| `--no-fill` | flag | off | Skip bottom cap fill (auto-disabled with segmentation) |
+| `--no-segment-leg` | flag | off | Disable leg surface segmentation |
+| `--segment-height-axis` | choice | `z` | Height axis for leg cut (`x`/`y`/`z`) |
+| `--recon-method` | choice | `poisson` | Default method for all objects (`poisson`, `ball_pivot`, `alpha_shape`, `poisson_omp1`) |
+| `--box-recon-method` | choice | — | Override method for box/ArUco only |
+| `--obj-recon-method` | choice | — | Override method for object/limb only |
+| `--seed` | int | 42 | Random seed |
+| `-l`, `--log`/`--no-log` | flag | on | Append metrics to log.csv |
 
 Backends auto-detected: CUDA → MPS (Apple Silicon) → CPU.
 

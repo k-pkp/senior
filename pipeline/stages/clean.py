@@ -20,6 +20,7 @@ from pipeline.core.plane import (
 )
 from pipeline.core.cluster import compute_eps, detect_top_k_objects
 from pipeline.core.segmentation import segment_point_cloud
+from pipeline.core.fill import cap_point_cloud_bottom
 
 
 def _segment_leg(object_paths, output_dir, height_axis="z", seed=42):
@@ -105,6 +106,7 @@ def clean_and_extract_objects(
     merge_clusters=False,
     seed=42,
     ransac_factor=3,
+    fill_enabled=True,
 ):
     os.makedirs(output_folder, exist_ok=True)
 
@@ -225,7 +227,13 @@ def clean_and_extract_objects(
     else:
         box_cluster, obj_cluster = detect_top_k_objects(pcd, k=k, visualize=visualize)
 
-    # ---- STEP 6: SAVE box.ply + obj.ply ----
+    # ---- STEP 6: FILL BOTTOM CAP ----
+    if fill_enabled and not skip_plane and box_cluster is not None:
+        box_cluster = cap_point_cloud_bottom(box_cluster, alpha=0.0)
+    if fill_enabled and not skip_plane and obj_cluster is not None:
+        obj_cluster = cap_point_cloud_bottom(obj_cluster, alpha=2.0)
+
+    # ---- STEP 7: SAVE box.ply + obj.ply ----
     output_paths = []
 
     if box_cluster is not None:
@@ -255,7 +263,8 @@ def clean_and_extract_objects(
 
 
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
-                      segment_leg=False, segment_height_axis="z"):
+                      segment_leg=False, segment_height_axis="z",
+                      fill_enabled=True):
     """Pipeline wrapper around clean_and_extract_objects.
 
     Optionally runs marker-based leg segmentation on obj.ply after cleaning.
@@ -269,6 +278,11 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
     clean_output_dir = os.path.join(output_dir, "clean_objects")
     os.makedirs(clean_output_dir, exist_ok=True)
 
+    fill_this_run = fill_enabled and not segment_leg
+    if not fill_this_run:
+        reason = "disabled by --no-fill" if not fill_enabled else "skipped (segmented cut incompatible with fill)"
+        print(f"  Bottom fill: {reason}")
+
     try:
         object_paths = clean_and_extract_objects(
             input_path=ply_path,
@@ -276,6 +290,7 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
             k=num_objects,
             visualize=False,
             seed=seed,
+            fill_enabled=fill_this_run,
         )
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:

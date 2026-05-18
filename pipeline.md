@@ -57,7 +57,7 @@ Input Images
 
 ### Stage 4: Poisson Reconstruction (non-watertight)
 - **File**: `pipeline/stages/reconstruct.py` → `reconstruct_mesh_stage()`
-  → `workers/recons_worker.py` (subprocess)
+  → `workers/recons_methods_worker.py` (subprocess)
 - **Helpers**: `pipeline/core/mesh.py`
 - **Process** (per object):
   1. Adaptive Poisson depth 7–11 by point count
@@ -103,18 +103,24 @@ Input Images
 
 ### Stage 7: Real-world Volume (ArUco-referenced)
 - **File**: `pipeline/stages/volume.py` → `compute_volumes()`
-- **Standalone tool**: `tools/com_vol.py` (CLI for volume-only computation against an existing scene)
-- **Reference**: `object_1` is the ArUco marker, a **14 × 14 × 14 cm cube**
-  (configurable via `REFERENCE_OBJECT_INDEX`, `REFERENCE_REAL_SIZE_CM` in `pipeline/config.py`)
-- **Formula**:
+- **Standalone tool**: `volume.py` (root-level CLI for volume-only computation)
+- **Reference**: mesh whose filename contains `box` — ArUco **14 × 14 × 14 cm cube**
+  (configurable via `REFERENCE_REAL_SIZE_CM` in `pipeline/config.py`)
+- **Scale formula**:
   ```
-  k          = REAL_VOL / mesh_bbox_vol_ref      # volume scale
-  k^(1/3)    = linear scale
-  real_X     = mesh_X * k^(1/3)
-  real_vol_i = mesh_vol_i * k                    # cm^3
+  k            = real_ref_vol_cm3 / ref_mesh_vol   # cm³ per mesh-unit³
+  linear_scale = k^(1/3)                           # cm per mesh-unit
+  real_vol_i   = mesh_vol_i * k                    # cm³
+  size_x_cm    = ext_x * linear_scale
   ```
-- **Volume source**: `mesh.volume` if watertight, else `convex_hull.volume`
-- **Mesh load**: `trimesh.load(path, force="mesh", process=False)` (same reason as Stage 5)
+- **Volume method priority** (per mesh):
+  1. **watertight** — exact signed volume (`trimesh.Trimesh.volume`)
+  2. **warp + floodfill** — GPU BVH surface marking (`warp-lang`) + scipy flood-fill; ~40× faster than trimesh (requires `warp-lang` and CUDA)
+  3. **trimesh voxel** — CPU ray-cast voxelization fallback
+  4. **convex_hull** — last resort; overestimates concave shapes
+- **Auto-resolution tuning** (default ON): increases voxel resolution from 50→300 in steps of 50 until volume change < 1.5% between steps. Avoids manual `--voxel-res` guessing and OOM at high resolutions.
+- **Mesh prep**: `merge_vertices()` restores shared-index connectivity from STL triangle soup (required for correct watertight detection)
+- **Output columns**: `name`, `size_x_cm`, `size_y_cm`, `size_z_cm`, `real_vol_cm3`, `real_vol_L`, `method`
 
 ## Usage
 
@@ -160,6 +166,8 @@ CLI parsing lives in `pipeline/cli.py`.
 | `--no-watertight` | off | Skip Stage 5; final mesh is Poisson recon only |
 | `--no-segment-leg` | off | Disable marker-based leg segmentation in Stage 3 (enabled by default) |
 | `--segment-height-axis` | `z` | Height axis for leg cut (`x`, `y`, or `z`) |
+| `--voxel-res` | `150` | Voxel grid resolution for Stage 7 volume (ignored when auto-res active) |
+| `--no-auto-res` | off | Fix voxel resolution instead of auto-tuning until convergence |
 | `--seed` | `42` | Seed for `random`, NumPy, PyTorch, Open3D |
 
 ## Output Structure
@@ -235,12 +243,15 @@ md5sum /tmp/wt_run{1,2,3}/mesh/object_1.ply
 
 Core:
 - `torch` ≥ 2.5.1, `torchvision` ≥ 0.20.1
-- `numpy`, `open3d`, `trimesh`, `scipy`, `opencv-python`, `networkx`,
+- `numpy`, `open3d`, `trimesh`, `scipy`, `pandas`, `opencv-python`, `networkx`,
   `matplotlib`, `Pillow`
 
 Watertight repair:
 - `pymeshfix` (≥ 0.18) — boundary hole filling
 - `open3d` ≥ 0.19 — `t.geometry.TriangleMesh.fill_holes` fallback
+
+Volume (Stage 7):
+- `warp-lang` ≥ 1.3.0 — optional GPU voxelization (~40× faster than trimesh; requires CUDA). Falls back to trimesh CPU voxelization if unavailable.
 
 ## Project Layout
 
@@ -269,10 +280,9 @@ pipeline/
     evaluate.py                   # Stage 6
     volume.py                     # Stage 7
 workers/                          # Subprocess workers (isolate native crashes)
-  recons_worker.py                # Poisson reconstruction worker (Stage 4)
+  recons_methods_worker.py        # Reconstruction worker — Poisson/BallPivot/AlphaShape (Stage 4)
   meshfix_worker.py               # PyMeshFix + Open3D fill_holes worker (Stage 5)
-tools/
-  com_vol.py                      # Standalone volume CLI (uses Stage 7 logic)
+volume.py                         # Standalone volume CLI (root-level, uses Stage 7 logic)
 vggt/                             # VGGT model + utilities
   dependency/  heads/  layers/  models/  utils/
 inputs/                           # Sample input image sets
@@ -301,7 +311,7 @@ output/                           # Pipeline artifacts (see Output Structure)
 | `pipeline/core/cluster.py` | DBSCAN clustering + ArUco-aware object ranking |
 | `pipeline/core/mesh.py` | Mesh-level utilities (cleanup, scene merge) |
 | `pipeline/utils/seeding.py` | `seed_everything()` for full reproducibility |
-| `workers/recons_worker.py` | Subprocess worker — Poisson reconstruction |
+| `workers/recons_methods_worker.py` | Subprocess worker — Poisson/BallPivot/AlphaShape reconstruction |
 | `workers/meshfix_worker.py` | Subprocess worker — PyMeshFix + Open3D fill_holes |
 | `tools/com_vol.py` | Standalone CLI for real-world volume computation |
 | `vggt/` | VGGT model + utilities |

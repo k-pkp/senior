@@ -52,6 +52,10 @@ Examples:
     p.add_argument("--obj-recon-method", type=str, default=None,
                    choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
                    help="Override recon method for object (limb) only")
+    p.add_argument("--voxel-res", type=int, default=150, dest="voxel_res",
+                   help="Voxel grid resolution for volume (default: 150; ignored when --auto-res)")
+    p.add_argument("--no-auto-res", action="store_false", dest="auto_res",
+                   help="Fix voxel resolution instead of auto-tuning until convergence")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for reproducibility (default: 42)")
     p.add_argument("-l", "--log", action=argparse.BooleanOptionalAction, default=True,

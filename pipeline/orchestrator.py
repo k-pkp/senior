@@ -180,7 +180,9 @@ def main():
 
         # ── Stage 7: Volumes ──
         if eval_objects:
-            compute_volumes(eval_objects)
+            compute_volumes(eval_objects,
+                            voxel_res=args.voxel_res,
+                            auto_res=args.auto_res)
 
         total_time = time.time() - total_t0
         _print_summary(total_time, inference_time, ply_path, scene_recon_path,

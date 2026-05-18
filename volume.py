@@ -115,6 +115,23 @@ def _volume_voxel(mesh: trimesh.Trimesh, resolution: int) -> float:
     return float(filled.volume)  # n_voxels * pitch³
 
 
+def _export_voxel_meshes(mesh: trimesh.Trimesh, resolution: int,
+                         export_dir: str, label: str) -> None:
+    """Export filled voxel grid as blocky (as_boxes) and smooth (marching_cubes) PLY."""
+    os.makedirs(export_dir, exist_ok=True)
+    safe = label.replace(" ", "_").replace("(", "").replace(")", "").strip("_")
+    pitch = float(mesh.extents.max()) / resolution
+    filled = mesh.voxelized(pitch=pitch).fill()
+
+    boxes_path = os.path.join(export_dir, f"{safe}_boxes.ply")
+    filled.as_boxes().export(boxes_path)
+    print(f"  voxel export → {boxes_path}  (blocky)")
+
+    mc_path = os.path.join(export_dir, f"{safe}_smooth.ply")
+    filled.marching_cubes.export(mc_path)
+    print(f"  voxel export → {mc_path}  (smooth)")
+
+
 def _volume_convex_hull(mesh: trimesh.Trimesh) -> float:
     return float(abs(mesh.convex_hull.volume))
 
@@ -164,7 +181,9 @@ def auto_tune_voxel_res(
 
 
 def _measure_volume(mesh: trimesh.Trimesh, voxel_res: int,
-                    auto_res: bool = False) -> tuple[float, str]:
+                    auto_res: bool = False,
+                    export_voxel_dir: str | None = None,
+                    label: str = "mesh") -> tuple[float, str]:
     """Return (volume_mesh_units3, method_label) using best available method."""
     if mesh.is_watertight:
         return float(abs(mesh.volume)), "watertight"
@@ -176,9 +195,12 @@ def _measure_volume(mesh: trimesh.Trimesh, voxel_res: int,
                 best_res, vol = auto_tune_voxel_res(mesh, use_warp=True)
                 method = f"warp+floodfill (auto res={best_res})"
             else:
+                best_res = voxel_res
                 vol = _volume_voxel_warp(mesh, voxel_res)
                 method = f"warp+floodfill (res={voxel_res})"
             if vol > 0:
+                if export_voxel_dir:
+                    _export_voxel_meshes(mesh, best_res, export_voxel_dir, label)
                 return vol, method
         except Exception as e:
             print(f"  [warn] warp failed: {e} — falling back to trimesh")
@@ -188,9 +210,12 @@ def _measure_volume(mesh: trimesh.Trimesh, voxel_res: int,
             best_res, vol = auto_tune_voxel_res(mesh, use_warp=False)
             method = f"voxel (auto res={best_res})"
         else:
+            best_res = voxel_res
             vol = _volume_voxel(mesh, voxel_res)
             method = f"voxel (res={voxel_res})"
         if vol > 0:
+            if export_voxel_dir:
+                _export_voxel_meshes(mesh, best_res, export_voxel_dir, label)
             return vol, method
     except Exception as e:
         print(f"  [warn] voxel failed: {e}")
@@ -206,7 +231,8 @@ def _measure_volume(mesh: trimesh.Trimesh, voxel_res: int,
 # ---------------------------------------------------------------------------
 
 def load_mesh_info(path: str, label: str, voxel_res: int,
-                   auto_res: bool = False) -> dict:
+                   auto_res: bool = False,
+                   export_voxel_dir: str | None = None) -> dict:
     if not os.path.exists(path):
         sys.exit(f"[ERROR] file not found: {path}")
 
@@ -222,7 +248,8 @@ def load_mesh_info(path: str, label: str, voxel_res: int,
 
     if auto_res:
         print(f"\n  auto-tuning res for {label}:")
-    volume, method = _measure_volume(mesh, voxel_res, auto_res=auto_res)
+    volume, method = _measure_volume(mesh, voxel_res, auto_res=auto_res,
+                                     export_voxel_dir=export_voxel_dir, label=label)
 
     print(f"  {label}: {method}")
 
@@ -244,11 +271,14 @@ def load_mesh_info(path: str, label: str, voxel_res: int,
 
 def compute_volumes(obj_path: str, box_path: str,
                     ref_size_cm: float, voxel_res: int,
-                    auto_res: bool = False) -> pd.DataFrame:
+                    auto_res: bool = False,
+                    export_voxel_dir: str | None = None) -> pd.DataFrame:
     """Compute scaled real-world volumes. Returns result DataFrame."""
     print("\n── Loading meshes ──")
-    obj = load_mesh_info(obj_path, label="object",          voxel_res=voxel_res, auto_res=auto_res)
-    box = load_mesh_info(box_path, label="reference (box)", voxel_res=voxel_res, auto_res=auto_res)
+    obj = load_mesh_info(obj_path, label="object",          voxel_res=voxel_res,
+                         auto_res=auto_res, export_voxel_dir=export_voxel_dir)
+    box = load_mesh_info(box_path, label="reference_box",   voxel_res=voxel_res,
+                         auto_res=auto_res, export_voxel_dir=export_voxel_dir)
 
     df = pd.DataFrame([obj, box])
 
@@ -298,6 +328,9 @@ def parse_args():
                    help=f"voxel grid resolution along longest axis  (default: {DEFAULT_VOXEL_RES})")
     p.add_argument("--auto-res", action="store_true",
                    help="auto-tune voxel resolution until volume converges (overrides --voxel-res)")
+    p.add_argument("--export-voxel", nargs="?", const="output/mesh/voxel", default=None,
+                   metavar="DIR",
+                   help="export filled voxel mesh (blocky + smooth) to DIR  (default: output/mesh/voxel)")
     p.add_argument("--list-meshes", action="store_true",
                    help="list all meshes in output/mesh/ and exit")
     return p.parse_args()
@@ -318,13 +351,15 @@ def main():
             print(f"  {f:<40}  {size/1024:>8.1f} KB")
         return
 
-    print(f"  obj       : {args.obj}")
-    print(f"  box       : {args.box}")
-    print(f"  ref-size  : {args.ref_size} cm")
-    print(f"  voxel-res : {'auto' if args.auto_res else args.voxel_res}")
+    print(f"  obj         : {args.obj}")
+    print(f"  box         : {args.box}")
+    print(f"  ref-size    : {args.ref_size} cm")
+    print(f"  voxel-res   : {'auto' if args.auto_res else args.voxel_res}")
+    if args.export_voxel:
+        print(f"  export-voxel: {args.export_voxel}")
 
     compute_volumes(args.obj, args.box, args.ref_size, args.voxel_res,
-                    auto_res=args.auto_res)
+                    auto_res=args.auto_res, export_voxel_dir=args.export_voxel)
 
 
 if __name__ == "__main__":

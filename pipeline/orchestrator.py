@@ -17,7 +17,6 @@ from pipeline.utils.seeding import seed_everything
 from pipeline.stages.inference import run_inference
 from pipeline.stages.pointcloud import export_ply
 from pipeline.stages.clean import clean_and_extract
-from pipeline.stages.segmentation import segment_leg_stage
 from pipeline.stages.reconstruct import reconstruct_mesh_stage
 from pipeline.stages.watertight import watertight_stage
 from pipeline.stages.evaluate import evaluate_with_viewer
@@ -36,6 +35,12 @@ def _print_banner(args, device):
     print(f"║  Pred. mode    : {args.prediction_mode:<40}║")
     print(f"║  Conf. thresh  : {args.conf_thres:<40}║")
     print(f"║  Skip mesh     : {str(args.skip_mesh):<40}║")
+    recon_label = args.recon_method
+    if args.box_recon_method and args.box_recon_method != args.recon_method:
+        recon_label += f" (box={args.box_recon_method})"
+    if args.obj_recon_method and args.obj_recon_method != args.recon_method:
+        recon_label += f" (obj={args.obj_recon_method})"
+    print(f"║  Recon method  : {recon_label:<40}║")
     print(f"║  Watertight    : {str(not args.no_watertight):<40}║")
     print(f"║  Evaluate      : {str(args.evaluate):<40}║")
     print(f"║  Seed          : {args.seed:<40}║")
@@ -147,14 +152,17 @@ def main():
         wt_mesh_paths = []
 
         if not args.skip_mesh:
-            object_paths = clean_and_extract(ply_path, args.output_dir, args.num_objects, seed=args.seed)
+            object_paths = clean_and_extract(
+                ply_path, args.output_dir, args.num_objects, seed=args.seed,
+                segment_leg=args.segment_leg,
+                segment_height_axis=args.segment_height_axis,
+                fill_enabled=not args.no_fill)
             if object_paths:
-                if args.segment_leg:
-                    object_paths = segment_leg_stage(
-                        object_paths, args.output_dir,
-                        height_axis=args.segment_height_axis, seed=args.seed)
                 scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
-                    object_paths, args.output_dir, seed=args.seed)
+                    object_paths, args.output_dir, seed=args.seed,
+                    method=args.recon_method,
+                    box_method=args.box_recon_method,
+                    obj_method=args.obj_recon_method)
 
                 if recon_mesh_paths and not args.no_watertight:
                     scene_wt_path, wt_mesh_paths = watertight_stage(
@@ -172,7 +180,9 @@ def main():
 
         # ── Stage 7: Volumes ──
         if eval_objects:
-            compute_volumes(eval_objects)
+            compute_volumes(eval_objects,
+                            voxel_res=args.voxel_res,
+                            auto_res=args.auto_res)
 
         total_time = time.time() - total_t0
         _print_summary(total_time, inference_time, ply_path, scene_recon_path,

@@ -37,10 +37,25 @@ Examples:
                    help="Auto-capture screenshots of outputs with viewer.py")
     p.add_argument("--no-watertight", action="store_true",
                    help="Skip watertight repair (export only Poisson reconstruction)")
+    p.add_argument("--no-fill", action="store_true",
+                   help="Skip bottom cap fill during cleaning")
     p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg",
                    help="Disable marker-based leg surface segmentation (enabled by default)")
     p.add_argument("--segment-height-axis", type=str, default="z", choices=["x", "y", "z"],
                    help="Height axis for leg cut (default: z, vertical after leveling)")
+    p.add_argument("--recon-method", type=str, default="poisson",
+                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
+                   help="Reconstruction method for all objects (default: poisson)")
+    p.add_argument("--box-recon-method", type=str, default=None,
+                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
+                   help="Override recon method for box (ArUco) only")
+    p.add_argument("--obj-recon-method", type=str, default=None,
+                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
+                   help="Override recon method for object (limb) only")
+    p.add_argument("--voxel-res", type=int, default=150, dest="voxel_res",
+                   help="Voxel grid resolution for volume (default: 150; ignored when --auto-res)")
+    p.add_argument("--no-auto-res", action="store_false", dest="auto_res",
+                   help="Fix voxel resolution instead of auto-tuning until convergence")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for reproducibility (default: 42)")
     p.add_argument("-l", "--log", action=argparse.BooleanOptionalAction, default=True,

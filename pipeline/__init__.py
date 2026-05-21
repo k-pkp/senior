@@ -1,1 +1,1 @@
-"""VGGT pipeline package — inference → PLY → clean → reconstruct → evaluate."""
+"""VGGT pipeline package — inference → PLY → clean → reconstruct → volume."""

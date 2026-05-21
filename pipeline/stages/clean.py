@@ -13,25 +13,6 @@ import os
 import numpy as np
 import open3d as o3d
 
-try:
-    import cupy as cp
-    from cuml.neighbors import NearestNeighbors as cuKNN
-    _CUML = True
-except ImportError:
-    _CUML = False
-
-
-def _remove_statistical_outlier_gpu(pcd, nb_neighbors, std_ratio):
-    pts = np.asarray(pcd.points)
-    pts_gpu = cp.asarray(pts, dtype=cp.float32)
-    knn = cuKNN(n_neighbors=nb_neighbors + 1, algorithm="brute")
-    knn.fit(pts_gpu)
-    dists, _ = knn.kneighbors(pts_gpu)
-    mean_dists = cp.mean(dists[:, 1:], axis=1)
-    threshold = float(cp.mean(mean_dists)) + std_ratio * float(cp.std(mean_dists))
-    keep = cp.asnumpy(mean_dists <= threshold)
-    return pcd.select_by_index(np.where(keep)[0])
-
 from pipeline.core.plane import (
     auto_ransac_threshold,
     detect_plane_ransac_deterministic,
@@ -179,17 +160,8 @@ def clean_and_extract_objects(
         std_ratio = 2.5
         nb_neighbors = 20
 
-    if _CUML:
-        try:
-            pcd = _remove_statistical_outlier_gpu(pcd, nb_neighbors, std_ratio)
-            print(f"Outlier removal (GPU): {initial_count:,} → {len(pcd.points):,} (std_ratio={std_ratio})")
-        except Exception as e:
-            print(f"GPU SOR failed ({e}), falling back to CPU")
-            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-            print(f"Outlier removal: {initial_count:,} → {len(pcd.points):,} (std_ratio={std_ratio})")
-    else:
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-        print(f"Outlier removal: {initial_count:,} → {len(pcd.points):,} (std_ratio={std_ratio})")
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+    print(f"Outlier removal: {initial_count:,} → {len(pcd.points):,} (std_ratio={std_ratio})")
 
     # ---- STEP 3: ADAPTIVE DOWNSAMPLING ----
     if len(pcd.points) > 100000:
@@ -300,7 +272,7 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
     """
     print()
     print("=" * 60)
-    print("STAGE 3: Cleaning point cloud and extracting objects | CUML:", _CUML)
+    print("STAGE 3: Cleaning point cloud and extracting objects")
     print("=" * 60)
 
     clean_output_dir = os.path.join(output_dir, "clean_objects")

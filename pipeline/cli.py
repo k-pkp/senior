@@ -9,7 +9,6 @@ def parse_args():
         epilog="""
 Examples:
   python run.py                                  # default: ./baam/ input
-  python run.py --image_folder ./baam/ --evaluate
   python run.py --image_folder examples/kitchen/images/ --conf_thres 30
   python run.py --skip_mesh                      # PLY only
 """,
@@ -33,8 +32,6 @@ Examples:
                    help="Number of objects to extract during cleaning (default: 2)")
     p.add_argument("--max_frames", type=int, default=None,
                    help="Max frames to process (auto-set to 7 on MPS to avoid OOM)")
-    p.add_argument("--evaluate", action="store_true",
-                   help="Auto-capture screenshots of outputs with viewer.py")
     p.add_argument("--no-watertight", action="store_true",
                    help="Skip watertight repair (export only Poisson reconstruction)")
     p.add_argument("--no-fill", action="store_true",

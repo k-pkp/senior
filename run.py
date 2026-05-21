@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""VGGT Run Script — automated terminal inference → PLY → clean → reconstruct → evaluate.
+"""VGGT Run Script — automated terminal inference → PLY → clean → reconstruct → volume.
 
 Usage:
     python run.py                                          # uses ./baam/ as input
     python run.py --image_folder ./baam/
     python run.py --image_folder ./baam/ --output_dir output/
     python run.py --image_folder ./baam/ --skip_mesh        # PLY only, skip clean+reconstruct
-    python run.py --image_folder ./baam/ --evaluate          # auto-screenshot with viewer.py
 
 Supports CUDA, MPS (Apple Silicon), and CPU backends automatically.
 """

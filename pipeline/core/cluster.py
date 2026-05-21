@@ -1,28 +1,9 @@
 """DBSCAN clustering + box/obj detection."""
 import numpy as np
 
-try:
-    import cupy as cp
-    from cuml.cluster import DBSCAN as cuDBSCAN
-    from cuml.neighbors import NearestNeighbors as cuKNN
-    _CUML = True
-except ImportError:
-    _CUML = False
-
 
 def compute_eps(pcd, factor=4.0):
     """Estimate DBSCAN epsilon from average nearest-neighbor distance."""
-    if _CUML:
-        try:
-            pts_gpu = cp.asarray(np.asarray(pcd.points), dtype=cp.float32)
-            knn = cuKNN(n_neighbors=2, algorithm="brute")
-            knn.fit(pts_gpu)
-            dists, _ = knn.kneighbors(pts_gpu)
-            avg_dist = float(cp.mean(dists[:, 1]))
-            print(f"Avg NN distance (GPU): {avg_dist:.6f}")
-            return avg_dist * factor
-        except Exception as e:
-            print(f"GPU KNN failed ({e}), falling back to CPU")
     distances = pcd.compute_nearest_neighbor_distance()
     avg_dist = np.mean(distances)
     print(f"Avg NN distance: {avg_dist:.6f}")
@@ -74,17 +55,7 @@ def detect_top_k_objects(pcd, k=2, visualize=False):
     eps = compute_eps(pcd)
     print(f"Adaptive eps: {eps:.5f}")
 
-    if _CUML:
-        try:
-            pts_gpu = cp.asarray(np.asarray(pcd.points), dtype=cp.float32)
-            model = cuDBSCAN(eps=eps, min_samples=10)
-            labels = cp.asnumpy(model.fit_predict(pts_gpu)).astype(np.int64)
-            print("DBSCAN ran on GPU")
-        except Exception as e:
-            print(f"GPU DBSCAN failed ({e}), falling back to CPU")
-            labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=10))
-    else:
-        labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=10))
+    labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=10))
     valid = labels >= 0
 
     if not np.any(valid):

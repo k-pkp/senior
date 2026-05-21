@@ -19,6 +19,7 @@ LOG_COLUMNS = [
     "timestamp", "command", "input", "output", "device", "gpu_name", "platform",
     "total_time_s", "inference_time_s", "cpu_count", "cpu_load_pct",
     "ram_used_gb", "ram_peak_gb", "vram_used_gb", "vram_peak_gb",
+    "obj_vol_cm3", "box_vol_cm3",
 ]
 
 
@@ -87,7 +88,8 @@ class RunLogger:
                 return None, None
         return None, None
 
-    def stop_and_write(self, input_path, output_path, inference_time):
+    def stop_and_write(self, input_path, output_path, inference_time,
+                       obj_vol_cm3=None, box_vol_cm3=None):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
@@ -123,6 +125,8 @@ class RunLogger:
             "ram_peak_gb": _fmt(ram_peak, ".2f"),
             "vram_used_gb": _fmt(vram_used, ".2f"),
             "vram_peak_gb": _fmt(vram_peak, ".2f"),
+            "obj_vol_cm3": _fmt(obj_vol_cm3, ".4f") if obj_vol_cm3 is not None else "",
+            "box_vol_cm3": _fmt(box_vol_cm3, ".4f") if box_vol_cm3 is not None else "",
         }
 
         new_file = not os.path.exists(self.log_path)

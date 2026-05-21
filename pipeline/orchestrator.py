@@ -117,6 +117,8 @@ def main():
 
     logger = None
     inference_time = None
+    obj_vol_cm3 = None
+    box_vol_cm3 = None
     if args.log:
         logger = RunLogger(os.path.join(_PROJECT_ROOT, "log.csv"), device)
         logger.start()
@@ -171,9 +173,16 @@ def main():
         # ── Stage 6: Volumes ──
         vol_objects = wt_mesh_paths or recon_mesh_paths
         if vol_objects:
-            compute_volumes(vol_objects,
-                            voxel_res=args.voxel_res,
-                            auto_res=args.auto_res)
+            vol_df = compute_volumes(vol_objects,
+                                     voxel_res=args.voxel_res,
+                                     auto_res=args.auto_res)
+            if vol_df is not None:
+                box_rows = vol_df[vol_df["is_ref"]]
+                obj_rows = vol_df[~vol_df["is_ref"]]
+                if not box_rows.empty:
+                    box_vol_cm3 = float(box_rows.iloc[0]["real_vol_cm3"])
+                if not obj_rows.empty:
+                    obj_vol_cm3 = float(obj_rows.iloc[0]["real_vol_cm3"])
 
         total_time = time.time() - total_t0
         _print_summary(total_time, inference_time, ply_path, scene_recon_path,
@@ -181,4 +190,5 @@ def main():
                        npz_path2, target_dir, target_images_dir)
     finally:
         if logger is not None:
-            logger.stop_and_write(args.image_folder, args.output_dir, inference_time)
+            logger.stop_and_write(args.image_folder, args.output_dir, inference_time,
+                                  obj_vol_cm3=obj_vol_cm3, box_vol_cm3=box_vol_cm3)

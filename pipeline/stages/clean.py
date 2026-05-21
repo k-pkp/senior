@@ -19,7 +19,11 @@ from pipeline.core.plane import (
     get_rotation_to_z_axis,
 )
 from pipeline.core.cluster import compute_eps, detect_top_k_objects
-from pipeline.core.segmentation import segment_point_cloud
+from pipeline.core.segmentation import (
+    segment_point_cloud,
+    detect_markers,
+    cluster_markers,
+)
 from pipeline.core.fill import cap_point_cloud_bottom
 
 
@@ -262,6 +266,40 @@ def clean_and_extract_objects(
     return output_paths
 
 
+def _count_markers_on_ply(ply_path, axis_idx=2):
+    """Quick marker-cluster count on raw PLY before cleaning.
+
+    Returns number of valid marker clusters (>=150 pts), or 0 if
+    detection fails or finds too few markers.
+    """
+    try:
+        pcd = o3d.io.read_point_cloud(ply_path)
+        if len(pcd.points) == 0:
+            return 0
+        coords = np.asarray(pcd.points, dtype=np.float64)
+        if not pcd.has_colors():
+            return 0
+        colors_float = np.asarray(pcd.colors, dtype=np.float64)
+        colors = np.clip(colors_float * 255.0, 0, 255).astype(np.uint8)
+        marker_mask, _stats = detect_markers(colors)
+        if marker_mask.sum() < 10:
+            return 0
+        marker_coords = coords[marker_mask]
+        labels, n_clusters = cluster_markers(marker_coords)
+        valid = labels != -1
+        if not np.any(valid):
+            return 0
+        valid_clusters = 0
+        for cid in sorted(set(labels)):
+            if cid == -1:
+                continue
+            if (labels == cid).sum() >= 150:
+                valid_clusters += 1
+        return valid_clusters
+    except Exception:
+        return 0
+
+
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
                       segment_leg=False, segment_height_axis="z",
                       fill_enabled=True):
@@ -278,9 +316,14 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
     clean_output_dir = os.path.join(output_dir, "clean_objects")
     os.makedirs(clean_output_dir, exist_ok=True)
 
-    fill_this_run = fill_enabled and not segment_leg
+    marker_count = _count_markers_on_ply(ply_path) if segment_leg else 0
+    fill_skip_2_marker = segment_leg and marker_count == 2
+    fill_this_run = fill_enabled and not fill_skip_2_marker
     if not fill_this_run:
-        reason = "disabled by --no-fill" if not fill_enabled else "skipped (segmented cut incompatible with fill)"
+        if not fill_enabled:
+            reason = "disabled by --no-fill"
+        else:
+            reason = f"skipped (2-marker cut: {marker_count} markers detected)"
         print(f"  Bottom fill: {reason}")
 
     try:

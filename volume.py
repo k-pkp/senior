@@ -118,15 +118,11 @@ def _volume_voxel(mesh: trimesh.Trimesh, resolution: int) -> float:
 
 def _export_voxel_meshes(mesh: trimesh.Trimesh, resolution: int,
                          export_dir: str, label: str) -> None:
-    """Export filled voxel grid as blocky (as_boxes) and smooth (marching_cubes) PLY."""
+    """Export filled voxel grid as smooth (marching_cubes) PLY."""
     os.makedirs(export_dir, exist_ok=True)
     safe = label.replace(" ", "_").replace("(", "").replace(")", "").strip("_")
     pitch = float(mesh.extents.max()) / resolution
     filled = mesh.voxelized(pitch=pitch).fill()
-
-    boxes_path = os.path.join(export_dir, f"{safe}_boxes.ply")
-    filled.as_boxes().export(boxes_path)
-    print(f"  voxel export → {boxes_path}  (blocky)")
 
     mc_path = os.path.join(export_dir, f"{safe}_smooth.ply")
     filled.marching_cubes.export(mc_path)

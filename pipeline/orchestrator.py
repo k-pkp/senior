@@ -19,7 +19,6 @@ from pipeline.stages.pointcloud import export_ply
 from pipeline.stages.clean import clean_and_extract
 from pipeline.stages.reconstruct import reconstruct_mesh_stage
 from pipeline.stages.watertight import watertight_stage
-from pipeline.stages.evaluate import evaluate_with_viewer
 from pipeline.stages.volume import compute_volumes
 
 
@@ -42,7 +41,6 @@ def _print_banner(args, device):
         recon_label += f" (obj={args.obj_recon_method})"
     print(f"║  Recon method  : {recon_label:<40}║")
     print(f"║  Watertight    : {str(not args.no_watertight):<40}║")
-    print(f"║  Evaluate      : {str(args.evaluate):<40}║")
     print(f"║  Seed          : {args.seed:<40}║")
     print(f"║  Leg segment   : {str(args.segment_leg):<40}║")
     print(f"╚{'═' * 58}╝")
@@ -170,17 +168,10 @@ def main():
         else:
             print("\n  (Skipping mesh stages — --skip_mesh was set)")
 
-        # Use watertight meshes for evaluation and volume if available, else recon meshes
-        eval_scene = scene_wt_path or scene_recon_path
-        eval_objects = wt_mesh_paths or recon_mesh_paths
-
-        # ── Stage 6: Evaluate ──
-        if args.evaluate:
-            evaluate_with_viewer(args.output_dir, ply_path, eval_scene, eval_objects)
-
-        # ── Stage 7: Volumes ──
-        if eval_objects:
-            compute_volumes(eval_objects,
+        # ── Stage 6: Volumes ──
+        vol_objects = wt_mesh_paths or recon_mesh_paths
+        if vol_objects:
+            compute_volumes(vol_objects,
                             voxel_res=args.voxel_res,
                             auto_res=args.auto_res)
 

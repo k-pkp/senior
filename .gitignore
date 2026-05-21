@@ -125,3 +125,7 @@ datasets/
 
 # test folder
 test/
+
+# Obsidian vault — per-machine UI state (notes + plugin config stay tracked)
+obsidian/
+CLAUDE.md

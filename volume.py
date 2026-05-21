@@ -112,6 +112,7 @@ def _volume_voxel(mesh: trimesh.Trimesh, resolution: int) -> float:
     pitch = float(mesh.extents.max()) / resolution
     vox = mesh.voxelized(pitch=pitch)
     filled = vox.fill()          # flood-fill interior
+    print(type(filled))
     return float(filled.volume)  # n_voxels * pitch³
 
 

@@ -3,26 +3,6 @@ import open3d as o3d
 import alphashape
 from shapely.geometry import Point
 
-try:
-    import cupy as cp
-    from cuml.neighbors import NearestNeighbors as cuKNN
-    _CUML = True
-except ImportError:
-    _CUML = False
-
-try:
-    from shapely import contains_xy as _shapely_contains_xy
-    def _pts_in_poly(polygon, xy):
-        return _shapely_contains_xy(polygon, xy[:, 0], xy[:, 1])
-except ImportError:
-    try:
-        from shapely.vectorized import contains as _shapely_contains_v
-        def _pts_in_poly(polygon, xy):
-            return _shapely_contains_v(polygon, xy[:, 0], xy[:, 1])
-    except ImportError:
-        def _pts_in_poly(polygon, xy):
-            return np.array([polygon.contains(Point(p)) for p in xy])
-
 
 def cap_point_cloud_bottom(pcd, alpha=2.0, z_offset=0.0, slice_thickness=0.01):
     """
@@ -38,18 +18,8 @@ def cap_point_cloud_bottom(pcd, alpha=2.0, z_offset=0.0, slice_thickness=0.01):
         pcd.orient_normals_consistent_tangent_plane(100)
 
     print("  -> Analyzing scan density...")
-    if _CUML:
-        try:
-            pts_gpu = cp.asarray(points, dtype=cp.float32)
-            knn = cuKNN(n_neighbors=2, algorithm="brute")
-            knn.fit(pts_gpu)
-            dists, _ = knn.kneighbors(pts_gpu)
-            avg_spacing = float(cp.mean(dists[:, 1]))
-            print("  -> NN distance computed on GPU")
-        except Exception:
-            avg_spacing = np.mean(pcd.compute_nearest_neighbor_distance())
-    else:
-        avg_spacing = np.mean(pcd.compute_nearest_neighbor_distance())
+    distances = pcd.compute_nearest_neighbor_distance()
+    avg_spacing = np.mean(distances)
 
     point_spacing = np.clip(avg_spacing, 0.0005, 0.005)
     print(f"  -> Calculated exact point spacing from scan: {point_spacing:.5f}")
@@ -85,8 +55,9 @@ def cap_point_cloud_bottom(pcd, alpha=2.0, z_offset=0.0, slice_thickness=0.01):
     xx, yy = np.meshgrid(x_grid, y_grid)
     grid_points_2d = np.c_[xx.ravel(), yy.ravel()]
 
-    mask = _pts_in_poly(hull_polygon, grid_points_2d)
-    synthetic_points_2d = grid_points_2d[mask]
+    synthetic_points_2d = [pt for pt in grid_points_2d if hull_polygon.contains(Point(pt))]
+
+    synthetic_points_2d = np.array(synthetic_points_2d)
     num_synthetic_points = len(synthetic_points_2d)
     print(f"  -> Generated {num_synthetic_points} synthetic points for the cap.")
 

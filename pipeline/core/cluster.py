@@ -100,7 +100,7 @@ def detect_top_k_objects(pcd, k=2, visualize=False):
     for idx, (cluster, score, npts, extent, density, max_dim) in enumerate(top):
         cube = aruco_cubeness(cluster)
         bw = aruco_bw_ratio(cluster)
-        aruco = cube * 0.6 + bw * 0.4
+        aruco = cube * 0.3 + bw * 0.7
         ext_str = f"({extent[0]:.4f},{extent[1]:.4f},{extent[2]:.4f})"
         print(f"    cluster #{idx+1}: {npts:,} pts, cubeness={cube:.4f}, aruco={aruco:.3f} {ext_str}")
         info.append((idx, cluster, score, npts, cube, bw, aruco))

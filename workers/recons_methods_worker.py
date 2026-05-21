@@ -6,6 +6,7 @@ Usage:
 """
 import os
 import sys
+import time
 import traceback
 import numpy as np
 import open3d as o3d
@@ -23,32 +24,38 @@ def _load_and_prep(input_path, seed=None):
     num_points = len(pcd.points)
     print(f"Points: {num_points:,}")
 
-    if num_points > 165000:
+    if num_points > 90000:
         bbox_extent = pcd.get_axis_aligned_bounding_box().get_max_extent()
         voxel_size = bbox_extent / 350
         pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
         attempts = 0
-        while len(pcd.points) > 165000 and attempts < 10:
+        while len(pcd.points) > 90000 and attempts < 10:
             voxel_size *= 1.15
             pcd = o3d.io.read_point_cloud(input_path)
             pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
             attempts += 1
         print(f"Downsampled: {num_points:,} -> {len(pcd.points):,}")
 
+    _dbg_t = time.time()
     distances = pcd.compute_nearest_neighbor_distance()
+    print(f"[DBG-prep] nn_distance: {time.time() - _dbg_t:.2f}s")
     avg_dist = np.mean(distances)
     radius = max(avg_dist * 4.0, 0.005)
     max_nn = min(max(30, int(len(pcd.points) * 0.01)), 100)
+    _dbg_t = time.time()
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn)
     )
+    print(f"[DBG-prep] estimate_normals(max_nn={max_nn}): {time.time() - _dbg_t:.2f}s")
 
     oriented = False
-    for k in [min(len(pcd.points) // 100, 50), 20, 10]:
+    for k in [min(len(pcd.points) // 100, 15), 10]:
         if k < 5:
             break
         try:
+            _dbg_t = time.time()
             pcd.orient_normals_consistent_tangent_plane(k)
+            print(f"[DBG-prep] orient_tangent_plane(k={k}): {time.time() - _dbg_t:.2f}s")
             print(f"Normals: tangent_plane(k={k})")
             oriented = True
             break
@@ -141,8 +148,10 @@ except Exception as e:
     print(f'failed: {{e}}', file=sys.stderr)
     sys.exit(1)
 """
+            _dbg_t = time.time()
             r = sp.run([sys.executable, "-c", script],
                         capture_output=True, text=True, timeout=300)
+            print(f"[DBG-poisson] depth={d}: {time.time() - _dbg_t:.2f}s rc={r.returncode}")
             if r.returncode == 0 and os.path.exists(mesh_out):
                 mesh = o3d.io.read_triangle_mesh(mesh_out)
                 densities = np.load(dens_out)
@@ -280,9 +289,13 @@ def main():
     if seed is not None:
         print(f"Seed: {seed}")
 
+    _dbg_t = time.time()
     pcd = _load_and_prep(input_path, seed=None)  # seed worker-level rng
+    print(f"[DBG-worker] load_and_prep: {time.time() - _dbg_t:.2f}s")
 
+    _dbg_t = time.time()
     mesh = METHODS[method_name](pcd, output_path, seed=seed)
+    print(f"[DBG-worker] method {method_name}: {time.time() - _dbg_t:.2f}s")
 
     o3d.io.write_triangle_mesh(output_path, mesh)
     print(f"Watertight: {mesh.is_watertight()}")

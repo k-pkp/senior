@@ -59,6 +59,7 @@ def reconstruct_multiple_objects(input_paths, output_folder="output_mesh",
              "--method", obj_method_name, "--seed", str(seed)],
             capture_output=True, text=True, timeout=600,
         )
+
         for line in result.stdout.strip().split("\n"):
             if line.strip():
                 print(f"  {line}")

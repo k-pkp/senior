@@ -132,6 +132,7 @@ def main():
 
         # ── Stage 1: Inference ──
         predictions, inference_time = run_inference(args.image_folder, device, args.max_frames)
+        print(f"[DBG-stage] stage1 inference: {inference_time:.2f}s")
 
         # Save predictions (compatible with demo_gradio)
         npz_path = os.path.join(target_dir, "predictions.npz")
@@ -143,7 +144,9 @@ def main():
         shutil.copy2(npz_path, npz_path2)
 
         # ── Stage 2: Export PLY ──
+        _dbg_t = time.time()
         ply_path = export_ply(predictions, args.output_dir, args)
+        print(f"[DBG-stage] stage2 export_ply: {time.time() - _dbg_t:.2f}s")
 
         # ── Stages 3-5: Clean + Reconstruct + Watertight ──
         scene_recon_path = None
@@ -152,30 +155,38 @@ def main():
         wt_mesh_paths = []
 
         if not args.skip_mesh:
+            _dbg_t = time.time()
             object_paths = clean_and_extract(
                 ply_path, args.output_dir, args.num_objects, seed=args.seed,
                 segment_leg=args.segment_leg,
                 segment_height_axis=args.segment_height_axis,
                 fill_enabled=not args.no_fill)
+            print(f"[DBG-stage] stage3 clean_and_extract: {time.time() - _dbg_t:.2f}s")
             if object_paths:
+                _dbg_t = time.time()
                 scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
                     object_paths, args.output_dir, seed=args.seed,
                     method=args.recon_method,
                     box_method=args.box_recon_method,
                     obj_method=args.obj_recon_method)
+                print(f"[DBG-stage] stage4 reconstruct: {time.time() - _dbg_t:.2f}s")
 
                 if recon_mesh_paths and not args.no_watertight:
+                    _dbg_t = time.time()
                     scene_wt_path, wt_mesh_paths = watertight_stage(
                         recon_mesh_paths, args.output_dir)
+                    print(f"[DBG-stage] stage5 watertight: {time.time() - _dbg_t:.2f}s")
         else:
             print("\n  (Skipping mesh stages — --skip_mesh was set)")
 
         # ── Stage 6: Volumes ──
         vol_objects = wt_mesh_paths or recon_mesh_paths
         if vol_objects:
+            _dbg_t = time.time()
             vol_df = compute_volumes(vol_objects,
                                      voxel_res=args.voxel_res,
                                      auto_res=args.auto_res)
+            print(f"[DBG-stage] stage6 volumes: {time.time() - _dbg_t:.2f}s")
             if vol_df is not None:
                 box_rows = vol_df[vol_df["is_ref"]]
                 obj_rows = vol_df[~vol_df["is_ref"]]

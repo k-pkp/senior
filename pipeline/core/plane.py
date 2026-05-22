@@ -1,5 +1,6 @@
 """Deterministic RANSAC plane detection and orientation helpers."""
 import numpy as np
+import torch
 
 
 def auto_ransac_threshold(pcd, base_factor=3):
@@ -11,43 +12,74 @@ def auto_ransac_threshold(pcd, base_factor=3):
     return threshold
 
 
+def _sample_triplets(n, m, gen, device):
+    """Sample m triplets of distinct point indices. Returns (tri (m,3), valid (m,))."""
+    tri = torch.randint(0, n, (m, 3), generator=gen, device=device)
+    for _ in range(128):
+        bad = ((tri[:, 0] == tri[:, 1]) |
+               (tri[:, 1] == tri[:, 2]) |
+               (tri[:, 0] == tri[:, 2]))
+        nbad = int(bad.sum())
+        if nbad == 0:
+            break
+        idx = bad.nonzero(as_tuple=True)[0]
+        tri[idx] = torch.randint(0, n, (nbad, 3), generator=gen, device=device)
+    valid = ~((tri[:, 0] == tri[:, 1]) |
+              (tri[:, 1] == tri[:, 2]) |
+              (tri[:, 0] == tri[:, 2]))
+    return tri, valid
+
+
 def detect_plane_ransac_deterministic(pcd, distance_threshold=0.015, num_iterations=1000, seed=42):
-    """Deterministic RANSAC plane detection using numpy."""
-    pts = np.asarray(pcd.points)
-    n = len(pts)
+    """GPU-batched deterministic RANSAC plane detection via torch (CUDA, CPU fallback).
+
+    All hypotheses are evaluated as one batched matmul instead of a Python loop.
+    Determinism is preserved through a seeded torch.Generator.
+    """
+    pts_np = np.asarray(pcd.points)
+    n = len(pts_np)
     if n < 3:
         raise ValueError("Need at least 3 points for plane detection")
 
-    rng = np.random.RandomState(seed)
-    best_plane = None
-    best_inliers = np.array([], dtype=np.int64)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"RANSAC: {num_iterations} iters, {n:,} pts, device={device}")
 
-    for _ in range(num_iterations):
-        i, j, k = rng.choice(n, size=3, replace=False)
-        p1, p2, p3 = pts[i], pts[j], pts[k]
+    pts = torch.as_tensor(pts_np, dtype=torch.float32, device=device)  # (N, 3)
+    gen = torch.Generator(device=device).manual_seed(seed)
 
-        v1 = p2 - p1
-        v2 = p3 - p1
-        normal = np.cross(v1, v2)
-        norm_len = np.linalg.norm(normal)
-        if norm_len < 1e-12:
-            continue
-        normal = normal / norm_len
+    m = num_iterations
+    tri, valid = _sample_triplets(n, m, gen, device)
 
-        d = -np.dot(normal, p1)
-        plane = np.array([normal[0], normal[1], normal[2], d])
+    p1 = pts[tri[:, 0]]                                # (M, 3)
+    p2 = pts[tri[:, 1]]
+    p3 = pts[tri[:, 2]]
+    normals = torch.linalg.cross(p2 - p1, p3 - p1)     # (M, 3)
+    norm_len = normals.norm(dim=1, keepdim=True)       # (M, 1)
+    valid = valid & (norm_len.squeeze(1) > 1e-12)
+    normals = normals / norm_len.clamp_min(1e-12)
+    d = -(normals * p1).sum(dim=1)                     # (M,)
 
-        distances = np.abs(np.dot(pts, normal) + d)
-        inlier_mask = distances <= distance_threshold
-        inlier_count = np.sum(inlier_mask)
+    # Inlier counts per hypothesis: |pts @ normals.T + d| <= threshold.
+    # Chunk over hypotheses to bound the (N, chunk) intermediate (~200 MB).
+    counts = torch.empty(m, dtype=torch.int64, device=device)
+    chunk = min(m, max(1, 50_000_000 // n))
+    for a in range(0, m, chunk):
+        b = min(a + chunk, m)
+        dist = (pts @ normals[a:b].t() + d[a:b]).abs()  # (N, b-a)
+        counts[a:b] = (dist <= distance_threshold).sum(dim=0)
 
-        if inlier_count > len(best_inliers):
-            best_inliers = np.where(inlier_mask)[0]
-            best_plane = plane
-
-    if best_plane is None:
+    counts[~valid] = -1
+    best_m = int(counts.argmax())
+    if counts[best_m].item() < 0:
         raise ValueError("Could not detect any plane")
 
+    nrm = normals[best_m]
+    dd = d[best_m]
+    dist_best = (pts @ nrm + dd).abs()                  # (N,)
+    inlier_mask = dist_best <= distance_threshold
+
+    best_plane = np.array([nrm[0].item(), nrm[1].item(), nrm[2].item(), dd.item()])
+    best_inliers = inlier_mask.nonzero(as_tuple=True)[0].cpu().numpy().astype(np.int64)
     return best_plane, best_inliers
 
 

@@ -3,7 +3,6 @@ import os
 import subprocess
 import sys
 
-import numpy as np
 import open3d as o3d
 
 from pipeline.core.mesh import merge_meshes, clean_merged_scene
@@ -12,7 +11,12 @@ from pipeline.core.mesh import merge_meshes, clean_merged_scene
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _RECONS_WORKER = os.path.join(_PROJECT_ROOT, "workers", "recons_methods_worker.py")
-_DEFAULT_METHOD = "poisson"
+# alpha_shape for both objects. It interpolates through the point shell
+# (median offset 0.000 from the cloud), whereas box_primitive builds a bounding
+# prism that sits ~4.8 mm outside the points and inflates the reference volume
+# ~11%. One method for both is also the simpler thing to defend.
+_DEFAULT_METHOD = "alpha_shape"
+_DEFAULT_BOX_METHOD = "alpha_shape"
 
 
 def _recon_name(input_path):
@@ -24,9 +28,9 @@ def _recon_name(input_path):
 def _pick_method(path, method, box_method, obj_method):
     """Determine recon method for a single object path."""
     basename = os.path.basename(path).lower()
-    if box_method is not None and ("box" in basename):
-        return box_method
-    if obj_method is not None and ("obj" in basename):
+    if "box" in basename:
+        return box_method if box_method is not None else _DEFAULT_BOX_METHOD
+    if obj_method is not None and ("obj" in basename or "leg" in basename):
         return obj_method
     if method is not None:
         return method
@@ -132,39 +136,3 @@ def reconstruct_mesh_stage(object_paths, output_dir, seed=42, method=None,
     except Exception as e:
         print(f"  ERROR during reconstruction: {e}")
         return None, []
-
-
-def reconstruct_mesh(
-    input_path: str,
-    output_folder: str = "output_mesh",
-    base_name: str = None,
-    poisson_depth: int = None,
-    density_quantile: float = 0.01,
-    merge_tolerance: float = 1e-6,
-    method: str = None,
-):
-    """Compatibility entry point for demo_gradio pipeline."""
-    del merge_tolerance, poisson_depth, density_quantile
-    if method is None:
-        method = _DEFAULT_METHOD
-
-    os.makedirs(output_folder, exist_ok=True)
-    if base_name is None:
-        base_name = os.path.splitext(os.path.basename(input_path))[0]
-
-    mesh_ply = os.path.join(output_folder, f"{base_name}.ply")
-    mesh_stl = os.path.join(output_folder, f"{base_name}.stl")
-
-    result = subprocess.run(
-        [sys.executable, _RECONS_WORKER, input_path, mesh_ply, "--method", method],
-        capture_output=True, text=True, timeout=600,
-    )
-    if result.returncode == 0 and os.path.exists(mesh_ply):
-        mesh = o3d.io.read_triangle_mesh(mesh_ply)
-        o3d.io.write_triangle_mesh(mesh_stl, mesh)
-
-    return mesh_ply, mesh_stl
-
-
-# numpy import kept for type-consistency with original recons.py
-_ = np

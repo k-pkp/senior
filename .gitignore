@@ -98,6 +98,12 @@ results/
 data/
 datasets/
 
+# Scratch: stagerun experiment runs (gigabytes) and ad-hoc mesh comparisons
+work/
+compare_recon/
+compare_ghost/
+*.zip
+
 
 # 3D assets (large)
 *.ply
@@ -110,6 +116,11 @@ datasets/
 *.usdz
 *.blend
 *.blend1
+
+# ...but the web app's sample fixtures MUST ship, or the site has nothing to
+# load and every screen fails on a fresh clone. ~3 MB total.
+!web/public/samples/**/*.ply
+!web/public/samples/**/*.stl
 
 # Media
 *.mp4

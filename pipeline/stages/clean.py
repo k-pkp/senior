@@ -1,12 +1,7 @@
-"""Stage 3 — Clean the point cloud, extract objects, and optionally segment legs.
+"""Stage 3 — segment the scene, cut the limb at its marker, close and export.
 
-Steps:
-    1. RANSAC-based leveling so the ground plane is horizontal (Z up).
-    2. Adaptive statistical-outlier removal.
-    3. Voxel downsampling if very dense.
-    4. Smart laser-cut floor removal (only if a horizontal bottom plane exists).
-    5. DBSCAN clustering + box detection (cubeness) → box.ply + obj.ply.
-    6. (Optional) Marker-based leg surface segmentation on obj.ply.
+Clusters the dense cloud once, detects marker cut planes on the dense limb,
+then ghost-filters each identified cluster separately.
 """
 import os
 
@@ -17,334 +12,462 @@ from pipeline.core.plane import (
     auto_ransac_threshold,
     detect_plane_ransac_deterministic,
     get_rotation_to_z_axis,
+    remove_dominant_plane,
 )
-from pipeline.core.cluster import compute_eps, detect_top_k_objects
-from pipeline.core.segmentation import (
-    segment_point_cloud,
-    detect_markers,
-    cluster_markers,
+from pipeline.core.cluster import detect_top_k_objects
+from pipeline.core.segmentation import (segment_point_cloud, apply_marker_cut,
+                                        MAX_MARKERS)
+from pipeline.config import MARKER_MIN_HEIGHT_FRAC
+from pipeline.core.fill import (
+    cap_point_cloud_bottom,
+    cap_points_on_plane,
+    extend_point_cloud_to_floor,
 )
-from pipeline.core.fill import cap_point_cloud_bottom
 
 
-def _segment_leg(object_paths, output_dir, height_axis="z", seed=42):
-    """Apply marker-based leg segmentation to the obj.ply in object_paths.
+# ── Core ──
 
-    Args:
-        object_paths: List of PLY paths from the clean stage (box.ply, obj.ply).
-        output_dir: Base output directory for the pipeline.
-        height_axis: Axis for height-based cut ("z" by default, vertical after leveling).
-        seed: Random seed (unused, kept for API consistency).
+def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
+                            segment_leg=False, segment_height_axis="z",
+                            fill_enabled=True, apply_cut=True):
+    """Cluster-first clean pipeline.
 
-    Returns:
-        new_paths: List of PLY paths with obj.ply replaced by segmented_obj.ply.
-                   If no obj.ply is found or segmentation produces too few points,
-                   returns the original list unchanged.
+    Phase A: Segment the dense cloud once (floor removal + DBSCAN), detect
+             marker cut planes on the dense leg, then ghost-filter each
+             identified cluster separately. Clustering on the dense cloud has
+             better statistics than on the filtered one, and splitting before
+             filtering keeps point identity so no label transfer is needed.
+    Phase B: RANSAC leveling on dense; the same rotation is applied to every
+             sub-cloud (including the marker planes — see R_total).
+    Phase C: Floor cut, extend to the detected floor, bottom cap — producing a
+             complete UNCUT cloud — then optionally the centroid-side marker cut
+             and its cut-plane cap.
+
+    apply_cut=False stops after the uncut cloud and publishes the cutting planes
+    instead. That is what an interactive review needs: the user sees a complete
+    object plus where the pipeline would cut it, and decides.
     """
-    print()
-    print("-" * 40)
-    print("Leg segmentation (Stage 3)")
-    print("-" * 40)
+    from pipeline.ghost import voxel_dedup, normal_aware_filter, compute_voxel_size
 
-    seg_dir = os.path.join(output_dir, "segmented")
-    os.makedirs(seg_dir, exist_ok=True)
+    objects_dir = os.path.join(output_dir, "objects")
+    debug_dir_out = os.path.join(output_dir, "debug")
+    os.makedirs(objects_dir, exist_ok=True)
+    os.makedirs(debug_dir_out, exist_ok=True)
 
-    new_paths = list(object_paths)
-    obj_ply = None
-    obj_idx = None
+    # ── Load ──
+    pcd_dense = o3d.io.read_point_cloud(dense_ply)
+    if len(pcd_dense.points) == 0:
+        raise ValueError("Empty dense point cloud")
+    initial_count = len(pcd_dense.points)
+    print(f"Loaded dense cloud: {initial_count:,} points")
 
-    for i, p in enumerate(object_paths):
-        if os.path.basename(p).lower().startswith("obj"):
-            obj_ply = p
-            obj_idx = i
-            break
-
-    if obj_ply is None:
-        print("  No obj.ply found in clean outputs — skipping segmentation")
-        return new_paths
-
-    print(f"  Input: {obj_ply}")
-
-    try:
-        pcd = o3d.io.read_point_cloud(obj_ply)
-        if len(pcd.points) == 0:
-            print("  Empty point cloud — skipping")
-            return new_paths
-
-        segmented_pcd, summary = segment_point_cloud(pcd, height_axis=height_axis, verbose=True)
-
-    except Exception as e:
-        print(f"  ERROR during segmentation: {e}")
-        return new_paths
-
-    cut_info = summary.get("cut", {})
-    if cut_info.get("case") == 0:
-        reason = cut_info.get("reason", "no_markers")
-        print(f"  No cut applied ({reason}) — keeping original obj.ply for reconstruction")
-        return new_paths
-
-    n_kept = summary.get("n_kept", 0)
-    if n_kept < 100:
-        print(f"  Only {n_kept} points after cut (< 100) — keeping original obj.ply")
-        return new_paths
-
-    seg_path = os.path.join(seg_dir, "segmented_obj.ply")
-    o3d.io.write_point_cloud(seg_path, segmented_pcd, write_ascii=False)
-
-    seg_pts = np.asarray(segmented_pcd.points)
-    print(f"  Saved: {seg_path} ({n_kept:,} pts) "
-          f"X[{seg_pts[:,0].min():.3f},{seg_pts[:,0].max():.3f}] "
-          f"Y[{seg_pts[:,1].min():.3f},{seg_pts[:,1].max():.3f}] "
-          f"Z[{seg_pts[:,2].min():.3f},{seg_pts[:,2].max():.3f}]")
-
-    new_paths[obj_idx] = seg_path
-    return new_paths
-
-
-def clean_and_extract_objects(
-    input_path,
-    output_folder="output_objects",
-    k=2,
-    visualize=False,
-    skip_plane=False,
-    merge_clusters=False,
-    seed=42,
-    ransac_factor=3,
-    fill_enabled=True,
-):
-    os.makedirs(output_folder, exist_ok=True)
-
-    pcd = o3d.io.read_point_cloud(input_path)
-    if len(pcd.points) == 0:
-        raise ValueError("Empty point cloud")
-
-    initial_count = len(pcd.points)
-    print(f"Loaded point cloud: {initial_count:,} points")
-
-    # ---- STEP 1: LEVELING (FLIP) FIRST ----
-    if not skip_plane:
-        try:
-            distance_threshold = auto_ransac_threshold(pcd, base_factor=ransac_factor)
-            plane_model, _ = detect_plane_ransac_deterministic(
-                pcd, distance_threshold=distance_threshold, num_iterations=1000, seed=seed
-            )
-
-            normal = plane_model[:3]
-            print("Leveling scan based on detected plane...")
-            R = get_rotation_to_z_axis(normal)
-            pcd.rotate(R, center=(0, 0, 0))
-
-            # --- SMART UPSIDE-DOWN CHECK ---
-            _, inliers_rot = detect_plane_ransac_deterministic(
-                pcd, distance_threshold=distance_threshold, num_iterations=500, seed=seed
-            )
-            pts_rot = np.asarray(pcd.points)
-            plane_z = np.mean(pts_rot[inliers_rot, 2])
-
-            mask = np.ones(len(pts_rot), dtype=bool)
-            mask[inliers_rot] = False
-            non_plane_z = pts_rot[mask, 2]
-
-            if len(non_plane_z) > 0 and np.mean(non_plane_z) < plane_z:
-                print("-> Detected upside-down orientation! Flipping 180 degrees...")
-                flip_R = pcd.get_rotation_matrix_from_xyz((np.pi, 0, 0))
-                pcd.rotate(flip_R, center=(0, 0, 0))
-
-        except Exception as e:
-            print(f"Leveling failed: {e}")
-
-    # ---- STEP 2: GENTLER OUTLIER REMOVAL ----
+    # SOR
     if initial_count < 50000:
-        std_ratio = 3.5
-        nb_neighbors = 10
+        std_ratio, nb_neighbors = 3.5, 10
     elif initial_count < 200000:
-        std_ratio = 3.0
-        nb_neighbors = 15
+        std_ratio, nb_neighbors = 3.0, 15
     else:
-        std_ratio = 2.5
-        nb_neighbors = 20
+        std_ratio, nb_neighbors = 2.5, 20
+    pcd_dense, _ = pcd_dense.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+    print(f"SOR: {initial_count:,} → {len(pcd_dense.points):,} (std_ratio={std_ratio})")
 
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-    print(f"Outlier removal: {initial_count:,} → {len(pcd.points):,} (std_ratio={std_ratio})")
+    if len(pcd_dense.points) > 100000:
+        pcd_dense = pcd_dense.voxel_down_sample(voxel_size=0.002)
+        print(f"Voxel downsample: → {len(pcd_dense.points):,}")
 
-    # ---- STEP 3: ADAPTIVE DOWNSAMPLING ----
-    if len(pcd.points) > 100000:
-        voxel_size = 0.002
-        pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
-        print(f"Downsampled to {len(pcd.points):,} (voxel={voxel_size})")
+    # ── Phase A: Cluster both flows in original VGGT space ──
+    print()
+    print("─" * 40)
+    print("PHASE A: Clustering (original VGGT space)")
+    print("─" * 40)
 
-    # ---- STEP 4: SMART LASER CUT PLANE REMOVAL ----
-    if not skip_plane:
+    # A1: Remove floor from dense copy for DBSCAN
+    pcd_cluster = o3d.geometry.PointCloud(pcd_dense)
+    pcd_cluster, _ = remove_dominant_plane(pcd_cluster)
+
+    # A2: DBSCAN on dense → box/obj clusters via cubeness
+    box_dense, obj_dense = detect_top_k_objects(pcd_cluster, k=num_objects)
+    if box_dense is None:
+        box_dense = pcd_cluster
+        obj_dense = None
+        print("  Only 1 cluster on dense — treating as box")
+
+    # A3: Marker detection on dense leg (if segment_leg enabled)
+    markers = []
+    if segment_leg and obj_dense is not None and len(obj_dense.points) > 0:
         try:
-            distance_threshold = auto_ransac_threshold(pcd, base_factor=ransac_factor)
-            distance_threshold = min(distance_threshold, 0.015)
-
-            plane_model, inliers = detect_plane_ransac_deterministic(
-                pcd, distance_threshold=distance_threshold, num_iterations=1000, seed=seed
-            )
-
-            pts = np.asarray(pcd.points)
-            plane_ratio = len(inliers) / len(pts)
-
-            # --- AUTO-PLANE GEOMETRY CHECK ---
-            normal = plane_model[:3]
-
-            # 1. Horizontal? Dot product with Z-axis ≈ ±1
-            is_horizontal = abs(np.dot(normal, [0, 0, 1])) > 0.85
-
-            # 2. At the bottom of the scene?
-            z_vals = pts[:, 2]
-            z_min, z_max = np.min(z_vals), np.max(z_vals)
-            plane_z = np.median(pts[inliers, 2])
-            is_at_bottom = (plane_z - z_min) < 0.25 * (z_max - z_min)
-
-            if is_horizontal and is_at_bottom and plane_ratio > 0.05:
-                margin = 0.008
-                keep_mask = pts[:, 2] > (plane_z + margin)
-                pcd = pcd.select_by_index(np.where(keep_mask)[0])
-                print(f"-> Smart Laser-cut floor at Z={plane_z:.4f} "
-                      f"({plane_ratio*100:.0f}% of points removed)")
-            else:
-                reason = []
-                if not is_horizontal:
-                    reason.append("not horizontal")
-                if not is_at_bottom:
-                    reason.append("not at the bottom")
-                if plane_ratio <= 0.05:
-                    reason.append("too small (<5%)")
-                print(f"Plane skipped: {', '.join(reason)} ({plane_ratio*100:.0f}% of points)")
-
+            _, summary = segment_point_cloud(obj_dense, height_axis=segment_height_axis, verbose=False)
+            planes_raw = summary.get("planes", [])
+            for _, centroid, normal, npts, _ in planes_raw:
+                nrm = normal / (np.linalg.norm(normal) + 1e-8)
+                markers.append({"centroid": np.array(centroid, dtype=np.float64),
+                                "normal": np.array(nrm, dtype=np.float64),
+                                "npts": int(npts)})
+            print(f"  Dense leg markers: {len(markers)} plane(s) found")
         except Exception as e:
-            print(f"Plane removal skipped (detection failed): {e}")
+            print(f"  Marker detection skipped: {e}")
 
-    # ---- STEP 5: DETECT OBJECTS ----
-    if merge_clusters:
-        print("Merge mode: filtering noise, merging all clusters")
-        eps = compute_eps(pcd)
-        labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=10))
-        noise_mask = labels < 0
-        if np.any(~noise_mask):
-            pcd = pcd.select_by_index(np.where(~noise_mask)[0])
-            print(f"  Removed {noise_mask.sum():,} noise points, kept {len(pcd.points):,}")
-        box_cluster = pcd
-        obj_cluster = None
+    # Save dense leg cluster and marker cut lines
+    if obj_dense is not None and len(obj_dense.points) > 0:
+        dlp = np.asarray(obj_dense.points, dtype=np.float32)
+        _quick_save_ply(dlp, None, os.path.join(debug_dir_out, "leg_cluster.ply"))
+    elif box_dense is not None and len(box_dense.points) > 0:
+        dlp = np.asarray(box_dense.points, dtype=np.float32)
+        _quick_save_ply(dlp, None, os.path.join(debug_dir_out, "leg_cluster.ply"))
+
+    import json as _json
+    cut_data = {"markers": []}
+    for m in markers:
+        cut_data["markers"].append({
+            "centroid": m["centroid"].tolist(),
+            "normal": m["normal"].tolist(),
+            "npts": m.get("npts", 0),
+        })
+    with open(os.path.join(debug_dir_out, "cutting_line.json"), "w") as _f:
+        _json.dump(cut_data, _f, indent=2)
+    print("  Saved: debug/leg_cluster.ply + debug/cutting_line.json")
+
+    # A4: Ghost filter each identified cluster separately.
+    #
+    # Filtering before clustering (the old flow) forced a second DBSCAN on a
+    # ~14x sparser cloud and left the two results free to disagree about which
+    # object is the box — nothing checked them. Splitting first keeps each
+    # point's identity, so no label transfer is needed and the segmentation is
+    # decided once, on the denser and better-conditioned cloud.
+    #
+    # The voxel size is computed once on the whole dense cloud: derived
+    # per-cluster it would differ per object and give them inconsistent
+    # densities.
+    dense_pts_full = np.asarray(pcd_dense.points, dtype=np.float32)
+    from pipeline.config import GHOST_VOXEL_FACTOR
+    if GHOST_VOXEL_FACTOR <= 0:
+        voxel_size = 0.0
+        # Still needed as a length scale for the normal-aware search radius.
+        nn_scale = compute_voxel_size(dense_pts_full, factor=1.0)
+        print("  Ghost voxel dedup: DISABLED (GHOST_VOXEL_FACTOR=0) — keeping "
+              "every point; ghost layers survive for the normal filter to catch")
     else:
-        box_cluster, obj_cluster = detect_top_k_objects(pcd, k=k, visualize=visualize)
+        voxel_size = compute_voxel_size(dense_pts_full)
+        nn_scale = voxel_size
+        print(f"  Ghost voxel_size: {voxel_size:.4f} (shared across clusters)")
 
-    # ---- STEP 6: FILL BOTTOM CAP ----
-    if fill_enabled and not skip_plane and box_cluster is not None:
-        box_cluster = cap_point_cloud_bottom(box_cluster, alpha=0.0)
-    if fill_enabled and not skip_plane and obj_cluster is not None:
-        obj_cluster = cap_point_cloud_bottom(obj_cluster, alpha=2.0)
+    def _ghost_filter(cluster, label):
+        if cluster is None or len(cluster.points) == 0:
+            return (np.zeros((0, 3), dtype=np.float32),
+                    np.zeros((0, 3), dtype=np.uint8))
+        pts = np.asarray(cluster.points, dtype=np.float32)
+        cols = (np.clip(np.asarray(cluster.colors, dtype=np.float32), 0, 1) * 255).astype(np.uint8)
+        n_in = len(pts)
+        pts, cols = voxel_dedup(pts, cols, voxel_size)
+        pts, cols = normal_aware_filter(pts, cols, nn_scale)
+        print(f"  Ghost filter [{label}]: {n_in:,} → {len(pts):,} pts")
 
-    # ---- STEP 7: SAVE box.ply + obj.ply ----
+        # Collapse the ghost sheet onto one surface. Runs per cluster so the
+        # neighbourhood never spans two objects.
+        from pipeline.config import MLS_RADIUS_MULT
+        if MLS_RADIUS_MULT and MLS_RADIUS_MULT > 0 and len(pts) > 50:
+            from pipeline.mls import mls_project
+            print(f"  MLS [{label}]:", end=" ")
+            pts, cols, _ = mls_project(pts, cols,
+                                       radius_mult=MLS_RADIUS_MULT)
+        return pts, cols
+
+    box_pts_arr, box_cols_arr = _ghost_filter(box_dense, "box")
+    leg_pts_arr, leg_cols_arr = _ghost_filter(obj_dense, "obj")
+
+    if obj_dense is None and len(box_pts_arr) > 0:
+        print("  Only 1 cluster — treating it as the box (no obj)")
+
+    print(f"  Clean: leg={len(leg_pts_arr):,}, box={len(box_pts_arr):,}")
+
+    # ── Phase B: Leveling ──
+    print()
+    print("─" * 40)
+    print("PHASE B: Leveling (shared transform)")
+    print("─" * 40)
+
+    ransac_thresh = auto_ransac_threshold(pcd_dense, base_factor=3)
+    plane_model, _ = detect_plane_ransac_deterministic(
+        pcd_dense, distance_threshold=ransac_thresh, num_iterations=1000, seed=seed)
+    normal = plane_model[:3]
+    print(f"RANSAC plane normal: ({normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f})")
+    R = get_rotation_to_z_axis(normal)
+    # Markers are detected in original VGGT space, so they must follow every
+    # rotation the clouds receive — including the upside-down flip below.
+    R_total = np.asarray(R, dtype=np.float64)
+
+    pcd_dense.rotate(R, center=(0, 0, 0))
+    dense_pts = np.asarray(pcd_dense.points, dtype=np.float32)
+
+    leg_pts_rot = _rotate_points(leg_pts_arr, R)
+    box_pts_rot = _rotate_points(box_pts_arr, R)
+
+    # Upside-down check
+    try:
+        _, inliers_rot = detect_plane_ransac_deterministic(
+            pcd_dense, distance_threshold=ransac_thresh, num_iterations=500, seed=seed)
+        plane_z_val = np.mean(dense_pts[inliers_rot, 2])
+        non_plane_mask = np.ones(len(dense_pts), dtype=bool)
+        non_plane_mask[inliers_rot] = False
+        if non_plane_mask.any() and np.mean(dense_pts[non_plane_mask, 2]) < plane_z_val:
+            print("Upside-down detected — flipping 180°")
+            flip_R = o3d.geometry.get_rotation_matrix_from_xyz((np.pi, 0, 0))
+            pcd_dense.rotate(flip_R, center=(0, 0, 0))
+            dense_pts = np.asarray(pcd_dense.points, dtype=np.float32)
+            leg_pts_rot = _rotate_points(leg_pts_rot, flip_R)
+            box_pts_rot = _rotate_points(box_pts_rot, flip_R)
+            R_total = np.asarray(flip_R, dtype=np.float64) @ R_total
+    except Exception as e:
+        print(f"Upside-down check failed: {e}")
+
+    # ── Phase C: Post-leveling cuts + cap ──
+    print()
+    print("─" * 40)
+    print("PHASE C: Cuts and export")
+    print("─" * 40)
+
+    # Floor cut on dense, apply to clean
+    floor_z, floor_margin = None, 0.008
+    try:
+        r_thresh = auto_ransac_threshold(pcd_dense, base_factor=3)
+        r_thresh = min(r_thresh, 0.015)
+        plane_model2, inliers2 = detect_plane_ransac_deterministic(
+            pcd_dense, distance_threshold=r_thresh, num_iterations=1000, seed=seed)
+        normal2 = plane_model2[:3]
+        is_horiz = abs(np.dot(normal2, [0, 0, 1])) > 0.85
+        z_vals = dense_pts[:, 2]
+        z_min, z_max = np.min(z_vals), np.max(z_vals)
+        pz = np.median(dense_pts[inliers2, 2])
+        is_bottom = (pz - z_min) < 0.25 * (z_max - z_min)
+        ratio = len(inliers2) / len(dense_pts)
+        if is_horiz and is_bottom and ratio > 0.05:
+            floor_z = pz
+            print(f"Floor plane at Z={floor_z:.4f} (ratio={ratio:.1%})")
+        else:
+            print(f"Floor cut skipped (horiz={is_horiz}, bottom={is_bottom}, ratio={ratio:.1%})")
+    except Exception as e:
+        print(f"Floor detection failed: {e}")
+
+    if floor_z is not None and len(leg_pts_rot) > 0:
+        lk = leg_pts_rot[:, 2] > (floor_z + floor_margin)
+        leg_pts_rot = leg_pts_rot[lk]; leg_cols_arr = leg_cols_arr[lk]
+    if floor_z is not None and len(box_pts_rot) > 0:
+        bk = box_pts_rot[:, 2] > (floor_z + floor_margin)
+        box_pts_rot = box_pts_rot[bk]; box_cols_arr = box_cols_arr[bk]
+    print(f"Floor cut: leg → {len(leg_pts_rot):,}, box → {len(box_pts_rot):,}")
+
+    # Rotate the marker planes into levelled space. This happens before any
+    # cutting so the planes can be published for review whether or not the cut
+    # is applied here.
+    leg_no_cut_path = os.path.join(objects_dir, "leg_no_cut.ply")
+    markers_rotated = []
+    if len(markers) > 0:
+        # A limb segment is bounded by at most two cuts, so only the two
+        # best-supported markers can matter; a third can only contradict one of
+        # them. Trim here rather than in the cut so the published planes, the
+        # cross-section caps and the cut all see the same set.
+        if len(markers) > MAX_MARKERS:
+            markers = sorted(markers, key=lambda m: -m.get("npts", 0))[:MAX_MARKERS]
+            print(f"Markers: keeping the {MAX_MARKERS} best-supported")
+        for m in markers:
+            cen = np.array(m["centroid"])
+            norm = np.array(m["normal"])
+            cen_r = (R_total @ cen).astype(np.float64)
+            norm_r = (R_total @ norm).astype(np.float64)
+            norm_r /= np.linalg.norm(norm_r) + 1e-8
+            markers_rotated.append({"centroid": cen_r.tolist(), "normal": norm_r.tolist(),
+                                    "npts": m.get("npts", 0)})
+
+        # Drop planes sitting in the bottom fraction of the object. Feet, arch
+        # shadows and the floor junction all live there, and a cut line that low
+        # would discard nearly the whole limb.
+        #
+        # This has to happen HERE rather than in segment_point_cloud: detection
+        # runs in original VGGT space, where the vertical axis is whatever the
+        # camera happened to give (on small_leg the limb's long axis is Y, not
+        # Z). Only after R_total does "height" mean height.
+        frac = MARKER_MIN_HEIGHT_FRAC
+        if frac > 0 and len(leg_pts_rot) > 0 and len(markers_rotated) > 0:
+            lo = float(leg_pts_rot[:, 2].min())
+            span = float(leg_pts_rot[:, 2].max()) - lo
+            if span > 0:
+                keep_m, drop_m = [], []
+                for mr in markers_rotated:
+                    h = (mr["centroid"][2] - lo) / span
+                    (keep_m if h >= frac else drop_m).append((mr, h))
+                for mr, h in drop_m:
+                    print(f"  Marker rejected: {h*100:.0f}% of height "
+                          f"(< {frac*100:.0f}%), {mr['npts']} pts")
+                markers_rotated = [mr for mr, _ in keep_m]
+
+        # Also publish the planes in LEVELLED space. cutting_line.json is written
+        # pre-levelling, but leg_no_cut.ply is post-levelling, so the two do not
+        # share a frame — anything drawing them together (a UI, a debug viewer)
+        # needs this version, and "height along Z" only means something here.
+        with open(os.path.join(debug_dir_out, "cutting_line_levelled.json"), "w") as _f:
+            _json.dump({"markers": markers_rotated, "space": "levelled"}, _f, indent=2)
+
+    # ── Close whatever the cut actually leaves open ──
+    #
+    # The floor extension and bottom cap fabricate a base at floor level. That
+    # is correct only when the floor really is the bottom of the region being
+    # measured, which depends on the cut:
+    #
+    #   0 markers -> no cut, bottom is the floor            -> floor cap
+    #   1 marker  -> keep below, bottom is still the floor  -> floor cap
+    #   2 markers -> keep between, bottom is the lower cut face -> plane cap
+    #
+    # Filling before the cut got the 2-marker case wrong. The fabricated skirt
+    # was usually discarded by the cut and merely wasted, but a marker placed
+    # low on the limb left part of it inside the kept segment — invented
+    # geometry in the middle of a measurement, and a lower face that bulged
+    # instead of sitting flat.
+    #
+    # leg_no_cut.ply is exempt: it is the review cloud and what gets measured
+    # if the user declines to cut, so it is always floor-closed. It is built
+    # from its own copy, and the cut runs on the unfilled cloud.
+    o3d_box = _array_to_o3d(box_pts_rot, box_cols_arr)
+    if fill_enabled and len(o3d_box.points) > 0:
+        # The box is never cut, so its base is always the floor.
+        # Extend down to the floor first — capping at the raw z_min would seal
+        # the object above the ground and lose the shadowed base entirely.
+        o3d_box = extend_point_cloud_to_floor(o3d_box, floor_z, label="box")
+        o3d_box = cap_point_cloud_bottom(o3d_box, alpha=0.0)
+
+    def _close_to_floor(pts, cols):
+        """Sweep the bottom band down to the floor and cap it."""
+        if not fill_enabled or len(pts) == 0:
+            return pts, cols
+        p = _array_to_o3d(pts, cols)
+        p = extend_point_cloud_to_floor(p, floor_z, label="obj")
+        p = cap_point_cloud_bottom(p, alpha=2.0)
+        out_pts = np.asarray(p.points, dtype=np.float32)
+        out_cols = ((np.clip(np.asarray(p.colors, dtype=np.float32), 0, 1) * 255)
+                    .astype(np.uint8) if p.has_colors() else cols)
+        return out_pts, out_cols
+
+    # Complete but uncut — the review cloud. Always floor-closed.
+    nc_pts, nc_cols = _close_to_floor(leg_pts_rot, leg_cols_arr)
+    _quick_save_ply(nc_pts, nc_cols, leg_no_cut_path)
+    print(f"Saved (complete, uncut): {leg_no_cut_path} ({len(nc_pts):,} pts)")
+
+    n_markers = len(markers_rotated)
+    if apply_cut and n_markers > 0 and len(leg_pts_rot) > 0:
+        keep_mask, cut_case = apply_marker_cut(leg_pts_rot.astype(np.float64),
+                                               markers_rotated)
+        n_kept = int(keep_mask.sum())
+        if n_kept >= 50:
+            leg_pts_rot = leg_pts_rot[keep_mask]
+            leg_cols_arr = leg_cols_arr[keep_mask]
+            print(f"Marker cut ({cut_case}): leg → {len(leg_pts_rot):,} pts")
+
+            # Cap the exposed cross-section. Left open, the surface solver
+            # rounds it into a dome instead of the flat face the cut produced.
+            if fill_enabled:
+                for i, mr in enumerate(markers_rotated):
+                    leg_pts_rot, leg_cols_arr = cap_points_on_plane(
+                        leg_pts_rot, leg_cols_arr,
+                        mr["centroid"], mr["normal"], label=f"marker {i}")
+                leg_pts_rot = leg_pts_rot.astype(np.float32)
+            if n_markers < 2:
+                # One plane truncates the top; the bottom is still the floor.
+                leg_pts_rot, leg_cols_arr = _close_to_floor(leg_pts_rot, leg_cols_arr)
+        else:
+            print(f"Marker cut ({cut_case}): only {n_kept} pts (< 50) — keeping full leg")
+            leg_pts_rot, leg_cols_arr = nc_pts, nc_cols
+        o3d_leg = _array_to_o3d(leg_pts_rot, leg_cols_arr)
+    else:
+        # No cut applied, so the review cloud is also the measured cloud.
+        if not apply_cut:
+            print("Marker cut deferred — cutting planes saved for interactive review")
+        leg_pts_rot, leg_cols_arr = nc_pts, nc_cols
+        o3d_leg = _array_to_o3d(leg_pts_rot, leg_cols_arr)
+
+    # Export
+    leg_cut_path = os.path.join(objects_dir, "leg_cut.ply")
+    box_path = os.path.join(objects_dir, "box.ply")
+    merged_path = os.path.join(objects_dir, "merged.ply")
+
+    # leg_cut + box
     output_paths = []
+    if len(o3d_leg.points) > 0:
+        o3d.io.write_point_cloud(leg_cut_path, o3d_leg)
+        output_paths.append(leg_cut_path)
+        print(f"Saved: {leg_cut_path} ({len(o3d_leg.points):,} pts)")
+    if len(o3d_box.points) > 0:
+        o3d.io.write_point_cloud(box_path, o3d_box)
+        output_paths.append(box_path)
+        print(f"Saved: {box_path} ({len(o3d_box.points):,} pts)")
 
-    if box_cluster is not None:
-        path = os.path.join(output_folder, "box.ply")
-        o3d.io.write_point_cloud(path, box_cluster)
-        output_paths.append(path)
-        pts = np.asarray(box_cluster.points)
-        print(f"Saved: {path} ({len(pts):,} pts) "
-              f"X[{pts[:,0].min():.3f}, {pts[:,0].max():.3f}] "
-              f"Y[{pts[:,1].min():.3f}, {pts[:,1].max():.3f}] "
-              f"Z[{pts[:,2].min():.3f}, {pts[:,2].max():.3f}]")
-
-    if obj_cluster is not None:
-        path = os.path.join(output_folder, "obj.ply")
-        o3d.io.write_point_cloud(path, obj_cluster)
-        output_paths.append(path)
-        pts = np.asarray(obj_cluster.points)
-        print(f"Saved: {path} ({len(pts):,} pts) "
-              f"X[{pts[:,0].min():.3f}, {pts[:,0].max():.3f}] "
-              f"Y[{pts[:,1].min():.3f}, {pts[:,1].max():.3f}] "
-              f"Z[{pts[:,2].min():.3f}, {pts[:,2].max():.3f}]")
+    # merged.ply
+    if len(o3d_leg.points) > 0 and len(o3d_box.points) > 0:
+        merged_pcd = o3d.geometry.PointCloud()
+        mp = np.vstack([np.asarray(o3d_leg.points), np.asarray(o3d_box.points)])
+        mc = np.vstack([np.asarray(o3d_leg.colors), np.asarray(o3d_box.colors)])
+        merged_pcd.points = o3d.utility.Vector3dVector(mp)
+        merged_pcd.colors = o3d.utility.Vector3dVector(mc)
+        o3d.io.write_point_cloud(merged_path, merged_pcd)
+        print(f"Saved: {merged_path} ({len(mp):,} pts)")
 
     if not output_paths:
-        print("WARNING: No clusters saved!")
+        print("WARNING: No objects exported")
 
     return output_paths
 
 
-def _count_markers_on_ply(ply_path, axis_idx=2):
-    """Quick marker-cluster count on raw PLY before cleaning.
+def _rotate_points(points, R):
+    """Apply 3x3 rotation matrix to (N,3) point array."""
+    if points.size == 0 or points.ndim < 2:
+        return points
+    return (points @ R.T).astype(np.float32)
 
-    Returns number of valid marker clusters (>=150 pts), or 0 if
-    detection fails or finds too few markers.
-    """
-    try:
-        pcd = o3d.io.read_point_cloud(ply_path)
-        if len(pcd.points) == 0:
-            return 0
-        coords = np.asarray(pcd.points, dtype=np.float64)
-        if not pcd.has_colors():
-            return 0
-        colors_float = np.asarray(pcd.colors, dtype=np.float64)
-        colors = np.clip(colors_float * 255.0, 0, 255).astype(np.uint8)
-        marker_mask, _stats = detect_markers(colors)
-        if marker_mask.sum() < 10:
-            return 0
-        marker_coords = coords[marker_mask]
-        labels, n_clusters = cluster_markers(marker_coords)
-        valid = labels != -1
-        if not np.any(valid):
-            return 0
-        valid_clusters = 0
-        for cid in sorted(set(labels)):
-            if cid == -1:
-                continue
-            if (labels == cid).sum() >= 150:
-                valid_clusters += 1
-        return valid_clusters
-    except Exception:
-        return 0
+
+def _quick_save_ply(points, colors, path):
+    """Save numpy points to PLY via trimesh."""
+    import trimesh as _trimesh
+    pc = _trimesh.PointCloud(points, colors=colors) if colors is not None else _trimesh.PointCloud(points)
+    pc.export(path)
+
+
+def _array_to_o3d(points, colors_uint8):
+    """Build Open3D PointCloud from numpy arrays."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    if colors_uint8 is not None and len(colors_uint8) == len(points):
+        colors_float = colors_uint8.astype(np.float32) / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(colors_float)
+    return pcd
 
 
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
                       segment_leg=False, segment_height_axis="z",
-                      fill_enabled=True):
-    """Pipeline wrapper around clean_and_extract_objects.
-
-    Optionally runs marker-based leg segmentation on obj.ply after cleaning.
-    Returns the list of per-object PLY paths, or None on failure.
-    """
+                      fill_enabled=True, clean_ply_path=None, apply_cut=True):
+    """Pipeline wrapper. clean_ply_path is accepted for call-site compatibility
+    and ignored — Stage 3 derives its own ghost-filtered clouds from ply_path."""
     print()
     print("=" * 60)
     print("STAGE 3: Cleaning point cloud and extracting objects")
     print("=" * 60)
 
-    clean_output_dir = os.path.join(output_dir, "clean_objects")
-    os.makedirs(clean_output_dir, exist_ok=True)
-
-    marker_count = _count_markers_on_ply(ply_path) if segment_leg else 0
-    fill_skip_2_marker = segment_leg and marker_count == 2
-    fill_this_run = fill_enabled and not fill_skip_2_marker
-    if not fill_this_run:
-        if not fill_enabled:
-            reason = "disabled by --no-fill"
-        else:
-            reason = f"skipped (2-marker cut: {marker_count} markers detected)"
-        print(f"  Bottom fill: {reason}")
-
+    del clean_ply_path  # historically selected the flow; only one flow remains
     try:
-        object_paths = clean_and_extract_objects(
-            input_path=ply_path,
-            output_folder=clean_output_dir,
-            k=num_objects,
-            visualize=False,
+        object_paths = _segment_and_export(
+            dense_ply=ply_path,
+            output_dir=output_dir,
+            num_objects=num_objects,
             seed=seed,
-            fill_enabled=fill_this_run,
+            segment_leg=segment_leg,
+            segment_height_axis=segment_height_axis,
+            fill_enabled=fill_enabled,
+            apply_cut=apply_cut,
         )
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:
             print(f"    → {p}")
-
-        if object_paths and segment_leg:
-            object_paths = _segment_leg(
-                object_paths, output_dir,
-                height_axis=segment_height_axis, seed=seed)
-
         return object_paths
     except Exception as e:
-        print(f"  ERROR during cleaning: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"  ERROR during stage 3: {e}")
         return None

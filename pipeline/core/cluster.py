@@ -77,17 +77,31 @@ def detect_top_k_objects(pcd, k=2, visualize=False):
         if npts < min_points:
             continue
 
-        norm_pts = npts / 1000.0
-        norm_density = min(density, 5_000_000) / 1_000_000.0
-        score = norm_pts * 0.5 + norm_density * 0.3 - max_dim * 0.2
-        clusters.append((cluster, score, npts, extent, density, max_dim))
+        clusters.append((cluster, npts, extent, density, max_dim))
 
     if len(clusters) == 0:
         print("No valid clusters → using whole cloud")
         return (pcd, None)
 
-    clusters.sort(key=lambda x: x[1], reverse=True)
-    top = clusters[:min(k, len(clusters))]
+    # Adaptive scoring: normalize by data median instead of magic constants
+    npts_arr = np.array([c[1] for c in clusters])
+    dens_arr = np.array([c[3] for c in clusters])
+    dims_arr = np.array([c[4] for c in clusters])
+
+    med_pts = max(float(np.median(npts_arr)), 1.0)
+    med_dens = max(float(np.median(dens_arr)), 1.0)
+    max_dim_val = max(float(np.max(dims_arr)), 1e-6)
+
+    scored = []
+    for i, (cluster, npts, extent, density, max_dim) in enumerate(clusters):
+        norm_pts = npts / med_pts
+        norm_dens = density / med_dens
+        norm_compact = 1.0 - (max_dim / max_dim_val)
+        score = norm_pts * 0.4 + norm_dens * 0.3 + norm_compact * 0.3
+        scored.append((cluster, score, npts, extent, density, max_dim))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = scored[:min(k, len(scored))]
 
     if len(top) < 2:
         print("Only 1 cluster → returning as box, no obj")

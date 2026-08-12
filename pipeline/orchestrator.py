@@ -24,6 +24,19 @@ from pipeline.stages.volume import compute_volumes
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+STAGE_DIRS = {
+    1: "01_inference",
+    2: "02_pointcloud",
+    3: "03_clean",
+    4: "04_recon",
+    5: "05_watertight",
+    6: "06_volume",
+}
+
+# Final deliverables, promoted out of for_debug/ to the top of output/.
+FINAL_NAMES = {"leg_cut": "leg_mesh", "obj": "leg_mesh",
+               "box": "box_mesh", "scene_colour": "scene_mesh"}
+
 
 def _print_banner(args, device):
     print(f"╔{'═' * 58}╗")
@@ -44,6 +57,44 @@ def _print_banner(args, device):
     print(f"║  Seed          : {args.seed:<40}║")
     print(f"║  Leg segment   : {str(args.segment_leg):<40}║")
     print(f"╚{'═' * 58}╝")
+
+
+def _publish_final_meshes(output_dir, wt_mesh_paths, recon_mesh_paths, scene_path):
+    """Promote the deliverables to output/ as leg_mesh / box_mesh / scene_mesh.
+
+    Everything else stays under for_debug/. Falls back to the Stage 4 recon when
+    watertight repair was skipped, so the three files always exist if a mesh was
+    produced at all.
+    """
+    import open3d as o3d
+
+    sources = list(wt_mesh_paths or recon_mesh_paths or [])
+    if scene_path:
+        sources.append(scene_path)
+
+    published = []
+    for src in sources:
+        if not src or not os.path.exists(src):
+            continue
+        stem = os.path.splitext(os.path.basename(src))[0]
+        stem = stem[:-len("_recon")] if stem.endswith("_recon") else stem
+        final = FINAL_NAMES.get(stem)
+        if final is None:
+            continue
+        dst_ply = os.path.join(output_dir, f"{final}.ply")
+        shutil.copy2(src, dst_ply)
+        mesh = o3d.io.read_triangle_mesh(dst_ply)
+        mesh.compute_vertex_normals()
+        dst_stl = os.path.join(output_dir, f"{final}.stl")
+        o3d.io.write_triangle_mesh(dst_stl, mesh)
+        published.append((final, len(mesh.vertices), len(mesh.triangles)))
+
+    if published:
+        print()
+        print("  Final meshes:")
+        for name, nv, nf in sorted(set(published)):
+            print(f"    {name}.ply / .stl   {nv:,} verts, {nf:,} faces")
+    return published
 
 
 def _copy_images_to_target(image_folder, target_images_dir):
@@ -124,8 +175,14 @@ def main():
         logger.start()
 
     try:
-        # target_dir mirrors demo_gradio's expected layout (predictions.npz + images/).
-        target_dir = os.path.join(args.output_dir, "target")
+        # Everything intermediate lands under for_debug/<stage>/; only the three
+        # final meshes sit at the top of output/.
+        debug_root = os.path.join(args.output_dir, "for_debug")
+        stage_dirs = {n: os.path.join(debug_root, d) for n, d in STAGE_DIRS.items()}
+        for d in stage_dirs.values():
+            os.makedirs(d, exist_ok=True)
+
+        target_dir = os.path.join(stage_dirs[1], "target")
         target_images_dir = os.path.join(target_dir, "images")
         os.makedirs(target_images_dir, exist_ok=True)
         _copy_images_to_target(args.image_folder, target_images_dir)
@@ -134,18 +191,43 @@ def main():
         predictions, inference_time = run_inference(args.image_folder, device, args.max_frames)
         print(f"[DBG-stage] stage1 inference: {inference_time:.2f}s")
 
+        # ── Stage 1b: Detection (after VGGT, uses freed GPU) ──
+        detection_seeds = None
+        if getattr(args, "use_detection", False):
+            _dbg_t = time.time()
+            try:
+                from pipeline.detection import detect_objects, seeds_to_xyz_labels
+                print()
+                print("=" * 60)
+                print("STAGE 1b: Object detection (Grounding DINO + SAM)")
+                print("=" * 60)
+                images_for_det = predictions["images"]
+                detection_seeds = detect_objects(images_for_det)
+                if detection_seeds:
+                    mode = getattr(args, "prediction_mode", "pointmap")
+                    wp = predictions.get("world_points" if mode == "pointmap" else "world_points_from_depth")
+                    if wp is not None:
+                        _, _ = seeds_to_xyz_labels(detection_seeds, wp)
+                        args._detection_seeds = detection_seeds
+                print(f"[DBG-stage] stage1b detection: {time.time() - _dbg_t:.2f}s")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"  WARNING: Detection failed ({e}), falling back to heuristic")
+                detection_seeds = None
+
         # Save predictions (compatible with demo_gradio)
         npz_path = os.path.join(target_dir, "predictions.npz")
         save_dict = {k: v for k, v in predictions.items() if v is not None}
         np.savez_compressed(npz_path, **save_dict)
         print(f"  Saved predictions: {npz_path}")
 
-        npz_path2 = os.path.join(args.output_dir, "predictions.npz")
+        npz_path2 = os.path.join(stage_dirs[1], "predictions.npz")
         shutil.copy2(npz_path, npz_path2)
 
         # ── Stage 2: Export PLY ──
         _dbg_t = time.time()
-        ply_path = export_ply(predictions, args.output_dir, args)
+        ply_path = export_ply(predictions, stage_dirs[2], args)
         print(f"[DBG-stage] stage2 export_ply: {time.time() - _dbg_t:.2f}s")
 
         # ── Stages 3-5: Clean + Reconstruct + Watertight ──
@@ -157,7 +239,7 @@ def main():
         if not args.skip_mesh:
             _dbg_t = time.time()
             object_paths = clean_and_extract(
-                ply_path, args.output_dir, args.num_objects, seed=args.seed,
+                ply_path, stage_dirs[3], args.num_objects, seed=args.seed,
                 segment_leg=args.segment_leg,
                 segment_height_axis=args.segment_height_axis,
                 fill_enabled=not args.no_fill)
@@ -165,7 +247,7 @@ def main():
             if object_paths:
                 _dbg_t = time.time()
                 scene_recon_path, recon_mesh_paths = reconstruct_mesh_stage(
-                    object_paths, args.output_dir, seed=args.seed,
+                    object_paths, stage_dirs[4], seed=args.seed,
                     method=args.recon_method,
                     box_method=args.box_recon_method,
                     obj_method=args.obj_recon_method)
@@ -174,7 +256,7 @@ def main():
                 if recon_mesh_paths and not args.no_watertight:
                     _dbg_t = time.time()
                     scene_wt_path, wt_mesh_paths = watertight_stage(
-                        recon_mesh_paths, args.output_dir)
+                        recon_mesh_paths, stage_dirs[5])
                     print(f"[DBG-stage] stage5 watertight: {time.time() - _dbg_t:.2f}s")
         else:
             print("\n  (Skipping mesh stages — --skip_mesh was set)")
@@ -188,12 +270,16 @@ def main():
                                      auto_res=args.auto_res)
             print(f"[DBG-stage] stage6 volumes: {time.time() - _dbg_t:.2f}s")
             if vol_df is not None:
+                vol_df.to_csv(os.path.join(stage_dirs[6], "volumes.csv"), index=False)
                 box_rows = vol_df[vol_df["is_ref"]]
                 obj_rows = vol_df[~vol_df["is_ref"]]
                 if not box_rows.empty:
                     box_vol_cm3 = float(box_rows.iloc[0]["real_vol_cm3"])
                 if not obj_rows.empty:
                     obj_vol_cm3 = float(obj_rows.iloc[0]["real_vol_cm3"])
+
+        _publish_final_meshes(args.output_dir, wt_mesh_paths, recon_mesh_paths,
+                              scene_wt_path or scene_recon_path)
 
         total_time = time.time() - total_t0
         _print_summary(total_time, inference_time, ply_path, scene_recon_path,

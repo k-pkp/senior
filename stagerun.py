@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""Run pipeline stages one at a time, with inspectable output per stage.
+
+Each stage reads the previous stage's artifacts from work/<input_name>/ and
+writes its own, so a stage can be re-run and inspected without repeating the
+expensive ones (inference in particular).
+
+    python3 stagerun.py 1 -i inputs/small_leg          # inference only
+    python3 stagerun.py 2 -i inputs/small_leg          # pointcloud, reuses stage 1
+    python3 stagerun.py 1-3 -i inputs/small_leg        # range
+    python3 stagerun.py 1 -i inputs/small_leg --force  # ignore cache
+
+Layout:
+    work/<name>/01_inference/   predictions.npz, input_frames.png, summary.txt
+    work/<name>/02_pointcloud/  points.ply, summary.txt
+    work/<name>/03_clean/       clean clouds, summary.txt
+    work/<name>/04_recon/       meshes
+    work/<name>/05_watertight/  watertight meshes
+    work/<name>/06_volume/      volumes.csv
+"""
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+WORK = "work"
+STAGE_DIRS = {
+    1: "01_inference",
+    2: "02_pointcloud",
+    3: "03_clean",
+    4: "04_recon",
+    5: "05_watertight",
+    6: "06_volume",
+}
+
+
+def stage_dir(name, n, create=True):
+    d = os.path.join(WORK, name, STAGE_DIRS[n])
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def src_dir(args, name, n):
+    """Directory to read stage n from — --src run if given, else this run."""
+    return stage_dir(args.src or name, n, create=False)
+
+
+def _write_summary(d, lines):
+    path = os.path.join(d, "summary.txt")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"\n  -> {path}")
+
+
+def multiview_stats(preds, conf_pct=50, sample=40000, seed=42):
+    """Geometric self-consistency: reproject each 3D point into every other view.
+
+    For point p seen in view i, its depth in view j is known two ways — the
+    geometric depth from transforming p by extrinsic[j], and the depth head's
+    own prediction at that pixel. Disagreement means the model is not
+    self-consistent about where the surface is.
+
+    Agreement is counted at >=3 views: two views agreeing can both be wrong in
+    the same way (they share the same depth head), whereas three corroborating
+    is a meaningfully stronger claim about the surface.
+
+    Ground-truth free, so it ranks variants but cannot prove correctness — a
+    model can be consistently wrong.
+    """
+    wp = preds["world_points"]
+    depth = preds["depth"]
+    if depth.ndim == 4:
+        depth = depth[..., 0]
+    extr, intr = preds["extrinsic"], preds["intrinsic"]
+    conf = preds["world_points_conf"]
+    S, H, W = wp.shape[:3]
+    if S <= 1:
+        return None
+
+    thr = np.percentile(conf, conf_pct)
+    rng = np.random.default_rng(seed)
+    rel_all, agree_counts = [], []
+
+    for i in range(S):
+        m = (conf[i] >= thr).reshape(-1)
+        idx = np.flatnonzero(m)
+        if len(idx) == 0:
+            continue
+        if len(idx) > sample:
+            idx = rng.choice(idx, sample, replace=False)
+        pts = wp[i].reshape(-1, 3)[idx].astype(np.float64)
+        agree = np.zeros(len(pts), dtype=np.int32)
+
+        for j in range(S):
+            if i == j:
+                continue
+            cam = np.hstack([pts, np.ones((len(pts), 1))]) @ extr[j].T
+            dz = cam[:, 2]
+            fx, fy = float(intr[j, 0, 0]), float(intr[j, 1, 1])
+            cx, cy = float(intr[j, 0, 2]), float(intr[j, 1, 2])
+            ok = dz > 1e-6
+            safe = np.where(ok, dz, np.inf)
+            u = np.rint(fx * cam[:, 0] / safe + cx)
+            v = np.rint(fy * cam[:, 1] / safe + cy)
+            u = np.nan_to_num(u, nan=-1, posinf=-1, neginf=-1).astype(np.int32)
+            v = np.nan_to_num(v, nan=-1, posinf=-1, neginf=-1).astype(np.int32)
+            ok &= (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            if not ok.any():
+                continue
+            d_pred = np.full(len(pts), np.inf)
+            d_pred[ok] = depth[j, v[ok], u[ok]]
+            rel = np.abs(d_pred - dz) / (np.abs(dz) + 1e-8)
+            rel_all.append(rel[ok & np.isfinite(rel)])
+            agree += ((rel < 0.05) & ok).astype(np.int32)
+
+        agree_counts.append(agree)
+
+    if not rel_all:
+        return None
+    rel = np.concatenate(rel_all)
+    ag = np.concatenate(agree_counts)
+    return {
+        "median_rel": float(np.median(rel)),
+        "p90_rel": float(np.percentile(rel, 90)),
+        "frac_3views_5pct": float((ag >= 3).mean()),
+        "frac_2views_at_1pct": None,
+        "mean_agreeing_views": float(ag.mean()),
+        "n_pairs": int(len(rel)),
+    }
+
+
+def border_contact(preds, conf_pct=50, band=8):
+    """Fraction of confident geometry touching the image border.
+
+    High values mean the subject runs off the edge of frame — the signature of
+    a preprocessing crop cutting the object, which no downstream stage can undo.
+    """
+    conf = preds["world_points_conf"]
+    S, H, W = conf.shape
+    thr = np.percentile(conf, conf_pct)
+    edge = np.zeros((H, W), dtype=bool)
+    edge[:band, :] = edge[-band:, :] = True
+    edge[:, :band] = edge[:, -band:] = True
+    hi = conf >= thr
+    tot = hi.sum()
+    if tot == 0:
+        return None
+    return {
+        "frac_conf_on_border": float((hi & edge[None]).sum() / tot),
+        "top_edge": float((hi[:, :band, :]).sum() / tot),
+        "bottom_edge": float((hi[:, -band:, :]).sum() / tot),
+    }
+
+
+def floor_planarity(path, band=0.03, cm_per_unit=None):
+    """RMS residual of the floor to a fitted plane, in mm.
+
+    The floor is real ceramic tile, so it is genuinely flat — its residual is
+    VGGT's surface-localisation noise measured against physical truth, not a
+    self-consistency proxy.
+    """
+    import open3d as o3d
+    p = o3d.io.read_point_cloud(path)
+    pts = np.asarray(p.points)
+    if len(pts) < 5000:
+        return None
+    sub = pts[::max(1, len(pts) // 200000)]
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(sub)
+    model, _ = pc.segment_plane(distance_threshold=0.01, ransac_n=3,
+                                num_iterations=2000)
+    n, d = np.array(model[:3]), model[3]
+    signed = pts @ n + d
+    m = np.abs(signed) < band
+    if m.sum() < 1000:
+        return None
+    r = signed[m] - np.median(signed[m])
+    # 14 cm ArUco cube measures ~0.265 units across these scenes
+    cm = cm_per_unit if cm_per_unit else 14 / 0.265
+    return {
+        "rms_mm": float(np.sqrt((r ** 2).mean()) * cm * 10),
+        "p95_mm": float(np.percentile(np.abs(r), 95) * cm * 10),
+        "n_floor": int(m.sum()),
+        "frac_floor": float(m.mean()),
+    }
+
+
+def _pcd_stats(path):
+    """Point count, extents, and colour presence for a PLY."""
+    import open3d as o3d
+    p = o3d.io.read_point_cloud(path)
+    pts = np.asarray(p.points)
+    if len(pts) == 0:
+        return f"{os.path.basename(path):<24} EMPTY"
+    e = pts.max(0) - pts.min(0)
+    return (f"{os.path.basename(path):<24} {len(pts):>8,} pts  "
+            f"extent=({e[0]:.4f},{e[1]:.4f},{e[2]:.4f})  "
+            f"colours={'yes' if p.has_colors() else 'NO'}")
+
+
+def _colorize(a, lo_pct=2, hi_pct=98):
+    """Percentile-normalised heatmap for a 2D float array."""
+    lo, hi = np.percentile(a, lo_pct), np.percentile(a, hi_pct)
+    x = np.clip((a - lo) / max(hi - lo, 1e-9), 0, 1)
+    try:
+        import matplotlib.cm as cm
+        return (cm.turbo(x)[..., :3] * 255).astype(np.uint8)
+    except Exception:
+        return (np.stack([x] * 3, -1) * 255).astype(np.uint8)
+
+
+def dump_raw(preds, out_dir):
+    """Materialise every Stage 1 output as something inspectable.
+
+    predictions.npz holds all nine arrays but is opaque; this writes each one as
+    an image, PLY or JSON so it can be judged directly rather than through
+    aggregate metrics.
+    """
+    import json
+    from PIL import Image
+    import trimesh
+
+    raw = os.path.join(out_dir, "raw")
+    os.makedirs(raw, exist_ok=True)
+    written = []
+
+    imgs = preds["images"]                       # (S,3,H,W)
+    S, _, H, W = imgs.shape
+    depth = preds["depth"]
+    depth = depth[..., 0] if depth.ndim == 4 else depth
+    dconf = preds["depth_conf"]
+    wconf = preds["world_points_conf"]
+
+    for sub in ("images", "depth", "depth_conf", "world_points_conf"):
+        os.makedirs(os.path.join(raw, sub), exist_ok=True)
+
+    for i in range(S):
+        rgb = (np.clip(imgs[i].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8)
+        Image.fromarray(rgb).save(f"{raw}/images/frame_{i:02d}.png")
+        Image.fromarray(_colorize(depth[i])).save(f"{raw}/depth/frame_{i:02d}.png")
+        Image.fromarray(_colorize(dconf[i])).save(f"{raw}/depth_conf/frame_{i:02d}.png")
+        Image.fromarray(_colorize(wconf[i])).save(f"{raw}/world_points_conf/frame_{i:02d}.png")
+    written += [f"images/           {S} PNG  — exactly what VGGT received",
+                f"depth/            {S} PNG  — depth head, turbo colormap",
+                f"depth_conf/       {S} PNG  — depth confidence",
+                f"world_points_conf/{S} PNG  — pointmap confidence"]
+
+    # Unfiltered clouds — shows what Stage 2's confidence filter throws away.
+    cols = (np.clip(imgs.transpose(0, 2, 3, 1), 0, 1) * 255).astype(np.uint8).reshape(-1, 3)
+    for key, fname in (("world_points", "cloud_pointmap.ply"),
+                       ("world_points_from_depth", "cloud_from_depth.ply")):
+        if key not in preds:
+            continue
+        pts = preds[key].reshape(-1, 3).astype(np.float32)
+        trimesh.PointCloud(pts, colors=cols).export(os.path.join(raw, fname))
+        written.append(f"{fname:<18} {len(pts):,} pts — RAW, no filtering")
+
+    cams = {
+        "pose_enc": preds["pose_enc"].tolist(),
+        "extrinsic": preds["extrinsic"].tolist(),
+        "intrinsic": preds["intrinsic"].tolist(),
+        "note": ("extrinsic is 3x4 cam-from-world (OpenCV convention); "
+                 "intrinsic is 3x3 pixel units for this resolution"),
+    }
+    with open(os.path.join(raw, "cameras.json"), "w") as f:
+        json.dump(cams, f, indent=2)
+    written.append("cameras.json       per-frame extrinsic / intrinsic / pose_enc")
+
+    fx = [float(preds["intrinsic"][i, 0, 0]) for i in range(S)]
+    cx = [float(preds["intrinsic"][i, 0, 2]) for i in range(S)]
+    manifest = [
+        "# Stage 1 raw outputs",
+        "",
+        "Everything VGGT produces, materialised. Generated from predictions.npz;",
+        "delete this folder and re-run stage 1 to regenerate (no inference needed).",
+        "",
+    ] + [f"- {w}" for w in written] + [
+        "",
+        "## What is and is not used downstream",
+        "",
+        "| output | used by | note |",
+        "|---|---|---|",
+        "| `world_points` + conf | Stage 2 | the only 3D source in the live pipeline |",
+        "| `depth` + `depth_conf` | nothing | second independent estimate, unused |",
+        "| `world_points_from_depth` | nothing | computed every run, never read |",
+        "| `extrinsic` / `intrinsic` | nothing | needed for any reprojection/consistency work |",
+        "| `images` | Stage 2 (colours) | |",
+        "",
+        "## Camera sanity",
+        "",
+        f"- focal length fx per frame: {', '.join(f'{v:.1f}' for v in fx)}",
+        f"- principal point cx: {', '.join(f'{v:.1f}' for v in cx)}  (image centre = {W/2:.1f})",
+        "",
+        "Focal lengths should be near-identical across frames for one phone camera;",
+        "large spread means the pose head is unsure and downstream scale will drift.",
+    ]
+    with open(os.path.join(raw, "MANIFEST.md"), "w") as f:
+        f.write("\n".join(manifest) + "\n")
+
+    print(f"  raw dump -> {raw}/  ({len(written)} artifact groups)")
+    return raw
+
+
+# ── Stage 1 ────────────────────────────────────────────────────────────
+
+def run_stage1(args, name):
+    from vggt.utils.device import get_device
+    from pipeline.stages.inference import run_inference
+
+    d = stage_dir(name, 1)
+    npz = os.path.join(d, "predictions.npz")
+    cached = os.path.exists(npz) and not args.force
+
+    if cached:
+        print(f"  cached: {npz}  (--force to redo)")
+        save = dict(np.load(npz))
+        preds, t = save, float("nan")
+        device = "cached"
+    else:
+        device = get_device()
+        preds, t = run_inference(args.image_folder, device, args.max_frames,
+                                 preprocess_mode=args.preprocess_mode,
+                                 input_res=args.input_res)
+        save = {k: v for k, v in preds.items() if v is not None}
+        np.savez_compressed(npz, **save)
+
+    if args.dump:
+        dump_raw(save, d)
+    if cached:
+        return
+
+    # Dump what the model actually saw — catches framing/crop problems.
+    try:
+        from PIL import Image
+        im = preds["images"]
+        S = im.shape[0]
+        picks = sorted(set([0, S // 2, S - 1]))
+        tiles = [(np.clip(im[i].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8)
+                 for i in picks]
+        Image.fromarray(np.hstack(tiles)).save(os.path.join(d, "input_frames.png"))
+    except Exception as e:
+        print(f"  (frame preview skipped: {e})")
+
+    lines = [f"STAGE 1 — inference   input={args.image_folder}",
+             f"  device            : {device}",
+             f"  inference time    : {t:.1f}s",
+             f"  frames            : {preds['images'].shape[0]}",
+             f"  resolution        : {preds['images'].shape[-2]}x{preds['images'].shape[-1]}",
+             f"  preprocess        : mode={args.preprocess_mode} res={args.input_res}",
+             ""]
+    for k, v in sorted(save.items()):
+        lines.append(f"  {k:<26} {str(v.shape):<22} {v.dtype}")
+
+    # Agreement between the two independent 3D estimates.
+    wp, wpd = save.get("world_points"), save.get("world_points_from_depth")
+    if wp is not None and wpd is not None:
+        conf = save["world_points_conf"]
+        keep = conf >= np.percentile(conf, 50)
+        dist = np.linalg.norm(wp[keep] - wpd[keep], axis=-1)
+        scale = np.percentile(np.linalg.norm(wp[keep] - wp[keep].mean(0), axis=-1), 90)
+        lines += ["",
+                  "  pointmap vs depth-unprojection disagreement (top-50% conf):",
+                  f"    median {np.median(dist):.5f}   p90 {np.percentile(dist, 90):.5f}"
+                  f"   (scene scale ~{scale:.3f})",
+                  f"    median as % of scene: {np.median(dist)/scale*100:.2f}%"]
+
+    mv = multiview_stats(save)
+    if mv:
+        lines += ["",
+                  "  multi-view reprojection consistency (top-50% conf):",
+                  f"    median rel depth error : {mv['median_rel']*100:.2f}%",
+                  f"    p90 rel depth error    : {mv['p90_rel']*100:.2f}%",
+                  f"    mean agreeing views    : {mv['mean_agreeing_views']:.2f}",
+                  f"    pts with >=3 views @5% : {mv['frac_3views_5pct']*100:.1f}%"]
+
+    bc = border_contact(save)
+    if bc:
+        lines += ["",
+                  "  framing (confident geometry on image border):",
+                  f"    any border : {bc['frac_conf_on_border']*100:.1f}%",
+                  f"    top edge   : {bc['top_edge']*100:.1f}%",
+                  f"    bottom edge: {bc['bottom_edge']*100:.1f}%"]
+
+    _write_summary(d, lines)
+
+
+# ── Stage 2 ────────────────────────────────────────────────────────────
+
+def run_stage2(args, name):
+    from pipeline.stages.pointcloud import export_ply
+
+    src = os.path.join(src_dir(args, name, 1), "predictions.npz")
+    if not os.path.exists(src):
+        sys.exit(f"ERROR: stage 1 output missing ({src}) — run stage 1 first")
+
+    d = stage_dir(name, 2)
+    preds = dict(np.load(src))
+
+    ply = export_ply(preds, d, args)
+    outs = [ply]
+
+    lines = [f"STAGE 2 — pointcloud",
+             f"  conf_thres        : {args.conf_thres}",
+             f"  prediction_mode   : {args.prediction_mode}",
+             f"  src stage1        : {args.src or name}", ""]
+    lines += ["  " + _pcd_stats(p) for p in outs if os.path.exists(p)]
+
+    fp = floor_planarity(ply)
+    if fp:
+        lines += ["",
+                  "  floor planarity (physical truth — tile floor is flat):",
+                  f"    RMS      : {fp['rms_mm']:.2f} mm",
+                  f"    p95      : {fp['p95_mm']:.2f} mm",
+                  f"    n_floor  : {fp['n_floor']:,}  ({fp['frac_floor']*100:.0f}% of cloud)"]
+    _write_summary(d, lines)
+
+
+# ── Stage 3 ────────────────────────────────────────────────────────────
+
+def run_stage3(args, name):
+    import glob
+    from pipeline.stages.clean import clean_and_extract
+
+    prev = src_dir(args, name, 2)
+    ply = os.path.join(prev, "points.ply")
+    if not os.path.exists(ply):
+        sys.exit(f"ERROR: stage 2 output missing ({ply}) — run stage 2 first")
+
+
+    d = stage_dir(name, 3)
+    paths = clean_and_extract(
+        ply, d, args.num_objects, seed=args.seed,
+        segment_leg=args.segment_leg,
+        segment_height_axis=args.segment_height_axis,
+        fill_enabled=not args.no_fill,
+        clean_ply_path=None)
+
+    lines = [f"STAGE 3 — clean   fill={not args.no_fill}  segment_leg={args.segment_leg}", ""]
+    for p in sorted(glob.glob(os.path.join(d, "**", "*.ply"), recursive=True)):
+        lines.append("  " + _pcd_stats(p))
+    lines += ["", f"  objects handed to stage 4: {len(paths or [])}"]
+    for p in (paths or []):
+        lines.append(f"    {p}")
+    _write_summary(d, lines)
+
+
+# ── Stage 4 / 5 / 6 ────────────────────────────────────────────────────
+
+def _mesh_stats(path):
+    import trimesh
+    m = trimesh.load(path, process=False)
+    m.merge_vertices()
+    return (f"{os.path.basename(path):<24} {len(m.vertices):>7,} v  {len(m.faces):>7,} f  "
+            f"watertight={str(m.is_watertight):<5}  vol={abs(m.volume):.6f}")
+
+
+def run_stage4(args, name):
+    import glob
+    from pipeline.stages.reconstruct import reconstruct_mesh_stage
+
+    prev = src_dir(args, name, 3)
+    objs = sorted(glob.glob(os.path.join(prev, "objects", "*.ply")))
+    objs = [p for p in objs if os.path.basename(p) in ("box.ply", "leg_cut.ply", "obj.ply")]
+    if not objs:
+        sys.exit("ERROR: stage 3 objects missing — run stage 3 first")
+
+    d = stage_dir(name, 4)
+    scene, recon = reconstruct_mesh_stage(
+        objs, d, seed=args.seed, method=args.recon_method,
+        box_method=args.box_recon_method, obj_method=args.obj_recon_method)
+
+    lines = [f"STAGE 4 — recon   method={args.recon_method} "
+             f"box={args.box_recon_method} obj={args.obj_recon_method}", ""]
+    lines += ["  " + _mesh_stats(p) for p in (recon or [])]
+    _write_summary(d, lines)
+
+
+def run_stage5(args, name):
+    import glob
+    from pipeline.stages.watertight import watertight_stage
+
+    prev = os.path.join(src_dir(args, name, 4), "mesh")
+    recon = sorted(glob.glob(os.path.join(prev, "*_recon.ply")))
+    if not recon:
+        sys.exit("ERROR: stage 4 recon meshes missing — run stage 4 first")
+
+    d = stage_dir(name, 5)
+    scene, wt = watertight_stage(recon, d)
+
+    lines = ["STAGE 5 — watertight", ""]
+    lines += ["  " + _mesh_stats(p) for p in (wt or [])]
+    _write_summary(d, lines)
+
+
+def run_stage6(args, name):
+    import glob
+    from pipeline.stages.volume import compute_volumes
+
+    for n in (5, 4):
+        prev = os.path.join(src_dir(args, name, n), "mesh")
+        meshes = sorted(glob.glob(os.path.join(prev, "*.ply")))
+        meshes = [p for p in meshes
+                  if not os.path.basename(p).startswith("scene")]
+        if meshes:
+            break
+    if not meshes:
+        sys.exit("ERROR: no meshes from stage 4/5 — run those first")
+
+    d = stage_dir(name, 6)
+    df = compute_volumes(meshes, voxel_res=args.voxel_res, auto_res=args.auto_res)
+    lines = [f"STAGE 6 — volume   (from {prev})", ""]
+    if df is not None:
+        df.to_csv(os.path.join(d, "volumes.csv"), index=False)
+        lines.append(df.to_string(index=False))
+    _write_summary(d, lines)
+
+
+RUNNERS = {1: run_stage1, 2: run_stage2, 3: run_stage3,
+           4: run_stage4, 5: run_stage5, 6: run_stage6}
+
+
+def parse_stages(spec):
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        return list(range(int(a), int(b) + 1))
+    return [int(spec)]
+
+
+def main():
+    p = argparse.ArgumentParser(description="Run pipeline stages individually")
+    p.add_argument("stages", help="stage number or range, e.g. 1 or 1-3")
+    p.add_argument("-i", "--image_folder", default="./inputs/small_leg/")
+    p.add_argument("--name", default=None, help="work dir name (default: input folder name)")
+    p.add_argument("--force", action="store_true", help="ignore cached stage 1")
+    p.add_argument("--src", default=None,
+                   help="run name to read the PREVIOUS stage from (default: --name)")
+    p.add_argument("--no-dump", dest="dump", action="store_false", default=True,
+                   help="skip materialising raw stage 1 outputs (images/depth/PLY/cameras)")
+    p.add_argument("--conf_thres", type=float, default=45.0)
+    p.add_argument("--prediction_mode", default="pointmap", choices=["pointmap", "depth"])
+    p.add_argument("--mask_black_bg", action="store_true")
+    p.add_argument("--mask_white_bg", action="store_true")
+    p.add_argument("--num_objects", type=int, default=2)
+    p.add_argument("--max_frames", type=int, default=None)
+    p.add_argument("--preprocess-mode", dest="preprocess_mode", default="crop",
+                   choices=["crop", "pad"],
+                   help="crop (default, centre-crops height) or pad (keeps whole frame)")
+    p.add_argument("--input-res", dest="input_res", type=int, default=518,
+                   help="VGGT input resolution, must be divisible by 14 (518 native, 1022 hi-res)")
+    p.add_argument("--no-fill", action="store_true")
+    p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg")
+    p.add_argument("--segment-height-axis", default="z", choices=["x", "y", "z"])
+    p.add_argument("--recon-method", dest="recon_method", default="alpha_shape")
+    p.add_argument("--box-recon-method", dest="box_recon_method", default=None)
+    p.add_argument("--obj-recon-method", dest="obj_recon_method", default=None)
+    p.add_argument("--voxel-res", dest="voxel_res", type=int, default=150)
+    p.add_argument("--no-auto-res", dest="auto_res", action="store_false")
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
+
+    name = args.name or os.path.basename(os.path.normpath(args.image_folder))
+
+    from pipeline.utils.seeding import seed_everything
+    seed_everything(args.seed)
+
+    for n in parse_stages(args.stages):
+        print()
+        print("=" * 64)
+        print(f"  STAGE {n}  ({STAGE_DIRS[n]})   work/{name}/")
+        print("=" * 64)
+        t0 = time.time()
+        RUNNERS[n](args, name)
+        print(f"\n  stage {n} took {time.time() - t0:.1f}s")
+        # --src redirects only the first stage of a range; once a stage has run
+        # under `name`, later stages must read what it just wrote.
+        args.src = None
+
+
+if __name__ == "__main__":
+    main()

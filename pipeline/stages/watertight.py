@@ -46,6 +46,21 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
             if os.path.exists(p):
                 os.remove(p)
 
+        # Already closed — alpha_shape picks the smallest alpha that yields a
+        # watertight mesh, so the default path arrives here with nothing to do.
+        # Skipping avoids a pointless subprocess and makes the log show when
+        # repair genuinely fires, which is a useful signal that Stage 4 struggled.
+        if verify_watertight(recon_path):
+            shutil.copy2(recon_path, wt_ply)
+            mesh = o3d.io.read_triangle_mesh(wt_ply)
+            mesh.compute_vertex_normals()
+            o3d.io.write_triangle_mesh(wt_stl, mesh)
+            print(f"  {name}: already watertight — repair skipped "
+                  f"({len(mesh.vertices):,} verts, {len(mesh.triangles):,} faces)")
+            watertight_paths.append(wt_ply)
+            meshes.append(mesh)
+            continue
+
         # meshfix_worker.py takes (input, output, color_source).
         # Retry up to 3 times for transient subprocess failures (PyMeshFix
         # C++ side has historically had random "double free" crashes).
@@ -116,7 +131,8 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
           f"{len(scene_colour.faces):,} faces ({cs_size_mb:.1f} MB) "
           f"→ {scene_colour_ply} + {scene_colour_stl}")
 
-    return scene_ply, scene_stl, watertight_paths
+    # scene_colour carries vertex colours; it is what gets published.
+    return scene_colour_ply, scene_stl, watertight_paths
 
 
 def watertight_stage(recon_paths, output_dir):

@@ -36,18 +36,21 @@ Examples:
                    help="Skip watertight repair (export only Poisson reconstruction)")
     p.add_argument("--no-fill", action="store_true",
                    help="Skip bottom cap fill during cleaning")
+    p.add_argument("--use-detection", action="store_true",
+                   help="Use Grounding DINO + SAM for object detection (leg/cube labeling)")
     p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg",
                    help="Disable marker-based leg surface segmentation (enabled by default)")
     p.add_argument("--segment-height-axis", type=str, default="z", choices=["x", "y", "z"],
                    help="Height axis for leg cut (default: z, vertical after leveling)")
-    p.add_argument("--recon-method", type=str, default="poisson",
-                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
-                   help="Reconstruction method for all objects (default: poisson)")
+    recon_choices = ["alpha_shape", "poisson", "poisson_omp1", "box_primitive"]
+    p.add_argument("--recon-method", type=str, default="alpha_shape",
+                   choices=recon_choices,
+                   help="Reconstruction method for non-box objects (default: poisson)")
     p.add_argument("--box-recon-method", type=str, default=None,
-                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
-                   help="Override recon method for box (ArUco) only")
+                   choices=recon_choices,
+                   help="Override recon method for box (ArUco); default box_primitive")
     p.add_argument("--obj-recon-method", type=str, default=None,
-                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
+                   choices=recon_choices,
                    help="Override recon method for object (limb) only")
     p.add_argument("--voxel-res", type=int, default=150, dest="voxel_res",
                    help="Voxel grid resolution for volume (default: 150; ignored when --auto-res)")

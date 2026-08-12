@@ -102,18 +102,44 @@ def get_rotation_to_z_axis(normal):
     return r
 
 
-def relocate_to_origin(pcd):
-    """Moves the point cloud so XY is centered at 0 and Z-min is at 0."""
-    points = np.asarray(pcd.points)
-    if len(points) == 0:
-        return pcd
+def remove_dominant_plane(pcd, min_ratio=0.10, seed=42):
+    """RANSAC the dominant plane and drop its inliers.
 
-    min_bound = pcd.get_min_bound()
-    max_bound = pcd.get_max_bound()
+    Used to detach objects from the floor before clustering — without it DBSCAN
+    links every object through the ground and returns one blob. Coordinate-system
+    agnostic; runs before levelling.
 
-    tx = -(min_bound[0] + max_bound[0]) / 2
-    ty = -(min_bound[1] + max_bound[1]) / 2
-    tz = -min_bound[2]
+    Returns (filtered_pcd, removed_bool).
+    """
+    try:
+        from pipeline.config import PLANE_REMOVAL_BAND_MULT
+        thresh = auto_ransac_threshold(pcd, base_factor=3)
+        model, inliers = detect_plane_ransac_deterministic(
+            pcd, distance_threshold=thresh, num_iterations=1000, seed=seed)
+        ratio = len(inliers) / len(pcd.points)
+        if ratio <= min_ratio:
+            print(f"  Dominant plane too small ({ratio:.1%}), keeping")
+            return pcd, False
 
-    pcd.translate((tx, ty, tz))
-    return pcd
+        # Drop a band around the fitted plane, not just its inliers. VGGT gives
+        # the floor a ghost sheet either side, so the inlier set is the middle
+        # of a sandwich and both skins survive — see PLANE_REMOVAL_BAND_MULT.
+        pts = np.asarray(pcd.points)
+        a, b, c, d = model
+        nrm = np.array([a, b, c], dtype=np.float64)
+        norm = np.linalg.norm(nrm)
+        keep = np.ones(len(pts), dtype=bool)
+        if norm > 1e-9:
+            dist = np.abs((pts @ (nrm / norm)) + d / norm)
+            keep = dist > thresh * PLANE_REMOVAL_BAND_MULT
+        else:
+            keep[inliers] = False
+        inliers = np.where(~keep)[0]
+        ratio = len(inliers) / len(pts)
+        result = pcd.select_by_index(np.where(keep)[0])
+        print(f"  Plane removed: {ratio:.1%} ({len(inliers):,} pts) "
+              f"→ {len(result.points):,} remaining")
+        return result, True
+    except Exception as e:
+        print(f"  Plane removal failed: {e}")
+        return pcd, False

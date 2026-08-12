@@ -8,12 +8,44 @@ import numpy as np
 import torch
 
 from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.load_fn import load_and_preprocess_images, load_and_preprocess_images_square
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.device import is_mps, autocast_on, aggressive_cleanup
 
-from pipeline.config import DEFAULT_MAX_FRAMES_MPS, IMAGE_EXTENSIONS, VGGT_MODEL_URL
+from pipeline.config import (
+    DEFAULT_MAX_FRAMES_MPS,
+    IMAGE_EXTENSIONS,
+    VGGT_COMMERCIAL_FILE,
+    VGGT_COMMERCIAL_REPO,
+    VGGT_MODEL_URL,
+    VGGT_USE_COMMERCIAL,
+)
+
+
+def _load_weights():
+    """Fetch the VGGT state dict, preferring the commercially licensed checkpoint.
+
+    The commercial repo is gated, so this needs an accepted licence plus a token
+    in HF_TOKEN / HUGGINGFACE_HUB_TOKEN (or `huggingface-cli login`). Without one
+    the download fails, and silently continuing on the CC BY-NC-SA checkpoint
+    would hand back a non-commercial model — so the fallback is loud.
+    """
+    if VGGT_USE_COMMERCIAL:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(VGGT_COMMERCIAL_REPO, VGGT_COMMERCIAL_FILE)
+            print(f"  Checkpoint: {VGGT_COMMERCIAL_REPO} (commercial licence)")
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as e:
+            print(f"  WARNING: commercial checkpoint unavailable ({type(e).__name__}: "
+                  f"{str(e)[:120]})")
+            print("  WARNING: falling back to facebook/VGGT-1B — CC BY-NC-SA 4.0, "
+                  "NOT licensed for commercial use.")
+
+    print("  Checkpoint: facebook/VGGT-1B (non-commercial)")
+    return torch.hub.load_state_dict_from_url(VGGT_MODEL_URL, map_location="cpu")
 
 
 def _select_frames(image_names, max_frames):
@@ -26,8 +58,23 @@ def _select_frames(image_names, max_frames):
     return [image_names[i] for i in indices]
 
 
-def run_inference(image_folder, device, max_frames=None):
-    """Load model, run inference, return predictions dict (numpy) and timings."""
+def run_inference(image_folder, device, max_frames=None, preprocess_mode="crop",
+                  input_res=518):
+    """Load model, run inference, return predictions dict (numpy) and timings.
+
+    preprocess_mode:
+        "crop" — width to 518, centre-crop the height. On 9:16 phone photos this
+                 discards ~44% of every frame, which can amputate the subject.
+        "pad"  — fit the whole frame inside 518 and pad. Keeps all content at
+                 lower effective resolution.
+
+    input_res:
+        518 is VGGT's native size. Anything else routes through the square
+        loader (black-padded, so pad-style regardless of preprocess_mode) and
+        must be divisible by 14 — 1022 works, 1024 does not. Token count grows
+        with res², and global attention across frames grows with its square, so
+        1022 costs roughly 15x the attention memory of 518.
+    """
     t0 = time.time()
     print("=" * 60)
     print("STAGE 1: Loading model and running inference")
@@ -44,7 +91,7 @@ def run_inference(image_folder, device, max_frames=None):
 
     print("  Loading VGGT model...")
     model = VGGT()
-    model.load_state_dict(torch.hub.load_state_dict_from_url(VGGT_MODEL_URL, map_location="cpu"))
+    model.load_state_dict(_load_weights())
     model.eval()
     model = model.to(device)
     print(f"  Model loaded in {time.time() - t0:.1f}s")
@@ -62,8 +109,19 @@ def run_inference(image_folder, device, max_frames=None):
     else:
         print(f"  Found {len(image_names)} images")
 
-    images = load_and_preprocess_images(image_names).to(device)
-    print(f"  Preprocessed shape: {images.shape}")
+    if int(input_res) == 518:
+        images = load_and_preprocess_images(image_names, mode=preprocess_mode).to(device)
+        mode_label = preprocess_mode
+    else:
+        if int(input_res) % 14 != 0:
+            print(f"ERROR: input_res {input_res} is not divisible by 14 "
+                  f"(nearest valid: {round(input_res / 14) * 14})")
+            sys.exit(1)
+        images, _coords = load_and_preprocess_images_square(image_names,
+                                                            target_size=int(input_res))
+        images = images.to(device)
+        mode_label = "square/pad"
+    print(f"  Preprocessed shape: {images.shape}  (mode={mode_label}, res={input_res})")
 
     t1 = time.time()
     print("  Running inference...")

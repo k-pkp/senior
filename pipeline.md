@@ -1,317 +1,345 @@
-# VGGT 3D Reconstruction Pipeline
+# VGGT Volume Measurement Pipeline
 
-End-to-end pipeline for reconstructing watertight 3D meshes from multi-view
-images using the VGGT (Visual Geometry Grounded Transformer) model and
-computing real-world volumes via an ArUco scale reference.
-
-## Pipeline Stages
+Measures the real-world volume of an object from a handful of phone photos,
+using an ArUco-marked cube of known size as the scale reference.
 
 ```
-Input Images
-  → [1] Inference
-  → [2] PLY Export
-  → [3] Clean & Extract
-  → [4] Poisson Reconstruction
-  → [5] Watertight Repair
-  → [6] Multi-view Evaluation
-  → [7] Real-world Volume
+Input images
+  → [1] VGGT inference        predictions.npz
+  → [2] Point cloud export    points.ply
+  → [3] Segment & cut         objects/{box, leg_cut}.ply
+  → [4] Surface reconstruct   mesh/*_recon.ply
+  → [5] Watertight check      mesh/*.ply
+  → [6] Real-world volume     volumes.csv
 ```
 
-### Stage 1: Model Inference
-- **File**: `pipeline/stages/inference.py` → `run_inference()`
-- **Model**: VGGT-1B (`facebook/VGGT-1B` from HuggingFace)
-- **Input**: Folder of images (JPG/PNG/BMP/TIFF/WEBP)
-- **Output**: Predictions dict
-  - `world_points` (S, H, W, 3) — direct 3D point regression
-  - `world_points_conf` — per-point confidence
-  - `depth` / `depth_conf` — depth maps and confidence
-  - `extrinsic` / `intrinsic` — camera parameters
-  - `world_points_from_depth` — unprojected depth-based points
-- **Device**: Auto-detects CUDA, MPS, or CPU (`vggt/utils/device.py`)
-- **Frame limit**: Auto-limits to 6 frames on MPS to avoid OOM
+Six stages. Only Stage 1 runs a neural network; everything after is geometry.
 
-### Stage 2: PLY Point Cloud Export
-- **File**: `pipeline/stages/pointcloud.py` → `export_ply()`
-- **Process**:
-  1. Adaptive confidence filter (percentile + distribution-aware absolute threshold)
-  2. Optional background masking (`--mask_black_bg`, `--mask_white_bg`)
-  3. Statistical outlier removal (Open3D, k=20, std_ratio=2.5)
-- **Output**: `output/points.ply` — colored point cloud
+---
 
-### Stage 3: Clean & Extract Objects (+ Optional Leg Segmentation)
-- **File**: `pipeline/stages/clean.py` → `clean_and_extract()`
-- **Helpers**: `pipeline/core/filters.py`, `pipeline/core/plane.py`, `pipeline/core/cluster.py`,
-  `pipeline/core/segmentation.py`
-- **Process**:
-  1. RANSAC-based leveling (ground plane → horizontal)
-  2. Adaptive statistical-outlier removal
-  3. Voxel downsampling if very dense (>100k points)
-  4. Smart laser-cut floor removal (horizontal bottom plane)
-  5. DBSCAN clustering with adaptive epsilon + ArUco-aware box detection
-  6. (Optional) Marker-based leg surface segmentation on `obj.ply`
-     - HSV + Excess Green color detection for markers
-     - DBSCAN spatial clustering of marker points
-     - SVD plane fitting + signed-distance cutting (handles slanted markers)
-- **Output**: `output/clean_objects/box.ply`, `obj.ply`
-  (if `--segment-leg` enabled: `output/segmented/segmented_obj.ply` replaces `obj.ply`)
+## Stage 1 — VGGT inference
 
-### Stage 4: Poisson Reconstruction (non-watertight)
-- **File**: `pipeline/stages/reconstruct.py` → `reconstruct_mesh_stage()`
-  → `workers/recons_methods_worker.py` (subprocess)
-- **Helpers**: `pipeline/core/mesh.py`
-- **Process** (per object):
-  1. Adaptive Poisson depth 7–11 by point count
-  2. Auto-downsample for >300k points
-  3. Adaptive normal estimation
-  4. Density filter (low-density artifact removal)
-  5. Cleanup: degenerate / duplicate triangles, non-manifold edges
-- **Output per object**: `output/mesh/object_N_recon.ply`, `object_N_recon.stl`
-- **Scene merge**: `output/mesh/scene_recon.ply`, `scene_recon.stl`
+**File**: `pipeline/stages/inference.py` → `run_inference()`
 
-### Stage 5: Watertight Repair
-- **File**: `pipeline/stages/watertight.py` → `watertight_stage()`
-  → `workers/meshfix_worker.py` (subprocess)
-- **Process** (per recon mesh):
-  1. **PyMeshFix `MeshFix.fill_holes()`** — closes boundary loops, never deletes faces
-     (shape preserved; retention typically >100% as faces are added)
-  2. **Open3D `TriangleMesh.fill_holes()`** fallback for residual gaps (deterministic earcut)
-  3. **Color transfer** — cKDTree nearest-neighbor from recon mesh vertices
-  4. Subprocess exit codes: `0` watertight, `2` written-not-watertight, `1` hard fail
-  5. Up to **3 retries** on hard fail (transient C++ crash isolation)
-- **Verification**: `trimesh.load(path, process=False)` + `is_watertight`
-  (`process=False` is required — default merge welds intentional PyMeshFix
-  seam duplicates and breaks edge-manifoldness)
-- **Output per object**: `output/mesh/object_N.ply`, `object_N.stl` (watertight)
-- **Scene merge (geometry only)**: `output/mesh/scene.ply`, `scene.stl`
-- **Scene merge (with vertex colors)**: `output/mesh/scene_colour.ply` +
-  `scene_colour.stl` (`trimesh.util.concatenate` of per-object watertight meshes,
-  `process=False` to keep PyMeshFix seam dups intact and preserve per-object
-  watertightness; STL is geometry-only — colors not stored in the format)
-- **Determinism**: PyMeshFix + Open3D `fill_holes` are pure C++ geometric algorithms,
-  no RNG → identical md5 across repeated runs (verified ×3)
+One forward pass of VGGT-1B over all input images, then the model is freed.
+Produces nine arrays:
 
-### Stage 6: Multi-Perspective Evaluation
-- **File**: `pipeline/stages/evaluate.py` → `evaluate_with_viewer()`, `viewer.py`
-- **Process**: Captures **38 screenshots** per output:
-  - 3 elevation rings × 12 azimuths (every 30°) = 36 orbital views
-  - 1 top + 1 bottom view
-- **Renderer**: Open3D `OffscreenRenderer` (EGL headless on Linux)
-- **Output** (`output/evaluation/`):
-  - `pointcloud/` — point cloud (38 views)
-  - `scene/` — merged scene mesh (38 views)
-  - `object_0/`, `object_1/`, … — per-object meshes (38 views each)
+| output | shape | used |
+|---|---|---|
+| `world_points` + `world_points_conf` | (S,518,518,3) | **yes** — the only 3D source |
+| `images` | (S,3,518,518) | yes — colours |
+| `depth` + `depth_conf` | (S,518,518,1) | no |
+| `world_points_from_depth` | (S,518,518,3) | no |
+| `extrinsic` / `intrinsic` / `pose_enc` | (S,3,4) / (S,3,3) / (S,9) | no |
 
-### Stage 7: Real-world Volume (ArUco-referenced)
-- **File**: `pipeline/stages/volume.py` → `compute_volumes()`
-- **Standalone tool**: `volume.py` (root-level CLI for volume-only computation)
-- **Reference**: mesh whose filename contains `box` — ArUco **14 × 14 × 14 cm cube**
-  (configurable via `REFERENCE_REAL_SIZE_CM` in `pipeline/config.py`)
-- **Scale formula**:
-  ```
-  k            = real_ref_vol_cm3 / ref_mesh_vol   # cm³ per mesh-unit³
-  linear_scale = k^(1/3)                           # cm per mesh-unit
-  real_vol_i   = mesh_vol_i * k                    # cm³
-  size_x_cm    = ext_x * linear_scale
-  ```
-- **Volume method priority** (per mesh):
-  1. **watertight** — exact signed volume (`trimesh.Trimesh.volume`)
-  2. **warp + floodfill** — GPU BVH surface marking (`warp-lang`) + scipy flood-fill; ~40× faster than trimesh (requires `warp-lang` and CUDA)
-  3. **trimesh voxel** — CPU ray-cast voxelization fallback
-  4. **convex_hull** — last resort; overestimates concave shapes
-- **Auto-resolution tuning** (default ON): increases voxel resolution from 50→300 in steps of 50 until volume change < 1.5% between steps. Avoids manual `--voxel-res` guessing and OOM at high resolutions.
-- **Mesh prep**: `merge_vertices()` restores shared-index connectivity from STL triangle soup (required for correct watertight detection)
-- **Output columns**: `name`, `size_x_cm`, `size_y_cm`, `size_z_cm`, `real_vol_cm3`, `real_vol_L`, `method`
+### Checkpoint licensing
+
+```python
+VGGT_USE_COMMERCIAL = True                          # pipeline/config.py
+VGGT_COMMERCIAL_REPO = "facebook/VGGT-1B-Commercial"
+```
+
+`facebook/VGGT-1B` is **CC BY-NC-SA 4.0 — non-commercial only**. The commercial
+checkpoint is gated: accept the terms on its model page, then `hf auth login`.
+Without a token the loader falls back **loudly** to the non-commercial weights —
+silently shipping NC weights would be worse than failing.
+
+The commercial licence's Acceptable Use Policy forbids unlicensed medical/health
+professional practice and inferring health data without consent — directly
+relevant to limb measurement — and requires acknowledgement in publications.
+
+### Preprocessing
+
+`--preprocess-mode crop` (default) resizes width to 518 and centre-crops the
+height, discarding ~44% of a 9:16 phone photo. `pad` keeps the whole frame at
+lower effective resolution. Neither wins outright: pad is better on est_325,
+crop on small_leg.
+
+**Input resolution is fixed at 518.** 1022 was tested and is far worse — the
+DINOv2 backbone's positional embeddings are learned for a 37×37 patch grid, so
+larger inputs are out of distribution. More effective resolution can only come
+from making the subject fill more of the frame.
+
+---
+
+## Stage 2 — Point cloud export
+
+**File**: `pipeline/stages/pointcloud.py` → `export_ply()`
+
+1. Adaptive confidence filter — percentile, with a distribution-aware absolute
+   floor for clouds where most points sit at minimum confidence
+2. Optional background masking (`--mask_black_bg`, `--mask_white_bg`)
+3. Statistical outlier removal (k=20, std_ratio=2.5)
+
+**Output**: `points.ply`
+
+`conf_thres=45` is the only threshold that filters floor and object at the same
+rate (57.3% vs 57.6%). Higher values reduce noise but starve the subject — at 90
+the object is kept at half the floor's rate.
+
+---
+
+## Stage 3 — Segment, cut, close
+
+**File**: `pipeline/stages/clean.py` → `clean_and_extract()`
+
+Clusters **once** on the dense cloud, then ghost-filters each identified cluster
+separately. Filtering first would force a second DBSCAN on a ~14× sparser cloud
+and let the two results disagree about which object is the reference, with
+nothing checking them.
+
+**Phase A — segmentation**
+1. SOR, then voxel downsample if >100k points
+2. Remove the dominant plane (`core/plane.py:remove_dominant_plane`) — without
+   it DBSCAN links every object through the floor into one blob
+3. DBSCAN → box / object, identified by cubeness + black-white ratio
+4. Marker detection on the **dense** limb (`core/segmentation.py`) — HSV +
+   Excess Green, DBSCAN, SVD plane fit. Density matters: the dense limb yields
+   ~337 marker points where the filtered one yields ~10
+5. Ghost filter each cluster (`pipeline/ghost.py`) — voxel dedup + normal-aware
+   rejection. The pipeline's dominant decimation step, ~97% of points
+
+**Phase B — levelling**
+RANSAC ground plane → rotation to Z-up, plus an upside-down flip check. The
+combined transform `R_total` is applied to the marker planes too; applying only
+`R` mis-places the cut by ~99 mm whenever the flip fires.
+
+**Phase C — cuts and closure**
+1. Floor cut (below `floor_z + 8 mm`)
+2. Centroid-side marker cut (`core/segmentation.py:apply_marker_cut`) — keeps
+   points on the same signed-distance side as the limb centroid, so 1-marker,
+   2-marker and n-marker cases use one rule in any coordinate frame
+3. **Cut-plane cap** (`core/fill.py:cap_points_on_plane`) — fills the exposed
+   cross-section with a grid built in the marker plane's own (u,v) basis, so it
+   stays coplanar with the cut however the marker is tilted
+4. **Extend to floor** (`core/fill.py:extend_point_cloud_to_floor`) — VGGT does
+   not reconstruct the shadowed base where an object meets the ground, so each
+   cluster floats 1.5–1.9 cm above the floor. The bottom band is swept down to
+   the detected plane *before* capping; capping at the raw `z_min` seals the
+   object above the ground and loses the base permanently
+5. Bottom cap (alpha-shape disc)
+
+**Output**: `objects/{box, leg_cut, leg_no_cut, merged}.ply`,
+`debug/{leg_cluster.ply, cutting_line.json}`
+
+---
+
+## Stage 4 — Surface reconstruction
+
+**File**: `pipeline/stages/reconstruct.py` → `workers/recons_methods_worker.py`
+
+Default **`alpha_shape` for both objects**.
+
+**alpha_shape** is interpolating — the surface passes through the actual points.
+Alpha is swept over `ALPHA_MULTIPLIERS` (8–40 × mean NN distance) and the
+**smallest value producing a watertight mesh** is selected: the tightest
+enclosing surface. Selecting on "first alpha returning any triangles" instead
+picks the smallest alpha and returns a shredded non-manifold shell (−91% volume
+on a known can).
+
+**Why not Poisson** — it fits a smooth *approximating* implicit surface whose
+smoothness prior rounds flat faces and sharp rims inward, losing real volume
+(−8.3% on a 325 ml can where the point cloud itself was within ±3%).
+alpha_shape beat Poisson for the object at every fixed reference method and
+under all four volume-measurement methods.
+
+**Why not a fitted primitive for the box** — `box_primitive` is still available
+but no longer default. It builds a *bounding* prism, so on a ~2 mm-noisy shell
+it sits 4.8 mm outside the points and inflates the reference ~11%. alpha_shape
+sits at median offset 0.000 from the cloud. One method for both objects is also
+easier to defend than a primitive for the reference and a solver for the target.
+
+`ball_pivot` was removed — it produced 5.5×10⁷ cm³ and non-watertight output.
+
+---
+
+## Stage 5 — Watertight check
+
+**File**: `pipeline/stages/watertight.py` → `workers/meshfix_worker.py`
+
+Skipped when the mesh is already closed, which with alpha_shape is always — it
+selects for watertightness by construction. So Stage 5 is **insurance, not a
+processing step**, and the log shows when repair actually fires (a signal that
+Stage 4 struggled).
+
+When it fires: PyMeshFix `fill_holes()`, then Open3D `fill_holes()` for residual
+gaps, then cKDTree colour transfer, with three retries for transient C++ crashes.
+
+Verification uses `trimesh.load(process=False)` deliberately — the default merge
+welds PyMeshFix's intentional seam duplicates and reports a watertight mesh as
+open.
+
+---
+
+## Stage 6 — Real-world volume
+
+**File**: `pipeline/stages/volume.py` → `compute_volumes()`
+
+### Scale from a measured length
+
+```
+linear_scale = REFERENCE_REAL_SIZE_CM / mean(reference OBB edges)
+k            = linear_scale ** 3
+```
+
+Deriving scale as `(real_vol / mesh_vol)^(1/3)` instead uses `mesh_vol^(1/3)` as
+the reference edge, which holds only for a perfect cube — and the cube root
+compounds any deviation three times. At 2.2% off cubic that under-read the edge
+3.1% and inflated every volume ~10%.
+
+Using the edge directly also leaves the reference's own volume **free to
+disagree with nominal**. Under the old scheme the box always printed exactly
+2744 cm³ because it was the denominator; it now reads ~2500 cm³, and that gap is
+a real error bar instead of one forced to zero.
+
+### Volume measurement
+
+1. **watertight** — exact signed volume, no discretisation error
+2. warp + flood-fill (GPU) — leaks through open surfaces
+3. trimesh voxel (CPU)
+4. convex hull — unreliable, ignores the surface entirely
+
+Tiers 2–4 warn loudly. A non-watertight mesh once returned 0.000825 instead of
+0.0119 because the flood fill escaped through a hole.
+
+### Voxel cross-check
+
+Voxel occupancy is computed alongside the exact value. Boundary voxels are
+counted whole, so voxel sits a few percent **above** exact and converges
+downward onto it:
+
+```
+res 150   box +2.96%   can +6.30%
+res 400   box +1.12%   can +2.36%
+```
+
+A voxel result *below* exact, or far above, flags a self-intersecting or
+inverted surface. Thin objects are hit ~2× harder than compact ones — which is
+why voxel is a verifier here, not the primary measurement.
+
+### Dimensions are OBB, not AABB
+
+An axis-aligned box around a tilted object reports its diagonal. The can reads
+5.78 cm across by OBB and 6.09 cm by AABB — a 5.5% error, and volume goes as
+diameter².
+
+---
+
+## Output structure
+
+```
+output/
+  leg_mesh.ply / .stl          the measured object
+  box_mesh.ply / .stl          the ArUco reference
+  scene_mesh.ply / .stl        both merged, vertex colours in the PLY
+  for_debug/
+    01_inference/   predictions.npz, target/
+    02_pointcloud/  points.ply
+    03_clean/       objects/  debug/
+    04_recon/       mesh/
+    05_watertight/  mesh/
+    06_volume/      volumes.csv
+```
+
+The three top-level meshes are the deliverables; everything intermediate stays
+under `for_debug/`. With `--no-watertight` they are published from the Stage 4
+recon instead, so they always exist if a mesh was produced.
+
+---
 
 ## Usage
 
 ```bash
-# Full pipeline (default — watertight ON, evaluation OFF)
-conda run -n vggt python run.py
-
-# Full pipeline + multi-view screenshots
-conda run -n vggt python run.py --evaluate
-
-# Skip watertight repair (keep Poisson recon as final mesh)
-conda run -n vggt python run.py --no-watertight
-
-# Custom input folder
-conda run -n vggt python run.py --image_folder ./my_images/ --evaluate
-
-# PLY only — skip stages 3–7
-conda run -n vggt python run.py --skip_mesh
-
-# Lower confidence threshold (more points retained)
-conda run -n vggt python run.py --conf_thres 30 --evaluate
-
-# Depth-based unprojection instead of pointmap regression
-conda run -n vggt python run.py --prediction_mode depth --evaluate
+python run.py -i inputs/est_325 --no-segment-leg    # rigid object, no marker
+python run.py -i inputs/small_leg                   # limb with marker band
+python run.py -i inputs/est_325 --skip_mesh         # point cloud only
 ```
 
-## CLI Arguments
+### Stage-by-stage runner
 
-CLI parsing lives in `pipeline/cli.py`.
+`stagerun.py` runs stages individually with inspectable output, caching Stage 1
+so parameter sweeps cost nothing:
 
-| Argument | Default | Description |
+```bash
+python3 stagerun.py 1 -i inputs/est_325 --name est_test
+python3 stagerun.py 2-6 --name est_test
+python3 stagerun.py 4-6 --name variant --src est_test --obj-recon-method poisson
+```
+
+`--src` redirects only the first stage of a range. Each stage writes a
+`summary.txt`; Stage 1 also writes `raw/` — every model output as PNG, PLY and
+JSON.
+
+### Flags
+
+| flag | default | note |
 |---|---|---|
-| `--image_folder` | `./baam/` | Input image directory |
-| `--output_dir` | `./output/` | Output directory |
-| `--conf_thres` | `45.0` | Confidence filter percentile (0–100) |
-| `--prediction_mode` | `pointmap` | `pointmap` or `depth` |
-| `--mask_black_bg` | off | Mask dark background pixels |
-| `--mask_white_bg` | off | Mask bright background pixels |
-| `--skip_mesh` | off | Skip stages 3–7, export PLY only |
-| `--num_objects` | `2` | Number of objects to extract |
-| `--max_frames` | auto | Max input frames (auto=6 on MPS) |
-| `--evaluate` | off | Capture multi-perspective screenshots |
-| `--no-watertight` | off | Skip Stage 5; final mesh is Poisson recon only |
-| `--no-segment-leg` | off | Disable marker-based leg segmentation in Stage 3 (enabled by default) |
-| `--segment-height-axis` | `z` | Height axis for leg cut (`x`, `y`, or `z`) |
-| `--voxel-res` | `150` | Voxel grid resolution for Stage 7 volume (ignored when auto-res active) |
-| `--no-auto-res` | off | Fix voxel resolution instead of auto-tuning until convergence |
-| `--seed` | `42` | Seed for `random`, NumPy, PyTorch, Open3D |
+| `-i`, `--image_folder` | `./inputs/baam/` | |
+| `--output_dir` | `./output/` | |
+| `--conf_thres` | 45.0 | see Stage 2 |
+| `--prediction_mode` | `pointmap` | `depth` measured worse on both datasets |
+| `--num_objects` | 2 | |
+| `--max_frames` | auto | 6 on MPS |
+| `--no-fill` | off | skip bottom cap and floor extend |
+| `--no-segment-leg` | off | required for objects with no marker band |
+| `--no-watertight` | off | publish Stage 4 recon as the final meshes |
+| `--recon-method` | `alpha_shape` | also `poisson`, `poisson_omp1`, `box_primitive` |
+| `--box-recon-method` / `--obj-recon-method` | — | per-object override |
+| `--voxel-res` | 150 | cross-check resolution |
+| `--seed` | 42 | |
+| `--preprocess-mode` | `crop` | `stagerun.py` only |
+| `--input-res` | 518 | `stagerun.py` only; must be ÷14 |
 
-## Output Structure
+---
 
-```
-output/
-  points.ply                       # Filtered point cloud (Stage 2)
-  predictions.npz                  # Raw model predictions
-  clean_objects/
-    box.ply / obj.ply                # Cleaned point clouds (Stage 3)
-  segmented/
-    segmented_obj.ply                 # Leg-segmented obj (Stage 3, optional)
-  mesh/
-    object_N_recon.ply / .stl      # Poisson recon (Stage 4, non-watertight)
-    scene_recon.ply / .stl         # Merged recon scene
-    object_N.ply / .stl            # Watertight repair (Stage 5)
-    scene.ply / .stl               # Merged watertight scene (no colors)
-    scene_colour.ply / .stl        # Merged watertight scene (PLY: vertex colors; STL: geometry only)
-  evaluation/                      # Stage 6 (only if --evaluate)
-    pointcloud/                    # 38 views
-    scene/                         # 38 views
-    object_0/, object_1/, …        # 38 views per object
-  target/
-    predictions.npz                # Copy for demo_gradio compatibility
-    images/                        # Copy of input images
-```
+## Known limitations
 
-## Interactive Viewing
+**No second reference — scale cannot be validated.** With one known object the
+cube *defines* scale. Its shape can be checked (footprint edges agree to 0.3%;
+Z/XY reveals floor truncation) but never its absolute size. Closing this needs a
+second object of known dimensions: calibrate on the cube, *predict* the second
+object's size, compare to truth. That prediction error is the accuracy figure
+this project needs and currently cannot produce.
 
-```bash
-# Point cloud
-conda run -n vggt python viewer.py output/points.ply
+**`REFERENCE_REAL_SIZE_CM = 14.0` is unverified.** The cube is handmade. A 2 mm
+build error is 1.4% linear = 4.3% volume on every result.
 
-# Watertight object mesh
-conda run -n vggt python viewer.py output/mesh/object_0.ply
+**Noise floor ~2 mm.** Floor planarity RMS is 1.9–2.3 mm and the can's radial
+shell noise is 2.1 mm — the same magnitude, so this is VGGT's baseline surface
+error, not something downstream adds. Since volume goes as r², a 1σ radius error
+is ±16% volume. Most tuning below that is inside the noise.
 
-# Scene mesh
-conda run -n vggt python viewer.py output/mesh/scene.ply
+**Ground truth ambiguity.** 325 ml is the can's *fill* volume; the pipeline
+measures *external displacement*, which is larger. Every reported percentage
+depends on which is meant.
 
-# Mesh info (vertices, faces, watertight, bounds)
-conda run -n vggt python viewer.py output/mesh/object_0.ply --info
+---
 
-# Multi-view screenshots
-conda run -n vggt python viewer.py output/mesh/object_0.ply --multi-view --screenshot my_views/
-```
-
-## Determinism
-
-All stages run with the seed from `--seed` (default `42`), applied in
-`pipeline/utils/seeding.py`:
-
-- `random`, `numpy.random`, `torch.manual_seed`, `torch.cuda.manual_seed_all`,
-  `open3d.utility.random.seed` are all set
-- `viewer.py` uses an internal `np.random.default_rng(42)` for any subsampling
-- Stage 5 PyMeshFix + Open3D `fill_holes` have no RNG; identical input bytes
-  produce byte-identical output (verified by md5 across 3 sequential runs)
-
-Reproducibility check (Stage 5 only, recon meshes already on disk):
-
-```bash
-for i in 1 2 3; do
-  conda run -n vggt python -c "
-from pipeline.stages.watertight import watertight_stage
-watertight_stage(['output/mesh/object_0_recon.ply',
-                  'output/mesh/object_1_recon.ply'],
-                 output_dir=f'/tmp/wt_run$i')"
-done
-md5sum /tmp/wt_run{1,2,3}/mesh/object_0.ply
-md5sum /tmp/wt_run{1,2,3}/mesh/object_1.ply
-```
-
-## Dependencies
-
-Core:
-- `torch` ≥ 2.5.1, `torchvision` ≥ 0.20.1
-- `numpy`, `open3d`, `trimesh`, `scipy`, `pandas`, `opencv-python`, `networkx`,
-  `matplotlib`, `Pillow`
-
-Watertight repair:
-- `pymeshfix` (≥ 0.18) — boundary hole filling
-- `open3d` ≥ 0.19 — `t.geometry.TriangleMesh.fill_holes` fallback
-
-Volume (Stage 7):
-- `warp-lang` ≥ 1.3.0 — optional GPU voxelization (~40× faster than trimesh; requires CUDA). Falls back to trimesh CPU voxelization if unavailable.
-
-## Project Layout
+## Layout
 
 ```
-run.py                            # Entry point — calls pipeline.orchestrator.main()
-viewer.py                         # 3D viewer + multi-perspective screenshot capture
-requirements.txt
+run.py                    entry point
+stagerun.py               stage-by-stage runner with per-stage diagnostics
+viewer.py                 PLY/STL viewer
+volume.py                 standalone volume CLI
 pipeline/
-  orchestrator.py                 # Drives Stages 1–7 end to end
-  cli.py                          # argparse definitions
-  config.py                       # Constants (image exts, ArUco reference size, etc.)
-  utils/
-    seeding.py                    # seed_everything()
-  core/                           # Shared geometry primitives
-    filters.py                    # Confidence + spatial filters
-    plane.py                      # Deterministic RANSAC plane detection
-    cluster.py                    # DBSCAN clustering + ArUco-aware ranking
-    mesh.py                       # Mesh utilities for recon/watertight stages
-    segmentation.py               # Marker-based leg surface segmentation
-  stages/                         # One module per pipeline stage
-    inference.py                  # Stage 1
-    pointcloud.py                 # Stage 2
-    clean.py                      # Stage 3 (clean + extract + optional seg)
-    reconstruct.py                # Stage 4 driver
-    watertight.py                 # Stage 5 driver
-    evaluate.py                   # Stage 6
-    volume.py                     # Stage 7
-workers/                          # Subprocess workers (isolate native crashes)
-  recons_methods_worker.py        # Reconstruction worker — Poisson/BallPivot/AlphaShape (Stage 4)
-  meshfix_worker.py               # PyMeshFix + Open3D fill_holes worker (Stage 5)
-volume.py                         # Standalone volume CLI (root-level, uses Stage 7 logic)
-vggt/                             # VGGT model + utilities
-  dependency/  heads/  layers/  models/  utils/
-inputs/                           # Sample input image sets
-output/                           # Pipeline artifacts (see Output Structure)
+  orchestrator.py         drives stages 1-6, publishes final meshes
+  cli.py  config.py
+  ghost.py                voxel dedup + normal-aware filter
+  detection.py            Grounding DINO + SAM (available, not wired into scale)
+  stages/                 inference pointcloud clean reconstruct watertight volume
+  core/                   plane cluster segmentation fill filters mesh
+  utils/                  seeding runlog
+workers/
+  recons_methods_worker.py   reconstruction subprocess
+  meshfix_worker.py          PyMeshFix subprocess
+tools/com_vol.py          standalone mesh-vs-reference volume tool
+docs/
+  experiments.md          every test, result and verdict
+  prompt.md               website design brief
+  update.md               historical snapshot (superseded)
+work/                     stagerun outputs, one folder per stage's experiments
 ```
 
-## Key Files
-
-| File | Purpose |
-|---|---|
-| `run.py` | Entry point — delegates to `pipeline.orchestrator.main()` |
-| `viewer.py` | 3D viewer + multi-perspective screenshot capture |
-| `pipeline/orchestrator.py` | End-to-end pipeline driver (Stages 1–7) |
-| `pipeline/cli.py` | CLI argument parser |
-| `pipeline/config.py` | Pipeline-wide constants |
-| `pipeline/stages/inference.py` | Stage 1 — VGGT model inference |
-| `pipeline/stages/pointcloud.py` | Stage 2 — PLY export with adaptive filtering |
-| `pipeline/stages/clean.py` | Stage 3 — Point cloud cleaning + object extraction + optional leg segmentation |
-| `pipeline/core/segmentation.py` | HSV+ExG marker detection + SVD plane cutting |
-| `pipeline/stages/reconstruct.py` | Stage 4 — Poisson reconstruction driver |
-| `pipeline/stages/watertight.py` | Stage 5 — Watertight repair driver |
-| `pipeline/stages/evaluate.py` | Stage 6 — Multi-view screenshot capture |
-| `pipeline/stages/volume.py` | Stage 7 — ArUco-referenced real-world volumes |
-| `pipeline/core/filters.py` | Confidence + spatial point cloud filters |
-| `pipeline/core/plane.py` | Deterministic RANSAC plane removal |
-| `pipeline/core/cluster.py` | DBSCAN clustering + ArUco-aware object ranking |
-| `pipeline/core/mesh.py` | Mesh-level utilities (cleanup, scene merge) |
-| `pipeline/utils/seeding.py` | `seed_everything()` for full reproducibility |
-| `workers/recons_methods_worker.py` | Subprocess worker — Poisson/BallPivot/AlphaShape reconstruction |
-| `workers/meshfix_worker.py` | Subprocess worker — PyMeshFix + Open3D fill_holes |
-| `tools/com_vol.py` | Standalone CLI for real-world volume computation |
-| `vggt/` | VGGT model + utilities |
+Determinism: `--seed` seeds `random`, NumPy, PyTorch and Open3D. Stage 3 is
+reproducible bit-for-bit; PyMeshFix and Open3D `fill_holes` have no RNG.

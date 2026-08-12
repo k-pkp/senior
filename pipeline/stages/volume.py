@@ -1,16 +1,28 @@
-"""Stage 7 — Compute real-world volumes using the ArUco reference (box).
+"""Stage 6 — Compute real-world volumes using the ArUco reference (box).
 
-Scale derivation:
-    k            = real_ref_vol_cm3 / ref_mesh_vol          # cm³ per mesh-unit³
-    linear_scale = k ** (1/3)                               # cm per mesh-unit
+Scale derivation (from a measured LENGTH, not a volume ratio):
+    linear_scale = REFERENCE_REAL_SIZE_CM / mean(ref OBB edges)   # cm per unit
+    k            = linear_scale ** 3                              # cm³ per unit³
     real_vol     = mesh_vol * k
-    ext_cm       = mesh_extents * linear_scale
+    size_cm      = mesh OBB extents * linear_scale
+
+Deriving scale as (real_vol / mesh_vol)^(1/3) instead uses mesh_vol^(1/3) as the
+reference edge, which only holds for a perfect cube; the cube root compounds any
+deviation three times. At 2.2% off cubic that under-read the edge by 3.1% and
+inflated every volume ~10%. Using the edge directly also leaves the reference's
+own volume free to disagree with nominal — that gap is a real error bar rather
+than something forced to zero.
 
 Volume method priority (per mesh):
-    1. watertight        — exact signed volume
-    2. warp+floodfill    — GPU BVH surface mark + CPU flood-fill (~40x faster than trimesh)
+    1. watertight        — exact signed volume, no discretisation error
+    2. warp+floodfill    — GPU BVH surface mark + CPU flood-fill (leaks on open meshes)
     3. trimesh voxel     — CPU fallback
-    4. convex_hull       — last resort, overestimates concave shapes
+    4. convex_hull       — unreliable; ignores the surface entirely
+
+Voxel occupancy is also computed alongside the exact value as an independent
+cross-check. It over-reads by a few percent (boundary voxels counted whole) and
+converges downward onto exact; a result below exact indicates a self-intersecting
+or inverted surface.
 
 The reference is a 14 × 14 × 14 cm ArUco cube identified by 'box' in its filename.
 """
@@ -160,6 +172,13 @@ def _measure_volume(mesh: trimesh.Trimesh,
     if mesh.is_watertight:
         return float(abs(mesh.volume)), "watertight"
 
+    # Not closed: everything below is an approximation, and flood-fill in
+    # particular leaks through holes and can under-read by an order of
+    # magnitude while still returning a plausible-looking number.
+    print("  WARNING: mesh is NOT watertight — falling back to voxel "
+          "approximation. Flood fill leaks through open surfaces; treat this "
+          "volume as unreliable.")
+
     if _WARP_AVAILABLE:
         try:
             if auto_res:
@@ -186,7 +205,10 @@ def _measure_volume(mesh: trimesh.Trimesh,
         print(f"  [warn] trimesh voxel failed: {e}")
 
     try:
-        return _volume_convex_hull(mesh), "convex_hull (fallback — overestimates concave)"
+        print("  WARNING: convex hull fallback — ignores the surface entirely and "
+              "only uses vertex positions. A broken mesh scores the same as a good "
+              "one. Do not report this as a measurement.")
+        return _volume_convex_hull(mesh), "convex_hull (UNRELIABLE)"
     except Exception as e:
         print(f"  [ERROR] all volume methods failed: {e}")
         return 0.0, "failed"
@@ -212,18 +234,59 @@ def _load_mesh_info(path: str, voxel_res: int, auto_res: bool = False) -> dict |
         return None
 
     mesh.merge_vertices()
-    extents        = mesh.bounds[1] - mesh.bounds[0]
     volume, method = _measure_volume(mesh, voxel_res, auto_res=auto_res)
+
+    # Oriented extents, not axis-aligned. An AABB around a yaw-rotated object
+    # reports its diagonal, not its size — the can measures 6.09 cm wide by
+    # AABB and 5.75 cm by OBB, and the cube 14.95 vs 14.0.
+    # Keep the OBB extents ordered by ORIENTATION, not magnitude: index 0 is the
+    # axis most aligned with world up. Stage 3 levels the scene, so that axis is
+    # the one the floor truncates — identifying it by geometry beats guessing
+    # from which edges happen to agree, which picks the wrong edge whenever two
+    # are short in the same direction.
+    _ob = mesh.bounding_box_oriented
+    _ext = np.asarray(_ob.primitive.extents, dtype=float)
+    _R = np.asarray(_ob.primitive.transform)[:3, :3]
+    _align = [abs(float(np.dot(_R[:, i] / (np.linalg.norm(_R[:, i]) + 1e-12),
+                               np.array([0.0, 0.0, 1.0])))) for i in range(3)]
+    _vi = int(np.argmax(_align))
+    _hi = [i for i in range(3) if i != _vi]
+    obb = np.array([_ext[_vi], _ext[_hi[0]], _ext[_hi[1]]])  # [vertical, horiz, horiz]
+
+    # Euler number is the decisive integrity check. A closed surface with
+    # tunnels bounds a region perfectly well, so is_watertight passes and the
+    # volume integral correctly subtracts the tunnels — the mesh looks right
+    # from outside while reporting far too little volume. Only 2 means a simple
+    # closed surface.
+    euler = int(mesh.euler_number)
+    if euler != 2:
+        print(f"  WARNING: {os.path.basename(path)} has euler number {euler} "
+              f"(expected 2) — the surface has tunnels or cavities and its "
+              f"volume is NOT reliable.")
+
+    # Independent cross-check: voxel occupancy of the same mesh. It over-reads
+    # by a predictable few percent (boundary voxels counted whole) and converges
+    # down onto the exact value. A voxel result *below* exact, or wildly above,
+    # means the surface is self-intersecting or wrongly wound.
+    voxel_check = None
+    if method == "watertight":
+        try:
+            v = (_volume_voxel_warp(mesh, voxel_res) if _WARP_AVAILABLE
+                 else _volume_voxel(mesh, voxel_res))
+            voxel_check = float(v)
+        except Exception:
+            pass
 
     return {
         "name":     os.path.basename(path),
         "is_ref":   _is_ref_mesh(path),
         "volume":   volume,
         "method":   method,
-        "ext_x":    float(extents[0]),
-        "ext_y":    float(extents[1]),
-        "ext_z":    float(extents[2]),
-        "bbox_vol": float(extents[0] * extents[1] * extents[2]),
+        "obb_a":    float(obb[0]),
+        "obb_b":    float(obb[1]),
+        "obb_c":    float(obb[2]),
+        "voxel":    voxel_check,
+        "euler":    euler,
     }
 
 
@@ -238,7 +301,7 @@ def compute_volumes(object_mesh_paths: list[str],
     res_label = "auto" if auto_res else str(voxel_res)
     print()
     print("=" * 60)
-    print(f"STAGE 7: real-world volumes  "
+    print(f"STAGE 6: real-world volumes  "
           f"(ref = {REFERENCE_REAL_SIZE_CM} cm ArUco cube  |  voxel_res={res_label})")
     print("=" * 60)
 
@@ -250,9 +313,23 @@ def compute_volumes(object_mesh_paths: list[str],
 
     df = pd.DataFrame(rows)
 
-    raw_cols = ["name", "method", "volume", "bbox_vol", "ext_x", "ext_y", "ext_z"]
-    print("\n  Raw mesh measurements (mesh units):")
+    raw_cols = ["name", "method", "euler", "volume", "obb_a", "obb_b", "obb_c"]
+    print("\n  Raw mesh measurements (mesh units; obb_a = vertical axis, "
+          "obb_b/c horizontal):")
     print(df[raw_cols].to_string(index=False))
+
+    # Voxel occupancy cross-check. Discretisation counts boundary voxels whole,
+    # so voxel should sit a few percent ABOVE exact and converge down onto it.
+    # Below exact, or far above, means a self-intersecting or inverted surface.
+    if df["voxel"].notna().any():
+        print("\n  Voxel cross-check (independent; expect +1..8% over exact):")
+        for _, r in df.iterrows():
+            if r["voxel"] is None or not np.isfinite(r["voxel"]) or r["volume"] <= 0:
+                continue
+            dev = (r["voxel"] - r["volume"]) / r["volume"] * 100
+            flag = "" if 0 <= dev <= 15 else "   <-- SUSPECT: mesh may be self-intersecting"
+            print(f"    {r['name']:<16} exact {r['volume']:.6f}  "
+                  f"voxel {r['voxel']:.6f}  {dev:+.2f}%{flag}")
 
     ref_rows = df[df["is_ref"]]
     if ref_rows.empty:
@@ -264,25 +341,58 @@ def compute_volumes(object_mesh_paths: list[str],
         print(f"\n  Reference mesh '{ref['name']}' has zero volume. Aborting.")
         return
 
-    real_ref_vol = REFERENCE_REAL_SIZE_CM ** 3
-    k            = real_ref_vol / ref["volume"]
-    linear_scale = k ** (1.0 / 3.0)
+    # Scale from a measured LENGTH, not a volume ratio.
+    #
+    # The old route was linear_scale = (real_vol / mesh_vol)^(1/3), which uses
+    # mesh_vol^(1/3) as the reference's edge — only valid if the mesh is a
+    # perfect cube. Any deviation from cubic is compounded three times by the
+    # cube root: at 2.2% off cubic the edge came out 3.1% short and inflated
+    # every reported volume by ~10%.
+    #
+    # Scale comes from the two HORIZONTAL edges. obb_a is the vertical one (see
+    # _load_mesh_info) and is the axis the floor truncates, so it is excluded
+    # rather than averaged in — including it drags the estimate small and
+    # inflates every downstream volume.
+    #
+    # The two horizontal edges are then independent measurements of the same
+    # physical 14 cm length, and how far they disagree is a genuine error bar.
+    ref_v = float(ref["obb_a"])                       # vertical
+    ref_h = np.array([ref["obb_b"], ref["obb_c"]], dtype=float)
+    ref_edge = float(ref_h.mean())
+    h_disagree = float(abs(ref_h[0] - ref_h[1]) / ref_edge * 100)
+    v_deficit = (ref_edge - ref_v) / ref_edge * 100
 
-    print(f"\n  Scale factor:")
-    print(f"    ref mesh vol  = {ref['volume']:.6f} mesh-units³")
-    print(f"    real ref vol  = {REFERENCE_REAL_SIZE_CM}³ = {real_ref_vol:.2f} cm³")
-    print(f"    k             = {real_ref_vol:.2f} / {ref['volume']:.6f} = {k:.6f} cm³/unit³")
-    print(f"    linear_scale  = k^(1/3) = {linear_scale:.6f} cm/unit")
+    linear_scale = REFERENCE_REAL_SIZE_CM / ref_edge
+    k = linear_scale ** 3
+
+    print(f"\n  Scale factor (from the reference's two horizontal edges):")
+    print(f"    horizontal    = {ref_h[0]:.4f}, {ref_h[1]:.4f} units "
+          f"— disagree by {h_disagree:.2f}%")
+    print(f"    vertical      = {ref_v:.4f} units ({ref_v * REFERENCE_REAL_SIZE_CM / ref_edge:.2f} cm "
+          f"of an expected {REFERENCE_REAL_SIZE_CM:.2f}), {v_deficit:+.2f}% short")
+    print(f"    ref edge      = {ref_edge:.6f} units  (vertical excluded — it is "
+          f"the axis the floor truncates)")
+    print(f"    linear_scale  = {REFERENCE_REAL_SIZE_CM} / {ref_edge:.6f} "
+          f"= {linear_scale:.6f} cm/unit")
+    print(f"    k             = linear_scale³ = {k:.2f} cm³/unit³")
+    print(f"    residual height deficit = {(ref_edge - ref_v) * linear_scale:.2f} cm "
+          f"— what Stage 3's floor extend did not recover")
+    if h_disagree > 3:
+        print(f"    WARNING: the two horizontal edges differ by {h_disagree:.1f}% "
+              f"— scale is poorly constrained")
 
     df["real_vol_cm3"] = df["volume"] * k
     df["real_vol_L"]   = df["real_vol_cm3"] / 1000.0
-    df["size_x_cm"]    = df["ext_x"] * linear_scale
-    df["size_y_cm"]    = df["ext_y"] * linear_scale
-    df["size_z_cm"]    = df["ext_z"] * linear_scale
+    df["height_cm"]    = df["obb_a"] * linear_scale   # vertical axis
+    df["width_cm"]     = df["obb_b"] * linear_scale
+    df["depth_cm"]     = df["obb_c"] * linear_scale
 
-    result_cols = ["name", "size_x_cm", "size_y_cm", "size_z_cm",
+    result_cols = ["name", "height_cm", "width_cm", "depth_cm",
                    "real_vol_cm3", "real_vol_L", "method"]
-    print("\n  Real-world dimensions and volumes:")
+    print("\n  Real-world dimensions (OBB) and volumes:")
     print(df[result_cols].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+    print(f"\n  Reference now reads {df[df['is_ref']].iloc[0]['real_vol_cm3']:.1f} cm³ "
+          f"vs {REFERENCE_REAL_SIZE_CM**3:.0f} cm³ nominal — the gap is the "
+          f"reference's own reconstruction error, no longer forced to zero.")
 
     return df

@@ -277,9 +277,25 @@ def _load_mesh_info(path: str, voxel_res: int, auto_res: bool = False) -> dict |
         except Exception:
             pass
 
+    # For the reference only, measure its edges from its own faces. An oriented
+    # bounding box was found to be mis-rotated by ~1.3 degrees on this cube,
+    # which inflates every edge by 2.2% and therefore under-reads every volume
+    # by ~6%. See pipeline/core/faces.py.
+    face_v, face_h = None, []
+    if _is_ref_mesh(path):
+        try:
+            from pipeline.core.faces import reference_edges
+            face_v, face_h, _d = reference_edges(
+                np.asarray(mesh.vertices), np.asarray(mesh.faces))
+        except Exception as e:
+            print(f"  face fit failed on {os.path.basename(path)} "
+                  f"({type(e).__name__}) — falling back to the bounding box")
+
     return {
         "name":     os.path.basename(path),
         "is_ref":   _is_ref_mesh(path),
+        "face_v":   face_v,
+        "face_h":   face_h,
         "volume":   volume,
         "method":   method,
         "obb_a":    float(obb[0]),
@@ -356,8 +372,24 @@ def compute_volumes(object_mesh_paths: list[str],
     #
     # The two horizontal edges are then independent measurements of the same
     # physical 14 cm length, and how far they disagree is a genuine error bar.
-    ref_v = float(ref["obb_a"])                       # vertical
-    ref_h = np.array([ref["obb_b"], ref["obb_c"]], dtype=float)
+    #
+    # The edges come from fitting the cube's own FACES, not from a bounding box.
+    # An OBB has to guess the orientation, and on this reference it guessed
+    # ~1.3 degrees wrong — enough to enclose 6.8% more volume than the convex
+    # hull of the same points. Spread over three axes that is +2.2% per edge,
+    # which under-reads every volume by ~6%. A cube's face normals *are* its
+    # axes, so fitting them removes that error by construction.
+    face_h = list(ref.get("face_h") or [])
+    face_v = ref.get("face_v")
+    if len(face_h) >= 2:
+        ref_h = np.array(sorted(face_h)[-2:], dtype=float)
+        ref_v = float(face_v) if face_v else float(ref["obb_a"])
+        edge_src = "fitted faces"
+    else:
+        ref_h = np.array([ref["obb_b"], ref["obb_c"]], dtype=float)
+        ref_v = float(ref["obb_a"])
+        edge_src = ("bounding box — FACE FIT UNAVAILABLE, expect the scale to "
+                    "run ~2% small")
     ref_edge = float(ref_h.mean())
     h_disagree = float(abs(ref_h[0] - ref_h[1]) / ref_edge * 100)
     v_deficit = (ref_edge - ref_v) / ref_edge * 100
@@ -365,7 +397,8 @@ def compute_volumes(object_mesh_paths: list[str],
     linear_scale = REFERENCE_REAL_SIZE_CM / ref_edge
     k = linear_scale ** 3
 
-    print(f"\n  Scale factor (from the reference's two horizontal edges):")
+    print(f"\n  Scale factor (from the reference's two horizontal edges, "
+          f"{edge_src}):")
     print(f"    horizontal    = {ref_h[0]:.4f}, {ref_h[1]:.4f} units "
           f"— disagree by {h_disagree:.2f}%")
     print(f"    vertical      = {ref_v:.4f} units ({ref_v * REFERENCE_REAL_SIZE_CM / ref_edge:.2f} cm "
@@ -381,11 +414,41 @@ def compute_volumes(object_mesh_paths: list[str],
         print(f"    WARNING: the two horizontal edges differ by {h_disagree:.1f}% "
               f"— scale is poorly constrained")
 
+    # Squareness self-check. The cube's three edges are three measurements of
+    # one physical length, so as shares of their sum they should each be
+    # 33.33%. Deviation is scale-free — it needs no ground truth and it is the
+    # only signal available that the reference reconstructed badly before its
+    # edge silently sets the scale for everything.
+    #
+    # It cannot see a COMMON-MODE error: inflate all three edges equally and the
+    # shares do not move. That is a real limitation, not an oversight — it is
+    # why the edge measurement itself had to be fixed rather than reweighted.
+    edges = np.array([ref_v, ref_h[0], ref_h[1]], dtype=float)
+    if np.all(np.isfinite(edges)) and edges.sum() > 0:
+        share = edges / edges.sum() * 100.0
+        dev = share - 100.0 / 3.0
+        print(f"    squareness    = shares {share[0]:.2f} / {share[1]:.2f} / "
+              f"{share[2]:.2f}%  (33.33 each if perfectly cubic)")
+        print(f"                    deviation {dev[0]:+.2f} / {dev[1]:+.2f} / "
+              f"{dev[2]:+.2f} pp  — vertical is expected low, the floor "
+              f"truncates it")
+        if abs(dev[1]) > 2.0 or abs(dev[2]) > 2.0:
+            print(f"    WARNING: a horizontal edge deviates by more than 2 pp "
+                  f"from cubic — the reference reconstructed poorly and its "
+                  f"edge should not be trusted as the scale")
+
     df["real_vol_cm3"] = df["volume"] * k
     df["real_vol_L"]   = df["real_vol_cm3"] / 1000.0
     df["height_cm"]    = df["obb_a"] * linear_scale   # vertical axis
     df["width_cm"]     = df["obb_b"] * linear_scale
     df["depth_cm"]     = df["obb_c"] * linear_scale
+
+    # face_h is a LIST, and pandas writes it as a quoted field containing a
+    # comma. Every consumer of this file splits on commas without honouring
+    # quotes (see web/src/lib/data.ts, "volumes.csv has no quoted fields"), so
+    # leaving it in shifts every column after it — the web app read the
+    # reference volume as "2". These two are working values, not results.
+    df = df.drop(columns=[c for c in ("face_v", "face_h") if c in df.columns])
 
     result_cols = ["name", "height_cm", "width_cm", "depth_cm",
                    "real_vol_cm3", "real_vol_L", "method"]

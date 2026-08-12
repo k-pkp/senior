@@ -100,8 +100,8 @@ What you should see at the end:
 
 ```
        name  height_cm  width_cm  depth_cm  real_vol_cm3     method
-    box.ply      13.37     13.81     14.19       2345.55 watertight
-leg_cut.ply      31.03      7.54     15.78        851.28 watertight
+    box.ply      13.97     14.33     14.54       2694.24 watertight
+leg_cut.ply      32.83      8.13     16.55       1075.04 watertight
 ```
 
 Both meshes should report `watertight` with `euler 2`. If either says
@@ -269,13 +269,15 @@ reporting any figure. In short:
   the *vertical* edge, and the *volume* carry information.
 - **`REFERENCE_REAL_SIZE_CM = 14.0` has never been measured.** The cube is
   handmade cardboard; a 2 mm build error is 1.4% linear = **4.3% volume** on
-  every result.
-- **Scale cannot be validated with one reference.** The cube's *volume* is now
-  free to disagree with nominal — currently **2346 vs 2744 cm³, −14.5%** — but
-  turning that into an accuracy figure needs a **second object of known size**.
-- **The noise floor is ±16% volume.** Surface localisation error is ~2 mm, and
-  volume goes as r². Most parameter tuning lives below that threshold, so
-  single-run deltas smaller than ~16% cannot be judged.
+  every result — which is now *larger than the error the pipeline still has*.
+- **Scale cannot be validated with one reference.** The cube's *volume* is free
+  to disagree with nominal — currently **2694 vs 2744 cm³, −1.8%** (leg scene)
+  and **2644 vs 2744, −3.7%** (can scene) — but turning that into an accuracy
+  figure needs a **second object of known size**.
+- **The noise floor is ~1–2% volume**, measured as local surface thickness on
+  the current pipeline (0.29 mm shell on a 3.94 cm radius limb). An earlier
+  ±16% figure quoted here came from a pre-rework measurement using a metric that
+  mixed shape error into the noise; it was wrong and is withdrawn.
 - **No ground truth exists for any measured object.** The can's "325 ml" is its
   *fill* volume, not external displacement — different quantities.
 
@@ -297,7 +299,7 @@ pipeline/
   mls.py            moving-least-squares surface projection
   multiview.py      multi-view consistency (disabled — documented failure)
   detection.py      Grounding DINO + SAM seed detection
-  core/             plane, cluster, fill, filters, mesh, segmentation
+  core/             plane, cluster, faces, fill, filters, mesh, segmentation
   stages/           inference, pointcloud, clean, reconstruct, watertight, volume
 
 workers/          recons_methods_worker.py, meshfix_worker.py

@@ -36,7 +36,26 @@ measurement (two footprint edges agreeing to 0.23%).
 
 ## Known noise floor
 
-Point-shell radial noise on the can: std **0.214 cm** on a 2.62 cm radius.
+> **CORRECTED 2026-08-12.** The ±16% figure below was measured on the *can*,
+> on the *pre-rework* pipeline, before MLS existed, using radial spread about a
+> fitted cylinder — a metric that includes shape error as well as noise. It was
+> then quoted for years as the current floor, including in `stage06_experiments.md`
+> and the README, where it was load-bearing for the claim that the reference's
+> error "cannot be distinguished from noise". That claim was wrong.
+>
+> Re-measured on the current pipeline as local surface thickness (std of
+> distance to a plane fitted through each point's 30 nearest neighbours):
+>
+> ```
+> audit_leg   shell 0.29 mm on r = 3.94 cm  ->  volume floor ~1.5%
+> audit_can   shell 0.15 mm on r = 2.66 cm  ->  volume floor ~1.1%
+> ```
+>
+> The real floor is **~1–2% volume**, not 16%. Errors of a few percent ARE
+> measurable and worth chasing. See `stage06_experiments.md`.
+
+Historic figure, kept for provenance — point-shell radial noise on the can: std
+**0.214 cm** on a 2.62 cm radius.
 Since volume goes as r², that is **±16% volume**. Any change moving the result
 by less than that is inside the noise and cannot be judged on one dataset.
 

@@ -102,6 +102,7 @@ datasets/
 work/
 compare_recon/
 compare_ghost/
+temp_output_compare_recon/
 *.zip
 
 

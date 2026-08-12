@@ -677,6 +677,49 @@ Stage 4 struggled, and the result deserves suspicion.
 
 Renumbered from Stage 7.
 
+### 6.0 The reference's edge comes from FITTED FACES, not a bounding box
+
+**The largest accuracy change in Stage 6.** `pipeline/core/faces.py` (new).
+
+An oriented bounding box has to guess the object's orientation. On the reference
+cube it guessed ~1.3 degrees wrong — enough to enclose **6.8% more volume than
+the convex hull of the same points**. An OBB must *contain* the hull, so that
+excess is pure fitting error:
+
+```
+face-to-face box       2505.7 cm3    the cube's real size
+convex hull of points  2479.2 cm3    -1.1%
+oriented bounding box  2647.8 cm3    +5.7%
+```
+
+Both libraries fail: Open3D's `get_oriented_bounding_box` returned **2.1x the
+AABB volume** on this cloud, trimesh's +5.7%. Spread over three axes that is
++2.2% per edge, and since `linear_scale = 14.0 / edge`, it under-read every
+volume by ~6%.
+
+A cube does not need a bounding box — its face normals *are* its axes. The new
+module clusters mesh triangles by normal (area-weighted, so the many tiny corner
+triangles cannot outvote a real face), pairs opposite faces, and measures their
+separation **through the mesh centroid** — because opposite faces splay by about
+a degree, and differencing plane offsets instead measures the gap extrapolated
+away from the object (0.265 units against a true 0.252). Verified exact on a
+synthetic cube rotated 30/20 degrees.
+
+| | before | after |
+|---|---|---|
+| cube, leg scene | 2460.1 cm3 (-10.3%) | **2694.2 cm3 (-1.8%)** |
+| cube, can scene | 2449.9 cm3 (-10.7%) | **2643.6 cm3 (-3.7%)** |
+| horizontal edges agree to | 2.68% / 1.46% | **0.79% / 1.14%** |
+
+Falls back to the OBB with an explicit warning below two face pairs. Reference
+only — meaningless for a limb.
+
+A **squareness gate** was added alongside: the three edges as shares of their sum
+should be 33.33% each, and a horizontal deviating more than 2 pp now warns. It is
+scale-free and needs no ground truth. It is deliberately *not* used as a
+correction — normalising to 100% makes common-mode error invisible, which is the
+exact defect above.
+
 ### 6.1 Scale derivation — the important maths
 
 `main` derived scale from a **volume ratio**:
@@ -768,6 +811,28 @@ leg_cut.ply  exact 0.003746  voxel 0.004078  +8.84%
 - χ ≠ 2 → explicit warning that the volume is not reliable.
 
 ---
+
+## 6.6 Other fixes found by auditing
+
+**`clean_merged_scene()` tore closed meshes open.** It called
+`remove_non_manifold_edges()` unguarded — the same function already guarded in
+Stage 4's `_post_process`. Now snapshots and reverts if the mesh was closed
+before and is not after.
+
+**`stagerun.py` fed the scene mesh back into Stage 5.** Its glob was
+`*_recon.ply`, which matched `scene_recon.ply` — already the merge of both
+objects — so every object was merged twice. Coincident duplicate geometry turned
+two closed surfaces into **7,554 fragments, euler 3113**. `orchestrator.py`
+always passed `recon_mesh_paths` and excluded it, so `run.py` was never affected;
+only the experiment harness was. The broken mesh did reach
+`web/public/samples/small_leg/scene_mesh.ply` and has been regenerated.
+
+**`MAX_RECON_POINTS = 90000`** replaces two magic `150000` literals in the worker.
+
+**A CSV column broke the web app.** `face_h` is a list, and pandas wrote it as a
+quoted comma-containing field; every consumer splits on commas without honouring
+quotes, so the reference volume read as "2". Working values are now dropped
+before the CSV is written.
 
 ## 7. Configuration — every new constant
 

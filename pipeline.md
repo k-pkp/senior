@@ -178,7 +178,8 @@ open.
 ### Scale from a measured length
 
 ```
-linear_scale = REFERENCE_REAL_SIZE_CM / mean(reference OBB edges)
+linear_scale = REFERENCE_REAL_SIZE_CM / mean(reference's two horizontal
+               FITTED-FACE edges)      # not a bounding box - see below
 k            = linear_scale ** 3
 ```
 
@@ -308,6 +309,11 @@ build error is 1.4% linear = 4.3% volume on every result.
 shell noise is 2.1 mm — the same magnitude, so this is VGGT's baseline surface
 error, not something downstream adds. Since volume goes as r², a 1σ radius error
 is ±16% volume. Most tuning below that is inside the noise.
+
+**Corrected 2026-08-12:** that ±16% came from a pre-rework measurement on the
+can using a metric that mixed shape error into the noise. Re-measured on the
+current pipeline as local surface thickness, the floor is **~1-2% volume**
+(0.29 mm shell on a 3.94 cm radius limb). Few-percent effects are measurable.
 
 **Ground truth ambiguity.** 325 ml is the can's *fill* volume; the pipeline
 measures *external displacement*, which is larger. Every reported percentage

@@ -269,7 +269,7 @@ flowchart TD
     V2["Order axes by orientation<br/>index 0 = most aligned with up"]
     V3["Exact signed volume<br/>divergence theorem"]
     V4["Voxel occupancy<br/>independent cross-check"]
-    V5["Reference: mean of the TWO<br/>horizontal edges"]
+    V5["Reference edges from FITTED FACES<br/>not a bounding box"]
     V6["linear_scale = 14.0 / edge<br/>k = scale cubed"]
     V7["Report reference error<br/>unforced"]
     OUT[/"volumes.csv"/]:::file
@@ -280,10 +280,12 @@ flowchart TD
 ```
 
 **The one thing to understand about this pipeline:** scale comes from a measured
-**length**, not a volume ratio.
+**length**, not a volume ratio — and that length is measured from the cube's own
+fitted faces, not from a bounding box. An OBB has to guess the orientation, and
+on this reference it guessed 1.3 degrees wrong, inflating every edge by 2.2%.
 
 ```
-ref edge     = mean of the cube's two HORIZONTAL OBB edges
+ref edge     = mean of the cube's two HORIZONTAL FITTED-FACE edges
 linear_scale = 14.0 cm / ref edge
 k            = linear_scale ** 3
 V_real       = V_mesh * k
@@ -312,10 +314,13 @@ Current run:
 ```
 horizontal edges  0.2264, 0.2325 units — disagree by 2.68%
 linear_scale      14.0 / 0.229427 = 61.02 cm/unit
-reference reads   2346 cm3 vs 2744 nominal  ->  -14.5%
+reference reads   2694 cm3 vs 2744 nominal  ->  -1.8%   (leg scene)
+                  2644 cm3 vs 2744 nominal  ->  -3.7%   (can scene)
 ```
 
-That −14.5% is the honest error bar on every other number.
+That -1.8% / -3.7% is the honest error bar on every other number — and it is now
+smaller than the cube's own build tolerance, since a 2 mm error on a handmade
+cardboard cube is 4.3% in volume.
 
 ---
 

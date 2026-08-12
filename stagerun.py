@@ -486,7 +486,14 @@ def run_stage5(args, name):
     from pipeline.stages.watertight import watertight_stage
 
     prev = os.path.join(src_dir(args, name, 4), "mesh")
-    recon = sorted(glob.glob(os.path.join(prev, "*_recon.ply")))
+    # scene_recon.ply is the MERGE of the per-object meshes, not another object.
+    # Feeding it back in makes Stage 5 merge every object twice, and the
+    # coincident duplicate geometry turns two closed surfaces into thousands of
+    # non-manifold fragments (measured: 2 components -> 7,554, euler 4 -> 3113).
+    # The orchestrator passes recon_mesh_paths, which already excludes it; only
+    # this glob had to rediscover that.
+    recon = sorted(p for p in glob.glob(os.path.join(prev, "*_recon.ply"))
+                   if os.path.basename(p) != "scene_recon.ply")
     if not recon:
         sys.exit("ERROR: stage 4 recon meshes missing — run stage 4 first")
 

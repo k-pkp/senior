@@ -82,7 +82,7 @@ Only the **spread** between edges and the **volume** carried information.
 
 ---
 
-### M3 — calibrate by length, **two horizontal** edges only · **CURRENT**
+### M3 — calibrate by length, **two horizontal OBB** edges · **REPLACED by M10**
 
 ```python
 _vi  = argmax_i |R[:,i] · ẑ|          # axis most aligned with world up
@@ -102,9 +102,9 @@ vertical    0.2192 units — 4.47% short of the horizontal mean
 ref edge    0.229427  ->  linear_scale = 61.02 cm/unit
 ```
 
-**Verdict:** current. Vertical is now genuinely independent evidence (it does
-not enter its own calibration). The two horizontals are still circular in their
-mean.
+**Verdict:** superseded by M10. The rule was right; the *ruler* was not. The
+oriented bounding box overstated the edge by 2.2%, which under-read every volume
+by ~6%.
 
 ---
 
@@ -207,43 +207,136 @@ number that would otherwise have been reported as a measurement.
 
 ---
 
+### M10 — measure the edge from the cube's own FACES · **CURRENT**
+
+The single largest accuracy gain in Stage 6, and it changed nothing about the
+*rule* — only about how the edge is measured.
+
+An oriented bounding box has to guess the orientation. On this reference it
+guessed about **1.3 degrees wrong**, which is enough to enclose 6.8% more volume
+than the convex hull of the very same points — and an OBB must *contain* the
+hull, so that excess is pure fitting error:
+
+```
+face-to-face box       2505.7 cm3     the cube's real size
+convex hull of points  2479.2 cm3     -1.1%
+oriented bounding box  2647.8 cm3     +5.7%    <- must contain the hull, yet exceeds it
+```
+
+Both Open3D and trimesh fail here. Open3D's `get_oriented_bounding_box` returned
+boxes with **2.1x the AABB volume** on this cloud; trimesh's was +5.7%. Neither
+is trustworthy for a measurement, and this *is* a measurement.
+
+A cube does not need a bounding box. **Its face normals are its axes.**
+`pipeline/core/faces.py` clusters the mesh's triangles by normal (area-weighted,
+so the many tiny corner triangles cannot outvote a real face), pairs opposite
+faces, and measures their separation.
+
+Two details that were not obvious:
+
+- **Area weighting is what makes it work.** Rounded corner triangles are
+  numerous but carry almost no area.
+- **Opposite faces are never exactly anti-parallel.** On a reconstructed cube
+  their normals splay by about a degree, so differencing the two plane offsets
+  measures the gap *extrapolated away from the object* — it read 0.265 units
+  against a true 0.252. The separation is therefore measured **through the mesh
+  centroid**: the sum of the centroid's distances to the two planes, which is
+  well defined however the normals splay. Verified on a synthetic cube rotated
+  30 deg / 20 deg: exactly 2.0000 on all three axes.
+
+Falls back to the OBB with an explicit warning when fewer than two face pairs
+are found. Applied to the reference only — meaningless for a limb.
+
+**Measured effect, both datasets:**
+
+| | M3 (OBB edge) | M10 (fitted faces) |
+|---|---|---|
+| cube, leg scene | 2460.1 cm3 (-10.3%) | **2694.2 cm3 (-1.8%)** |
+| cube, can scene | 2449.9 cm3 (-10.7%) | **2643.6 cm3 (-3.7%)** |
+| limb | 981.6 cm3 | 1075.0 cm3 |
+| can | 291.4 cm3 | 314.4 cm3 |
+| horizontal edges disagree by | 2.68% / 1.46% | **0.79% / 1.14%** |
+
+**Verdict:** current. Reference error more than halved, and the two horizontal
+edges — independent measurements of the same physical 14 cm — now agree to
+about 1%.
+
+---
+
+### M11 — squareness as a quality gate · **CURRENT**
+
+From an idea of the project owner's: normalise the three edges so they sum to
+100%; each should be 33.33% if the cube is cubic. Deviation is **scale-free** —
+it needs no ground truth.
+
+Tested as a *selection* rule (pick the axis closest to 33.33%) it gained little:
+0.8 pp on OBB edges against 6.0 pp for fixing the measurement. And it cannot
+work as a correction, because forcing the shares to sum to 100% makes any
+**common-mode** error mathematically invisible — inflate all three edges equally
+and the shares do not move. That is exactly the defect M10 fixed, which is why
+the measurement had to change rather than the weighting.
+
+Kept as what it is genuinely good for — an **error bar and a warning gate**:
+
+```
+squareness = shares 33.04 / 33.29 / 33.67%   (33.33 each if perfectly cubic)
+             deviation -0.29 / -0.05 / +0.33 pp
+```
+
+Warns when a horizontal deviates by more than 2 pp. Before this, nothing caught
+a badly-reconstructed reference before its edge silently set the scale.
+
+**Verdict:** kept as a gate, rejected as a correction.
+
+---
+
 ## Current measurement
 
-`inputs/small_leg`, 6 photos, alpha shape, both meshes watertight with χ = 2:
+Full pipeline, both datasets, fresh from Stage 1. `run.py` and `stagerun.py`
+agree to 0.0000 cm3 and reruns are bit-identical.
 
 ```
        name     method  euler   volume    obb_a    obb_b    obb_c
-    box.ply watertight      2 0.010323 0.219166 0.226351 0.232503
-leg_cut.ply watertight      2 0.003746 0.508577 0.123537 0.258523
+    box.ply watertight      2 0.011439 0.226249 0.231968 0.235381
+leg_cut.ply watertight      2 0.004565 0.531543 0.131647 0.267971
 
        name  height_cm  width_cm  depth_cm  real_vol_cm3
-    box.ply      13.37     13.81     14.19       2345.55
-leg_cut.ply      31.03      7.54     15.78        851.28
+    box.ply      13.97     14.33     14.54       2694.24
+leg_cut.ply      32.83      8.13     16.55       1075.04
+
+can scene:  box 2643.6 cm3 (-3.7%)   can 314.4 cm3
 ```
 
-### Decomposition of the reference's −14.5%
+Reference error is now **-1.8% / -3.7%** across two independent scenes, against
+-10.3% / -10.7% before M10.
+
+### Decomposition of the reference's remaining error
+
+The earlier decomposition in this file attributed the gap to "4.49% vertical
+truncation + 10.50% mesh under-filling its box". **That was wrong**, and the
+error is instructive: *fill ratio* divides mesh volume by the **OBB** volume,
+and the OBB was itself inflated by 2.2% per axis. A metric artifact was being
+read as a physical defect.
+
+Measured against the cube's real face-to-face size instead:
 
 ```
-perfect cube of the measured edge    0.012076 units³
-actual OBB box volume                0.011534   →   −4.49%   vertical short
-actual mesh volume                   0.010323   →  −10.50%   mesh under-fills its box
-                                                   −14.52%
+convex hull of the points   98.9% of the face-to-face box   -> corners barely rounded
+mesh volume                 97.8% of the face-to-face box   -> reconstruction loses ~2%
+implied corner radius       0.74 cm on a 13.7 cm cube       -> near-physical for taped cardboard
 ```
 
-Two independent defects requiring different treatment:
+So the mesh is a good mesh. What remains after M10 is **-1.8% / -3.7%**, and the
+vertical edge still reads 1.3–2.5% short of the horizontals. Two candidates, not
+separable from here:
 
-**−4.49% — vertical truncation.** The cube's underside rests on the floor and
-never reconstructs. Partly self-inflicted: the floor-removal band is
-`±2 × 0.00497 = 0.0099` units = **0.61 cm**, and the vertical deficit is
-**0.63 cm**. Widening the band to eliminate the floor slab also shaves the base
-off anything resting on the floor. The floor extension does fire
-(`[box] extended to floor: gap 0.0113`) and recovers roughly half.
+- the cube genuinely is not square. It is handmade cardboard; 13.4 x 13.7 x 13.7
+  is entirely plausible for a taped box.
+- a small vertical bias specific to the cube's top face.
 
-**−10.50% — the mesh under-fills its own bounding box.** Alpha shape rounds
-edges and corners. This is `fill ratio = V/(abc) = 0.8950` where a perfect cube
-is 1.0000.
-
----
+Against this, the **can shows no vertical anomaly** and its bottom face sits
+exactly on the detected floor plane, so the floor extension is not leaving a gap.
+That argues for the cube simply not being cubic — which only a caliper settles.
 
 ## Circularity — what is and is not evidence
 
@@ -310,6 +403,58 @@ estimate implies a precision the pipeline does not have.
 
 ---
 
+## Reconstruction method comparison (2026-08-12)
+
+Run on the same Stage 3 cloud, no pipeline changes. Files in
+`temp_output_compare_recon/`.
+
+```
+alpha_shape                  15,696 tri  wt=True   chi=  2   1 comp   1075.0 cm3
+poisson_d9                   90,319 tri  wt=False  chi=260  207 comp        —
+  + pymeshfix               101,238 tri  wt=True   chi=394  207 comp   1016.1 cm3   -5.5%
+ball_pivot                   34,087 tri  wt=False  chi=-576  40 comp        —
+  + pymeshfix                60,874 tri  wt=True   chi= 66   40 comp    797.7 cm3  -25.8%
+```
+
+**Alpha shape is the only method that closes without repair**, and the reason is
+structural: it works from a 3D Delaunay tetrahedralisation and **never uses
+normals**. Poisson integrates a normal field and ball pivoting seeds the ball on
+normals, and the fabricated base — a flat cap plus a 4-level swept skirt — has no
+well-defined normal. Normal coherence there is 7x worse than on the real surface
+(median deviation 0.0021 vs 0.0003).
+
+Ball pivot is the prettiest, and that is measurable: it keeps **every input point
+as a vertex, 1:1**, so its surface roughness is *identical* to the cloud's, 0.300
+mm to three decimals. But 0.300 mm is the shell-noise floor, and VGGT at 518x518
+over a 35 cm limb resolves ~0.7 mm at best — so that texture is noise rendered
+faithfully, not skin detail.
+
+Ball pivot also carried **39 shells buried inside the body** (8.20 cm3). Blender's
+"Select Interior Faces" does not find them: it selects faces whose edges have
+more than 2 face users, and these are fully detached loose parts whose edges have
+exactly 2. Applying the pipeline's own largest-component filter plus
+`orient_triangles()` removes them and fixes the inconsistent winding — but the
+volume only moves 797.7 -> 796.3. The -25.8% was never the buried geometry; it is
+PyMeshFix fanning a flat surface across the sole where ball pivot left a hole.
+
+**Verdict:** alpha shape stays the default for both objects. Ball pivot is a
+better *picture* and a worse *measurement*, and the thing that makes it
+mis-measure is the fabricated base, not the algorithm.
+
+### Blender repair operations, tested and rejected
+
+| operation | result |
+|---|---|
+| Recalculate Outside | normals already 98.7% correct by a radial test; forcing them changed euler by +-30 and closed nothing. Does fix ball pivot's genuinely inconsistent winding. |
+| Merge by Distance | at 0.25x spacing ball pivot went 40 -> **41** components. The pieces are not nearly-touching; the holes are missing surface, not split seams. |
+| Select Interior Faces | 0 interior faces on every mesh including the merged scenes. |
+
+All three are repairs for *modelling* damage — flipped winding after mirroring,
+doubled verts after joining, buried geometry after booleans. Surface
+reconstruction cannot produce any of them.
+
+---
+
 ## What blocks a defensible result
 
 Ranked. Items 1–3 are **experiment design, not code**.
@@ -363,25 +508,24 @@ percentage against 325 ml is defensible.
 is the clinical gold standard for limb volumetry and the only thing that can
 confirm 851 cm³.
 
-### 4. The measured error is inside the noise floor
+### 4. ~~The measured error is inside the noise floor~~ — WITHDRAWN
 
-From [`experiments.md`](experiments.md): point-shell radial noise on the can is
-**std 0.214 cm on a 2.62 cm radius**. Volume goes as `r²`, so that is
-**±16% volume**.
+This entry claimed the reference's error could not be distinguished from noise,
+citing ±16% volume from [`experiments.md`](experiments.md). **That was wrong.**
+
+The ±16% came from a pre-rework measurement on the *can*, before MLS existed,
+using radial spread about a fitted cylinder — a metric that folds shape error in
+with noise. Re-measured on the current pipeline as local surface thickness:
 
 ```
-radius p25 → 260.2 cm³
-radius med → 286.4 cm³
-radius p75 → 333.1 cm³
+audit_leg   shell 0.29 mm on r = 3.94 cm  ->  volume floor ~1.5%
+audit_can   shell 0.15 mm on r = 2.66 cm  ->  volume floor ~1.1%
 ```
 
-**The reference's −14.5% is smaller than the ±16% noise floor.** On a single
-dataset it cannot be distinguished from noise, and any change moving the result
-by less than that cannot be judged.
-
-**Action:** repeat runs across multiple capture sessions and report a
-distribution, not one number. Until then, single-run deltas below ~16% mean
-nothing.
+The real floor is **~1-2%**. Errors of a few percent are measurable, and the
+reference's error was a real signal worth chasing — which is exactly what M10
+found and more than halved. Repeat runs across capture sessions are still worth
+having, but not because single-run deltas are unreadable.
 
 ### 5. MLS shrinkage is unresolved
 
@@ -407,12 +551,18 @@ we know a priori that it rests there. Not attempted.
 
 | | status |
 |---|---|
-| volume estimator | solid — exact signed volume, χ = 2 verified, independent cross-check |
+| volume estimator | solid — exact signed volume, chi = 2 verified, independent cross-check |
 | calibration method | correct in form — length, not volume; horizontals only |
+| edge measurement | **fixed (M10)** — fitted faces, not a bounding box |
+| reference error | **-1.8% / -3.7%** across two scenes, was -10.3% / -10.7% |
 | calibration **value** | **unverified** — `14.0` never measured |
 | reported accuracy | **not yet possible** — no second reference, no ground truth |
-| single-run sensitivity | **±16%** — larger than the effect being measured |
+| single-run sensitivity | **~1-2%** (corrected from a stale ±16%) |
 
-The pipeline is in good shape. The **measurement protocol** is not, and no
-amount of further code will fix that. The next three actions are a caliper, a
-second reference object, and a bucket of water.
+The pipeline is in good shape and the remaining reference error is now smaller
+than the cube's own build tolerance — a 2 mm error on a handmade cardboard cube
+is 4.3% in volume, larger than the -1.8% we are chasing.
+
+That is the headline: **further code cannot improve the number until the cube is
+measured.** The next three actions are a caliper, a second reference object of a
+different shape, and a bucket of water.

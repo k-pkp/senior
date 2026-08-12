@@ -1,6 +1,0 @@
-# Next.js / Node build artefacts — never committed.
-node_modules/
-.next/
-out/
-*.tsbuildinfo
-.env*.local

@@ -118,11 +118,6 @@ temp_output_compare_recon/
 *.blend
 *.blend1
 
-# ...but the web app's sample fixtures MUST ship, or the site has nothing to
-# load and every screen fails on a fresh clone. ~3 MB total.
-!web/public/samples/**/*.ply
-!web/public/samples/**/*.stl
-
 # Media
 *.mp4
 *.avi

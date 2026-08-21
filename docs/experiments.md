@@ -349,6 +349,12 @@ invasive: it moves points rather than removing them.
 ## Open
 
 - [ ] Measure the can with calipers (height, diameter) — gates every accuracy claim
+- [ ] **Water displacement on a held-out object** — the missing ground truth, and
+      the tiebreaker for three deferred decisions. When it exists, re-run:
+      E-ghost-steps (does `normal_aware_filter` stay? does `voxel_dedup`?),
+      E-dedup-impl (can `voxel_dedup` become a library call?), and the Stage 6
+      scale question in `stage06_experiments.md`. All three are currently measured
+      against the pipeline itself, which cannot settle any of them.
 - [ ] `mode="pad"` vs `"crop"` — crop currently discards 44% of each photo
 - [ ] `conf_thres` sweep — untested, controls shell thickness
 - [ ] length-based scale instead of `k^(1/3)` — more correct, ~3% shift
@@ -511,3 +517,87 @@ missing-column path silently produced Infinity. And the earlier docs recorded th
 consequence as "new runs will not display their numbers" — the numbers were the
 visible part, but it was the geometry that died. A consequence written down
 imprecisely is not much better than one not written down.
+
+---
+
+## E-ghost-steps — which cleaning steps change the answer · Aug 2026
+
+**Question.** `voxel_dedup` and `normal_aware_filter` both look like decimation.
+Does either change the reported volume, or are they ceremony?
+
+**Method.** Stages 3-6 re-run four times from one shared Stage 1-2 source
+(`--src verify`), each step disabled in turn. `GHOST_VOXEL_FACTOR = 0` disables
+dedup; the normal filter was disabled by raising `max_deviation` past rejection.
+Both files restored afterwards and verified identical to the commit.
+
+| variant | points into Stage 4 | limb volume | vs current |
+|---|---|---|---|
+| A · full chain | 14,722 | 1091.79 cm³ | — |
+| B · no `normal_aware_filter` | 15,057 | 1090.97 cm³ | **−0.08%** |
+| C · no `voxel_dedup` | 84,751 | 1121.22 cm³ | **+2.70%** |
+| D · neither | 90,321 | 1118.89 cm³ | +2.48% |
+
+**`voxel_dedup` — KEPT.** 2.7% is larger than the reference cube's own residual,
+so it is not noise. The direction matches the mechanism: without it the ghost
+survives, the surface stays a thick band, and the alpha shape wraps a fatter
+solid. It also keeps Stage 4's input at 14.7k points rather than 84.8k.
+
+Its mechanism is not what it looks like. It does **not** collapse the ghost —
+two sheets 2 mm apart fall in different voxels and both survive, and on its own it
+leaves the shell at 1.62 mm against a random subsample's 1.39 mm. What it does is
+set the point spacing, and `MLS_RADIUS_MULT` is measured in spacings: 0.94 mm
+spacing gives MLS a 3.75 mm radius, 2.10 mm spacing gives 8.38 mm, against a ~2 mm
+sheet separation. Decimating is what lets MLS's neighbourhood span both sheets.
+Running MLS with no decimation at all reaches only 1.12 mm against 0.52 mm.
+
+**`normal_aware_filter` — REMOVABLE, DECISION DEFERRED.** 0.08% on volume and 2.9%
+of points, which is indistinguishable from nothing. B even keeps *more* points than
+A and lands on the same volume: the strays it would remove get wrapped by the alpha
+shape regardless.
+
+Not deleted, because this violates the decision rule at the top of this file. The
+evidence is one capture, measured against the pipeline itself rather than a known
+volume, and `small_leg` reconstructs cleanly either way. The failure the step
+guards against — misoriented points seeding spurious tetrahedra — is a *bad
+capture* failure. **Re-run this A/B on the first dataset with independent ground
+truth and decide it there.**
+
+Full working, with the cross-section after every function:
+[`ghost_removal_chain.md`](ghost_removal_chain.md).
+
+---
+
+## E-dedup-impl — is `voxel_dedup` replaceable by `open3d.voxel_down_sample`? · Aug 2026
+
+**Question.** `voxel_dedup` is ~30 hand-written lines. Open3D ships the same
+operation. Same call site, same voxel size, only the function swapped — does the
+answer change?
+
+| | box | limb | into Stage 4 | limb volume |
+|---|---|---|---|---|
+| `voxel_dedup` (current) | 105,045 → 16,432 | 118,478 → 17,683 | 14,722 | 1091.79 cm³ |
+| `o3d.voxel_down_sample` | 105,045 → 16,385 | 118,478 → 17,736 | 14,811 | 1088.59 cm³ |
+
+**0.29% apart.** The only substantive difference is the grid anchor —
+`voxel_dedup` uses `points.min(axis=0)`, Open3D its own origin — so cells fall
+elsewhere, a few points cross a boundary and the centroids shift. After MLS the
+patch spread is 0.23 mm either way.
+
+**NO DECISION TAKEN.** 0.29% is small but measured on one capture against the
+pipeline itself, and it is not clearly below the noise floor of a system whose
+reference cube carries a ~2% residual. Deferred to ground truth, with
+`normal_aware_filter` (E-ghost-steps).
+
+Three things any swap must preserve, recorded so the work is not redone: colour
+averaging (Open3D does it only when the cloud carries colours), the
+`voxel_size <= 0` escape hatch that `GHOST_VOXEL_FACTOR = 0` uses to disable the
+step, and a deterministic grid origin.
+
+**Method note worth keeping.** These two measured 0.59 mm against 0.75 mm on
+cross-section shell thickness — a 27% gap suggesting `voxel_dedup` was clearly
+better — while on volume they differ by 0.29%. Shell RMS in one slice is a noisy
+proxy and was over-read earlier in this investigation. Where a proxy and the
+reported volume disagree, the volume decides.
+
+Figure: [`dedup_vs_open3d.png`](dedup_vs_open3d.png), working in
+[`ghost_removal_chain.md`](ghost_removal_chain.md).

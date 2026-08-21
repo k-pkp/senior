@@ -2,10 +2,13 @@
 
 Both runs measure the **same six photographs** (`inputs/small_leg`) on the same
 machine, an RTX 4060. `main` is `bab2bbc`, run from a clean `git worktree` so
-nothing from the current tree could leak into it. Artefacts from both are kept
-under [`rework_outputs/`](rework_outputs/) — the point clouds, the cleaned
-objects, the watertight meshes and the full run logs, so any number here can be
-re-checked rather than taken on trust.
+nothing from the current tree could leak into it.
+
+[`rework_outputs/`](rework_outputs/) carries the measurement files from both runs —
+`volumes.csv`, `framing.json`, the Stage 6 report — so every number below can be
+checked against its source. The clouds, meshes and full logs are **not** in the
+repository: they are 55 MB of `.ply`, they are excluded by `.gitignore`, and they
+are reproducible from the two commands below.
 
 Reproduce with:
 
@@ -120,7 +123,14 @@ Where the two diverge most.
 the "ghost". The current tree removes it (voxel dedup, then a normal-aware
 filter) and then projects what survives onto a locally fitted surface with MLS.
 An 85% reduction is not lost information: it is the same surface, described once
-instead of two-and-a-bit times. The section figure below shows exactly this.
+instead of two-and-a-bit times.
+
+Step by step, with a cross-section after every function, in
+[`ghost_removal_chain.md`](ghost_removal_chain.md). The short version:
+`voxel_dedup` does the work — it collapses about **6.5 points per voxel** into
+one, and that ratio is the measurement of how duplicated the surface was.
+`normal_aware_filter` then removes only 537 stragglers (2.9%), and MLS deletes
+nothing at all but halves the shell thickness, 1.76 mm to 0.79 mm.
 
 The current tree also detects the marker band and cuts the limb there, which
 `main` does by a centroid-side rule.

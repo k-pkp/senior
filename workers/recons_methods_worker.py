@@ -241,8 +241,26 @@ except Exception as e:
     return mesh
 
 
+# Alpha is searched as multiples of mean nearest-neighbour spacing, smallest
+# first, and the first value that yields a sound closed surface wins.
+#
+# The ladder used to stop at 90x, and that ceiling was reached in practice: a
+# limb cloud that closes cleanly at 140x reported "no watertight alpha found"
+# and fell through to a repair path, one rung short of the answer. It was not
+# under-sampled or holed -- its Euler number fell monotonically 2202, 868, 654,
+# 398, 222, 102, 16, 2 with no boundary edges at any step, which is a surface
+# converging, not a surface failing.
+#
+# Extended so that case terminates. The order still matters more than the
+# ceiling: since the smallest sound alpha wins, adding coarse rungs cannot make
+# a cloud that already closes finely choose a coarse one. A cloud that only
+# closes out here is a real result but a blunt one -- at 140x the alpha ball is
+# wider than the limb, and the surface it returns sits at 67% of the convex hull
+# against 50% for a cloud that closes at 25x, meaning genuine concavities have
+# been bridged. Closing coarsely is better than not closing; it is not as good
+# as closing finely.
 ALPHA_MULTIPLIERS = [8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 25.0, 30.0,
-                     40.0, 55.0, 70.0, 90.0]
+                     40.0, 55.0, 70.0, 90.0, 115.0, 140.0, 170.0, 200.0]
 
 
 def method_alpha_shape(pcd, output_path, seed=None):
@@ -336,11 +354,19 @@ def method_alpha_shape(pcd, output_path, seed=None):
               f"watertight={wt}, euler={euler}"
               + (f", volume={vol:.6f}" if wt else "") + note)
 
-        # Keep the best closed-but-unsound mesh as a last resort, but never
-        # prefer it over a topologically valid one.
-        if fallback is None or (wt and not isinstance(fallback[0], type(None))):
-            if fallback is None:
-                fallback = (m, mul)
+        # Keep the best unsound mesh as a last resort. The inner guard here used
+        # to be `if fallback is None`, which meant the fallback was fixed on the
+        # FIRST iteration and never revisited -- and the search starts at the
+        # smallest alpha, which is the most shredded candidate of all. A run
+        # that failed to close then reported the worst mesh it had built rather
+        # than the best, turning a partial failure into a total one.
+        #
+        # Rank instead: closed beats open; among those, the Euler number nearest
+        # 2 is nearest to a valid solid; ties go to the mesh carrying more
+        # surface, which is the less fragmented one.
+        score = (wt, -abs(euler - 2), len(m.triangles))
+        if fallback is None or score > fallback[2]:
+            fallback = (m, mul, score)
         if sound:
             best = (m, mul, vol)
             break
@@ -350,9 +376,11 @@ def method_alpha_shape(pcd, output_path, seed=None):
         print(f"Alpha Shape: selected alpha={mul:.0f}x nn "
               f"(smallest watertight AND euler=2), volume={vol:.6f}")
     elif fallback is not None:
-        mesh, mul = fallback
-        print(f"WARNING: no watertight alpha found — using alpha={mul:.0f}x nn "
-              f"(Stage 5 will attempt repair)")
+        mesh, mul, score = fallback
+        print(f"WARNING: no watertight alpha found — using the best candidate, "
+              f"alpha={mul:.0f}x nn (watertight={bool(score[0])}, "
+              f"euler={2 - score[1] if score[1] <= 0 else 2 + score[1]}, "
+              f"{score[2]:,} faces; Stage 5 will attempt repair)")
     else:
         print("ERROR: Alpha Shape failed at all alphas")
         sys.exit(1)

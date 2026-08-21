@@ -19,6 +19,7 @@ Layout:
     work/<name>/06_volume/      volumes.csv
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -29,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 WORK = "work"
 STAGE_DIRS = {
+    0: "00_prep",
     1: "01_inference",
     2: "02_pointcloud",
     3: "03_clean",
@@ -309,6 +311,54 @@ def dump_raw(preds, out_dir):
 
 # ── Stage 1 ────────────────────────────────────────────────────────────
 
+def run_stage0(args, name):
+    """Frame each photo around the subject before VGGT is given a square.
+
+    Writes cropped frames that stage 1 can be pointed at with -i, rather than
+    handing them over implicitly, so a prep run and a raw run stay directly
+    comparable.
+    """
+    from pipeline.stages.prep import prepare_frames
+
+    d = stage_dir(name, 0)
+    images = os.path.join(d, "images")
+    manifest = prepare_frames(args.image_folder, images,
+                              band_heights=args.prep_band,
+                              pad=args.prep_pad,
+                              centre_on_subject=args.prep_recentre,
+                              output_size=args.prep_size,
+                              strict=args.prep_strict,
+                              crop=args.prep_crop,
+                              min_frames=args.prep_min_frames)
+    frames = manifest["frames"]
+    lines = [f"STAGE 0 — prep   (from {args.image_folder})", ""]
+    lines.append(f"  band              : {manifest['band_cube_heights']} cube heights")
+    lines.append(f"  pad               : {manifest['pad_frac']:.0%}")
+    lines.append(f"  centred on        : "
+                 f"{'subject' if manifest['centre_on_subject'] else 'frame'}")
+    lines.append("")
+    for r in frames:
+        w = r["window"]
+        state = "ok" if (r["cube_ok"] and r["band_ok"]) else "REJECTED"
+        # The reasons come from the stage that decided them. This used to
+        # re-derive its own, which drifted: the summary still said "cube not
+        # contained" after Stage 0 had started distinguishing a cube that was
+        # never seen from one the window cuts.
+        notes = r.get("reasons") or []
+        sev = r.get("severity")
+        note = ("  " + "; ".join(notes)) if notes else ""
+        sev = f"  [{sev}]" if sev else ""
+        lines.append(f"  {r['source']:<16} {state:<9} {r['mode']:<13} "
+                     f"{w[2] - w[0]}px  offset {r['offset_px']:.0f} px{sev}{note}")
+    if manifest.get("rejected"):
+        lines.append("")
+        lines.append(f"  rejected: {', '.join(manifest['rejected'])}")
+    lines.append("")
+    lines.append(f"  next: stagerun.py 1 -i {images} --name {name}")
+    _write_summary(d, lines)
+    print(f"\n  -> {images}")
+
+
 def run_stage1(args, name):
     from vggt.utils.device import get_device
     from pipeline.stages.inference import run_inference
@@ -423,9 +473,59 @@ def run_stage2(args, name):
 
 # ── Stage 3 ────────────────────────────────────────────────────────────
 
+def _measured_marker_colour(args, name):
+    """The marker colour Stage 0 measured for this run, if it ran.
+
+    Falls back to None, which leaves Stage 3 on the config defaults — those
+    describe one khaki band, so a differently coloured marker needs this.
+    """
+    for cand in (name, args.src):
+        if not cand:
+            continue
+        path = os.path.join(stage_dir(cand, 0, create=False), "framing.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f).get("marker_colour")
+    return None
+
+
+def _review_planes(args):
+    """Cutting planes supplied by an interactive review, if any.
+
+    The file holds {"markers": [{"centroid": [x,y,z], "normal": [x,y,z]}, ...]}
+    in LEVELLED space, which is the shape Stage 3 already publishes as
+    cutting_line_levelled.json — so a review can read that file, move a plane
+    and hand the same structure straight back.
+    """
+    if not getattr(args, "planes", None):
+        return None
+    with open(args.planes) as f:
+        data = json.load(f)
+    markers = data.get("markers", data) if isinstance(data, dict) else data
+    return list(markers)
+
+
 def run_stage3(args, name):
     import glob
-    from pipeline.stages.clean import clean_and_extract
+    from pipeline.stages.clean import clean_and_extract, cut_only
+
+    # --cut-only is the second half of a Stage 3 that deferred its cut. Every
+    # expensive step already ran and its result is on disk, so this reads the
+    # uncut limb back and applies the confirmed planes to it. Doing that instead
+    # of a full re-run is what keeps a review from costing a second clustering,
+    # ghost filter, MLS and levelling pass.
+    if getattr(args, "cut_only", False):
+        d = stage_dir(name, 3)
+        paths = cut_only(d, _review_planes(args) or [],
+                         fill_enabled=not args.no_fill)
+        lines = ["STAGE 3 — cut only   (planes confirmed by review)", ""]
+        for p in sorted(glob.glob(os.path.join(d, "objects", "*.ply"))):
+            lines.append("  " + _pcd_stats(p))
+        lines += ["", f"  objects handed to stage 4: {len(paths or [])}"]
+        for p in (paths or []):
+            lines.append(f"    {p}")
+        _write_summary(d, lines)
+        return
 
     prev = src_dir(args, name, 2)
     ply = os.path.join(prev, "points.ply")
@@ -439,7 +539,10 @@ def run_stage3(args, name):
         segment_leg=args.segment_leg,
         segment_height_axis=args.segment_height_axis,
         fill_enabled=not args.no_fill,
-        clean_ply_path=None)
+        clean_ply_path=None,
+        marker_colour=_measured_marker_colour(args, name),
+        override_planes=_review_planes(args),
+        apply_cut=not getattr(args, "no_cut", False))
 
     lines = [f"STAGE 3 — clean   fill={not args.no_fill}  segment_leg={args.segment_leg}", ""]
     for p in sorted(glob.glob(os.path.join(d, "**", "*.ply"), recursive=True)):
@@ -460,6 +563,43 @@ def _mesh_stats(path):
             f"watertight={str(m.is_watertight):<5}  vol={abs(m.volume):.6f}")
 
 
+def _clear_meshes(d):
+    """Remove every mesh in a stage's output directory.
+
+    Right for stage 5, whose output is derived wholly from stage 4 and costs
+    nothing to rebuild.
+    """
+    import glob as _glob
+    mesh_dir = os.path.join(d, "mesh")
+    for pat in ("*.ply", "*.stl"):
+        for f in _glob.glob(os.path.join(mesh_dir, pat)):
+            os.remove(f)
+
+
+def _prune_meshes(d, object_paths):
+    """Drop stage 4 meshes that no longer have an object behind them.
+
+    A stage's output has to describe that stage's run: when the limb's cut is
+    deferred there is no leg_cut.ply, and a leg_cut_recon.ply left from an
+    earlier run would be picked up by stage 5 and measured as if it were this
+    run's answer. That is exactly how a deferred cut still reported a cut limb.
+
+    Meshes whose object IS still present are left alone, so reconstruct can
+    reuse the ones whose cloud has not changed — the reference cube in
+    particular, which no cut ever touches.
+    """
+    import glob as _glob
+    from pipeline.stages.reconstruct import _recon_name
+
+    mesh_dir = os.path.join(d, "mesh")
+    keep = {_recon_name(p) for p in object_paths}
+    keep.add("scene_recon")            # rebuilt every time from whatever survives
+    for f in _glob.glob(os.path.join(mesh_dir, "*")):
+        stem = os.path.splitext(os.path.basename(f))[0]
+        if stem not in keep:
+            os.remove(f)
+
+
 def run_stage4(args, name):
     import glob
     from pipeline.stages.reconstruct import reconstruct_mesh_stage
@@ -471,6 +611,7 @@ def run_stage4(args, name):
         sys.exit("ERROR: stage 3 objects missing — run stage 3 first")
 
     d = stage_dir(name, 4)
+    _prune_meshes(d, objs)
     scene, recon = reconstruct_mesh_stage(
         objs, d, seed=args.seed, method=args.recon_method,
         box_method=args.box_recon_method, obj_method=args.obj_recon_method)
@@ -498,6 +639,7 @@ def run_stage5(args, name):
         sys.exit("ERROR: stage 4 recon meshes missing — run stage 4 first")
 
     d = stage_dir(name, 5)
+    _clear_meshes(d)
     scene, wt = watertight_stage(recon, d)
 
     lines = ["STAGE 5 — watertight", ""]
@@ -520,6 +662,21 @@ def run_stage6(args, name):
         sys.exit("ERROR: no meshes from stage 4/5 — run those first")
 
     d = stage_dir(name, 6)
+    # PARKED — the marker cross-check that used this was reverted with Stage 6.
+    # Stage 1's pointmap is what let Stage 6 measure the printed markers, the
+    # one length its scale is not calibrated on. Looked up separately from the
+    # meshes because --src redirects every earlier stage at once: re-running
+    # stage 6 alone on a run whose stage 1 lives elsewhere would otherwise pull
+    # that run's meshes in too. See the PARKED block in pipeline/stages/volume.py.
+    #
+    # inference = None
+    # for cand in (args.inference, name, args.src):
+    #     if not cand:
+    #         continue
+    #     cand_dir = stage_dir(cand, 1, create=False)
+    #     if os.path.exists(os.path.join(cand_dir, "predictions.npz")):
+    #         inference = cand_dir
+    #         break
     df = compute_volumes(meshes, voxel_res=args.voxel_res, auto_res=args.auto_res)
     lines = [f"STAGE 6 — volume   (from {prev})", ""]
     if df is not None:
@@ -528,7 +685,7 @@ def run_stage6(args, name):
     _write_summary(d, lines)
 
 
-RUNNERS = {1: run_stage1, 2: run_stage2, 3: run_stage3,
+RUNNERS = {0: run_stage0, 1: run_stage1, 2: run_stage2, 3: run_stage3,
            4: run_stage4, 5: run_stage5, 6: run_stage6}
 
 
@@ -545,6 +702,43 @@ def main():
     p.add_argument("-i", "--image_folder", default="./inputs/small_leg/")
     p.add_argument("--name", default=None, help="work dir name (default: input folder name)")
     p.add_argument("--force", action="store_true", help="ignore cached stage 1")
+    p.add_argument("--prep-band", dest="prep_band", type=float, default=1.6,
+                   help="stage 0: how far above the floor the limb reaches, in "
+                        "cube heights (the cube stands on the floor and fixes "
+                        "both the level and the scale)")
+    p.add_argument("--prep-pad", dest="prep_pad", type=float, default=0.05,
+                   help="stage 0: margin around the subject before squaring")
+    p.add_argument("--prep-size", dest="prep_size", type=int, default=518,
+                   help="stage 0: side of the emitted square. 518 is what VGGT "
+                        "resizes to anyway, and for a square input its own "
+                        "arithmetic is exact, so nothing is lost by doing the "
+                        "reduction here. 0 emits at native resolution.")
+    p.add_argument("--prep-min-frames", dest="prep_min_frames", type=int,
+                   default=6, help="stage 0: frames required before the "
+                                   "pipeline may run")
+    p.add_argument("--no-prep-crop", dest="prep_crop",
+                   action="store_false",
+                   help="hand VGGT the original frames instead of stage 0's crop.\n"
+                        "VGGT then centre-crops them itself, which discards 44%% of\n"
+                        "a 9:16 photo without regard for where the reference is.")
+    p.add_argument("--continue-on-rejected", dest="prep_strict",
+                   action="store_false",
+                   help="run the pipeline even though stage 0 rejected "
+                        "frames. Off by default: a clipped reference "
+                        "corrupts the scale of every reported volume "
+                        "and leaves no visible sign that it did.")
+    p.add_argument("--prep-lenient", dest="prep_strict", action="store_false",
+                   help=argparse.SUPPRESS)  # old name for --continue-on-rejected
+    p.add_argument("--prep-frame-centred", dest="prep_recentre",
+                   action="store_false",
+                   help="stage 0: keep the window concentric with the frame "
+                        "instead of centring it on the subject. Rarely useful: "
+                        "it degenerates to the old centre crop and left 1 of 6 "
+                        "frames usable against 4.")
+    p.add_argument("--inference", default=None,
+                   help="run dir holding 01_inference, for the Stage 6 marker "
+                        "cross-check. Needed when stage 1 lives in another run "
+                        "and --src would also redirect the meshes.")
     p.add_argument("--src", default=None,
                    help="run name to read the PREVIOUS stage from (default: --name)")
     p.add_argument("--no-dump", dest="dump", action="store_false", default=True,
@@ -563,6 +757,18 @@ def main():
     p.add_argument("--no-fill", action="store_true")
     p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg")
     p.add_argument("--segment-height-axis", default="z", choices=["x", "y", "z"])
+    p.add_argument("--cut-only", dest="cut_only", action="store_true",
+                   help="stage 3: skip straight to the cut, reusing the uncut "
+                        "result a previous --no-cut run left on disk. Needs "
+                        "--planes.")
+    p.add_argument("--no-cut", dest="no_cut", action="store_true",
+                   help="stage 3: detect the cutting planes and publish them, "
+                        "but do not cut. The uncut cloud is measured instead, "
+                        "so a review can approve the cut before it is applied.")
+    p.add_argument("--planes", default=None,
+                   help="JSON of cutting planes in levelled space to use instead "
+                        "of the detected ones (stage 3) — the shape stage 3 "
+                        "writes as cutting_line_levelled.json")
     p.add_argument("--recon-method", dest="recon_method", default="alpha_shape")
     p.add_argument("--box-recon-method", dest="box_recon_method", default=None)
     p.add_argument("--obj-recon-method", dest="obj_recon_method", default=None)

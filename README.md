@@ -3,11 +3,26 @@
 Measure an object's real-world volume from a handful of phone photos, using an
 ArUco-marked cube of known size as the scale reference.
 
-Six stages: **VGGT inference → point cloud → segment & cut → surface
-reconstruction → watertight check → real-world volume.** Only the first runs a
-neural network; the rest is geometry.
+Seven stages: **framing gate → VGGT inference → point cloud → segment & detect →
+surface reconstruction → watertight check → real-world volume**, with the marker
+cut applied once a person has confirmed where it falls. Stages 0 and 1 run neural
+networks; the rest is geometry. A cold run is ~91 s on an RTX 4060.
 
-Full technical detail in [`pipeline.md`](pipeline.md).
+Two stages stop for a decision. **Stage 0** refuses a capture it cannot frame — a
+photo that clips the reference cube corrupts the scale of every number the run
+reports, with no visible sign. **Stage 3** detects the cutting plane but does not
+apply it, so no volume is ever produced from a cut nobody approved.
+
+There is also a browser front end: `./serve.sh` starts the viewer and the compute
+service together.
+
+| | |
+|---|---|
+| Full technical detail | [`pipeline.md`](pipeline.md) |
+| Running the web app | [`docs/running_the_web_app.md`](docs/running_the_web_app.md) |
+| What changed against `main` | [`docs/changes_newVSold.md`](docs/changes_newVSold.md) |
+| Experiment log and verdicts | [`docs/experiments.md`](docs/experiments.md) |
+| Stage 6 — under review | [`docs/stage06_experiments.md`](docs/stage06_experiments.md) |
 
 ---
 
@@ -19,7 +34,7 @@ pip install -r requirements.txt
 ```
 
 Backends are auto-detected: **CUDA → MPS → CPU**. Developed on an RTX 4060
-(8 GB); a full run is ~40 s there.
+(8 GB); a full run is ~91 s there.
 
 ### Model weights
 

@@ -5,15 +5,63 @@ using an ArUco-marked cube of known size as the scale reference.
 
 ```
 Input images
+  → [0] Framing gate          frame_NN.png (518²), framing.json
+        ── refuses a capture it cannot frame ──
   → [1] VGGT inference        predictions.npz
   → [2] Point cloud export    points.ply
-  → [3] Segment & cut         objects/{box, leg_cut}.ply
+  → [3] Segment, detect       leg_open.ply, cutting_line_levelled.json
+        ── stops here for the cut to be confirmed ──
   → [4] Surface reconstruct   mesh/*_recon.ply
   → [5] Watertight check      mesh/*.ply
   → [6] Real-world volume     volumes.csv
+  → [3] Apply confirmed cut   objects/leg_cut.ply   (--cut-only)
+  → [4..6] again, limb only
 ```
 
-Six stages. Only Stage 1 runs a neural network; everything after is geometry.
+Seven stages, two of which take a human decision. Stages 0 and 1 run neural
+networks; everything else is geometry.
+
+Cold run on `inputs/small_leg`: **91 s** end to end.
+
+---
+
+## Stage 0 — Framing gate
+
+**File**: `pipeline/stages/prep.py` → `prepare_frames()`
+
+VGGT is handed a 518×518 square, and its own centre crop discards 43.8% of a 9:16
+phone photo with no regard for where the reference is — on `inputs/small_leg` that
+clipped the cube's base in two of six frames. This stage chooses the crop instead.
+
+| step | how |
+|---|---|
+| cube bounds | ArUco `DICT_5X5_250` face quads, expanded to whole faces by homography, unioned with a GroundingDINO box |
+| limb + band | GroundingDINO boxes, SAM masks; the band box must sit on the selected limb |
+| band colour | per-column max-deviation trace of the cord, **dilated ±3 rows** so it reports the cord's body rather than its darkest pixel |
+| window | full frame width, sliding vertically; must hold cube and band with 5% margin |
+| gate | accept if that window fits everything, **or** if VGGT's own centre crop would keep what is visible; reject only when neither holds |
+
+The measured band colour goes to Stage 3 in place of the config's fixed thresholds,
+which is what lets a marker of any colour work.
+
+### Rejection reasons
+
+| condition | reason | severity | rejected? |
+|---|---|---|---|
+| band missing, cube seen | `marker missing, not crucial` | not crucial | no |
+| cube missing, band seen | `cube missing, crucial` | crucial | yes |
+| both missing | `marker and cube missing, very crucial` | very crucial | yes |
+| detected, does not fit | `objects out of window` | crucial / very crucial | yes |
+
+A missing band costs the cut but not the scale, and the cut only needs the band on
+some frames, so that frame is kept. A missing or clipped cube costs the scale of
+every number the run reports, silently — which is why this stage refuses rather
+than warns.
+
+Anything not croppable is written out **raw** for VGGT to handle, rejected frames
+included, so a refused capture can still be inspected.
+`--continue-on-rejected` decides whether the run proceeds, not whether the frames
+are written.
 
 ---
 
@@ -175,6 +223,18 @@ open.
 
 **File**: `pipeline/stages/volume.py` → `compute_volumes()`
 
+> **Reverted to main's version**, pending review by the stage's author. What runs
+> is `linear_scale = (2744 / V_ref_mesh)^(1/3)` with axis-aligned extents, so the
+> reference cube reports exactly 2744.00 cm³ on every run — an identity, not a
+> measurement — and the 14 cm cube reads 18.80 × 19.30 × 14.06 cm.
+>
+> The section below describes the **parked** method, kept as a commented block at
+> the bottom of `volume.py`. See `docs/stage06_experiments.md`.
+>
+> The CSV columns are `ext_x/ext_y/ext_z/size_*_cm` rather than the parked
+> method's `obb_a/obb_b/obb_c/height_cm`. The web viewer reads both and mirrors
+> whichever derivation produced the file, so runs display either way.
+
 ### Scale from a measured length
 
 ```
@@ -254,6 +314,8 @@ recon instead, so they always exist if a mesh was produced.
 python run.py -i inputs/est_325 --no-segment-leg    # rigid object, no marker
 python run.py -i inputs/small_leg                   # limb with marker band
 python run.py -i inputs/est_325 --skip_mesh         # point cloud only
+python run.py -i inputs/small_leg --continue-on-rejected   # ignore the framing gate
+./serve.sh                                          # web app + compute service
 ```
 
 ### Stage-by-stage runner
@@ -340,10 +402,16 @@ workers/
   recons_methods_worker.py   reconstruction subprocess
   meshfix_worker.py          PyMeshFix subprocess
 tools/com_vol.py          standalone mesh-vs-reference volume tool
+service/                  HTTP front end: upload, run, serve artifacts
+serve.sh                  starts the web app and the service together
+web/                      viewer and review UI (Next.js)
 docs/
+  changes_newVSold.md     every change against main, plus the derivations
   experiments.md          every test, result and verdict
-  prompt.md               website design brief
-  update.md               historical snapshot (superseded)
+  pipeline_flowchart.md   diagrams and per-stage I/O
+  running_the_web_app.md  how to run the web app and the compute service
+  stage06_experiments.md  Stage 6 method history and what blocks accuracy
+  web_explaination.md     the web app explained from first principles
 work/                     stagerun outputs, one folder per stage's experiments
 ```
 

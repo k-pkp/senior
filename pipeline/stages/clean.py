@@ -28,8 +28,10 @@ from pipeline.core.fill import (
 # ── Core ──
 
 def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
+                        marker_colour=None,
                             segment_leg=False, segment_height_axis="z",
-                            fill_enabled=True, apply_cut=True):
+                            fill_enabled=True, apply_cut=True,
+                            override_planes=None):
     """Cluster-first clean pipeline.
 
     Phase A: Segment the dense cloud once (floor removal + DBSCAN), detect
@@ -46,6 +48,11 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     apply_cut=False stops after the uncut cloud and publishes the cutting planes
     instead. That is what an interactive review needs: the user sees a complete
     object plus where the pipeline would cut it, and decides.
+
+    override_planes closes that loop: it is the decision coming back. Given a
+    list of {"centroid", "normal"} in LEVELLED space, it replaces whatever
+    detection found, and everything downstream — the cut, the cross-section
+    caps, the volume — follows the person rather than the colour threshold.
     """
     from pipeline.ghost import voxel_dedup, normal_aware_filter, compute_voxel_size
 
@@ -97,7 +104,16 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     markers = []
     if segment_leg and obj_dense is not None and len(obj_dense.points) > 0:
         try:
-            _, summary = segment_point_cloud(obj_dense, height_axis=segment_height_axis, verbose=False)
+            if marker_colour:
+                print(f"  Marker colour from Stage 0: "
+                      f"RGB {[int(v) for v in marker_colour['rgb']]} "
+                      f"(ExG {marker_colour.get('exg', 0):+.0f}) — "
+                      f"thresholds follow the measured band, not the config "
+                      f"defaults")
+            _, summary = segment_point_cloud(obj_dense,
+                                             height_axis=segment_height_axis,
+                                             verbose=False,
+                                             marker_colour=marker_colour)
             planes_raw = summary.get("planes", [])
             for _, centroid, normal, npts, _ in planes_raw:
                 nrm = normal / (np.linalg.norm(normal) + 1e-8)
@@ -165,12 +181,15 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
 
         # Collapse the ghost sheet onto one surface. Runs per cluster so the
         # neighbourhood never spans two objects.
-        from pipeline.config import MLS_RADIUS_MULT
+        from pipeline.config import MLS_RADIUS_MULT, MLS_BOX_POLYNOMIAL
         if MLS_RADIUS_MULT and MLS_RADIUS_MULT > 0 and len(pts) > 50:
             from pipeline.mls import mls_project
+            # The reference is known to be planar; the limb is not.
+            poly = MLS_BOX_POLYNOMIAL if label == "box" else True
             print(f"  MLS [{label}]:", end=" ")
             pts, cols, _ = mls_project(pts, cols,
-                                       radius_mult=MLS_RADIUS_MULT)
+                                       radius_mult=MLS_RADIUS_MULT,
+                                       polynomial=poly)
         return pts, cols
 
     box_pts_arr, box_cols_arr = _ghost_filter(box_dense, "box")
@@ -308,6 +327,47 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
         with open(os.path.join(debug_dir_out, "cutting_line_levelled.json"), "w") as _f:
             _json.dump({"markers": markers_rotated, "space": "levelled"}, _f, indent=2)
 
+    # Publish the levelling rotation itself. Stage 1's pointmap lives in the
+    # unlevelled frame while every exported cloud and mesh lives in this one, so
+    # without R_total nothing downstream can relate the two — which is what
+    # Stage 6 needs to express a marker measurement as vertical or horizontal.
+    # Rotation preserves length, so pure distances do not need it; directions do.
+    with open(os.path.join(debug_dir_out, "levelling.json"), "w") as _f:
+        _json.dump({"R_total": np.asarray(R_total, dtype=float).tolist(),
+                    # The height the floor sits at in levelled space. A cut
+                    # applied later has to close down to the same floor this
+                    # pass used, or the two would disagree about where the
+                    # object ends.
+                    "floor_z": None if floor_z is None else float(floor_z),
+                    "note": "levelled = R_total @ pointmap; floor normal is +Z"},
+                   _f, indent=2)
+
+    # ── Planes supplied by a review, if any ──
+    #
+    # These arrive already in levelled space — the frame the review works in and
+    # the frame cutting_line_levelled.json publishes — so they need no rotation.
+    # Applied here rather than earlier so the detected planes are still written
+    # out above: a review that overrules detection should not erase the record
+    # of what was measured.
+    #
+    # MARKER_MIN_HEIGHT_FRAC is deliberately not applied. It exists to reject
+    # spurious detections near the floor, and a plane a person placed by hand is
+    # not one; silently discarding it would look like the cut was ignored.
+    if override_planes is not None:
+        markers_rotated = []
+        for m in list(override_planes)[:MAX_MARKERS]:
+            cen = np.asarray(m["centroid"], dtype=np.float64)
+            norm = np.asarray(m["normal"], dtype=np.float64)
+            norm = norm / (np.linalg.norm(norm) + 1e-8)
+            markers_rotated.append({"centroid": cen.tolist(),
+                                    "normal": norm.tolist(),
+                                    "npts": int(m.get("npts", 0))})
+        print(f"Markers: {len(markers_rotated)} supplied by review "
+              f"(detection found {len(markers)})")
+        with open(os.path.join(debug_dir_out, "cutting_line_review.json"), "w") as _f:
+            _json.dump({"markers": markers_rotated, "space": "levelled",
+                        "source": "review"}, _f, indent=2)
+
     # ── Close whatever the cut actually leaves open ──
     #
     # The floor extension and bottom cap fabricate a base at floor level. That
@@ -332,7 +392,10 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
         # The box is never cut, so its base is always the floor.
         # Extend down to the floor first — capping at the raw z_min would seal
         # the object above the ground and lose the shadowed base entirely.
-        o3d_box = extend_point_cloud_to_floor(o3d_box, floor_z, label="box")
+        # alpha matches the cap below: the cube's silhouette is convex, so a
+        # concave outline could only be noise biting into a corner.
+        o3d_box = extend_point_cloud_to_floor(o3d_box, floor_z, alpha=0.0,
+                                              label="box")
         o3d_box = cap_point_cloud_bottom(o3d_box, alpha=0.0)
 
     def _close_to_floor(pts, cols):
@@ -346,6 +409,14 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
         out_cols = ((np.clip(np.asarray(p.colors, dtype=np.float32), 0, 1) * 255)
                     .astype(np.uint8) if p.has_colors() else cols)
         return out_pts, out_cols
+
+    # The cut operates on the OPEN cloud — floor-cut but not yet floor-closed —
+    # and only then closes what the cut leaves open. Saving it is what lets a
+    # deferred cut reproduce this pass exactly instead of approximating it by
+    # cutting the closed cloud, which carries a fabricated skirt the real path
+    # never cuts through.
+    _quick_save_ply(leg_pts_rot, leg_cols_arr,
+                    os.path.join(objects_dir, "leg_open.ply"))
 
     # Complete but uncut — the review cloud. Always floor-closed.
     nc_pts, nc_cols = _close_to_floor(leg_pts_rot, leg_cols_arr)
@@ -390,18 +461,29 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     merged_path = os.path.join(objects_dir, "merged.ply")
 
     # leg_cut + box
+    #
+    # With the cut deferred there is deliberately no leg_cut.ply. Writing the
+    # uncut cloud under that name would send stages 4-6 off to reconstruct and
+    # integrate a limb whose extent nobody has agreed to yet, and every second
+    # of that is thrown away the moment the cut is confirmed. The reference cube
+    # still goes through, because its measurement does not depend on the cut and
+    # the review needs its edge length to show anything in centimetres.
     output_paths = []
-    if len(o3d_leg.points) > 0:
+    if apply_cut and len(o3d_leg.points) > 0:
         o3d.io.write_point_cloud(leg_cut_path, o3d_leg)
         output_paths.append(leg_cut_path)
         print(f"Saved: {leg_cut_path} ({len(o3d_leg.points):,} pts)")
+    elif not apply_cut:
+        if os.path.exists(leg_cut_path):
+            os.remove(leg_cut_path)   # a stale one would be measured instead
+        print("Deferred: leg_cut.ply not written — awaiting the confirmed cut")
     if len(o3d_box.points) > 0:
         o3d.io.write_point_cloud(box_path, o3d_box)
         output_paths.append(box_path)
         print(f"Saved: {box_path} ({len(o3d_box.points):,} pts)")
 
     # merged.ply
-    if len(o3d_leg.points) > 0 and len(o3d_box.points) > 0:
+    if apply_cut and len(o3d_leg.points) > 0 and len(o3d_box.points) > 0:
         merged_pcd = o3d.geometry.PointCloud()
         mp = np.vstack([np.asarray(o3d_leg.points), np.asarray(o3d_box.points)])
         mc = np.vstack([np.asarray(o3d_leg.colors), np.asarray(o3d_box.colors)])
@@ -442,7 +524,8 @@ def _array_to_o3d(points, colors_uint8):
 
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
                       segment_leg=False, segment_height_axis="z",
-                      fill_enabled=True, clean_ply_path=None, apply_cut=True):
+                      fill_enabled=True, clean_ply_path=None, apply_cut=True,
+                      marker_colour=None, override_planes=None):
     """Pipeline wrapper. clean_ply_path is accepted for call-site compatibility
     and ignored — Stage 3 derives its own ghost-filtered clouds from ply_path."""
     print()
@@ -461,6 +544,8 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
             segment_height_axis=segment_height_axis,
             fill_enabled=fill_enabled,
             apply_cut=apply_cut,
+            marker_colour=marker_colour,
+            override_planes=override_planes,
         )
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:
@@ -471,3 +556,101 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
         traceback.print_exc()
         print(f"  ERROR during stage 3: {e}")
         return None
+
+
+def cut_only(stage3_dir, planes, fill_enabled=True):
+    """Apply confirmed cutting planes to a stage 3 output that deferred its cut.
+
+    This is the second half of a split Stage 3. The first half did all the
+    expensive work — SOR, RANSAC, DBSCAN, ghost filtering, MLS, levelling,
+    marker detection — and saved the levelled limb in the exact state the cut
+    operates on (`leg_open.ply`: floor-cut, not yet floor-closed). None of that
+    depends on where the cut goes, so none of it is repeated here.
+
+    The steps below are the same ones, in the same order, that
+    `_segment_and_export` runs after its own detection. They have to be: the
+    whole point of splitting is that confirming the detected plane must give
+    the identical answer to never having split at all.
+
+    `planes` are {"centroid", "normal"} in LEVELLED space. An empty list means
+    the user chose to measure the object whole.
+    """
+    import json as _json
+
+    objects_dir = os.path.join(stage3_dir, "objects")
+    debug_dir_out = os.path.join(stage3_dir, "debug")
+    open_path = os.path.join(objects_dir, "leg_open.ply")
+    box_path = os.path.join(objects_dir, "box.ply")
+    if not os.path.exists(open_path):
+        raise SystemExit(
+            f"ERROR: {open_path} missing — run stage 3 with --no-cut first, so "
+            f"there is a detected-but-uncut result to apply a cut to")
+
+    with open(os.path.join(debug_dir_out, "levelling.json")) as f:
+        floor_z = _json.load(f).get("floor_z")
+
+    pcd = o3d.io.read_point_cloud(open_path)
+    pts = np.asarray(pcd.points, dtype=np.float32)
+    cols = ((np.clip(np.asarray(pcd.colors, dtype=np.float32), 0, 1) * 255)
+            .astype(np.uint8) if pcd.has_colors() else None)
+    print(f"Loaded uncut limb: {len(pts):,} pts")
+
+    markers = []
+    for m in list(planes)[:MAX_MARKERS]:
+        n = np.asarray(m["normal"], dtype=np.float64)
+        n = n / (np.linalg.norm(n) + 1e-8)
+        markers.append({"centroid": np.asarray(m["centroid"], dtype=np.float64).tolist(),
+                        "normal": n.tolist(), "npts": int(m.get("npts", 0))})
+
+    def _close_to_floor(p_pts, p_cols):
+        if not fill_enabled or floor_z is None or len(p_pts) == 0:
+            return p_pts, p_cols
+        p = _array_to_o3d(p_pts, p_cols)
+        p = extend_point_cloud_to_floor(p, floor_z, label="obj")
+        p = cap_point_cloud_bottom(p, alpha=2.0)
+        out = np.asarray(p.points, dtype=np.float32)
+        oc = ((np.clip(np.asarray(p.colors, dtype=np.float32), 0, 1) * 255)
+              .astype(np.uint8) if p.has_colors() else p_cols)
+        return out, oc
+
+    if markers:
+        keep, case = apply_marker_cut(pts.astype(np.float64), markers)
+        if int(keep.sum()) >= 50:
+            pts, cols = pts[keep], (None if cols is None else cols[keep])
+            print(f"Marker cut ({case}): leg → {len(pts):,} pts")
+            if fill_enabled:
+                for i, mr in enumerate(markers):
+                    pts, cols = cap_points_on_plane(pts, cols, mr["centroid"],
+                                                    mr["normal"], label=f"marker {i}")
+                pts = pts.astype(np.float32)
+            if len(markers) < 2:
+                pts, cols = _close_to_floor(pts, cols)
+        else:
+            print(f"Marker cut ({case}): only {int(keep.sum())} pts (< 50) — "
+                  f"keeping the whole limb")
+            pts, cols = _close_to_floor(pts, cols)
+    else:
+        print("No cutting planes supplied — measuring the limb whole")
+        pts, cols = _close_to_floor(pts, cols)
+
+    with open(os.path.join(debug_dir_out, "cutting_line_review.json"), "w") as f:
+        _json.dump({"markers": markers, "space": "levelled", "source": "review"},
+                   f, indent=2)
+
+    leg_cut_path = os.path.join(objects_dir, "leg_cut.ply")
+    o3d_leg = _array_to_o3d(pts, cols)
+    o3d.io.write_point_cloud(leg_cut_path, o3d_leg)
+    print(f"Saved: {leg_cut_path} ({len(pts):,} pts)")
+
+    out = [leg_cut_path]
+    if os.path.exists(box_path):
+        out.append(box_path)
+        box = o3d.io.read_point_cloud(box_path)
+        merged = o3d.geometry.PointCloud()
+        merged.points = o3d.utility.Vector3dVector(
+            np.vstack([np.asarray(o3d_leg.points), np.asarray(box.points)]))
+        if o3d_leg.has_colors() and box.has_colors():
+            merged.colors = o3d.utility.Vector3dVector(
+                np.vstack([np.asarray(o3d_leg.colors), np.asarray(box.colors)]))
+        o3d.io.write_point_cloud(os.path.join(objects_dir, "merged.ply"), merged)
+    return out

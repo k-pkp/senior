@@ -58,6 +58,23 @@ def reconstruct_multiple_objects(input_paths, output_folder="output_mesh",
         recon_ply = os.path.join(output_folder, f"{name}.ply")
         recon_stl = os.path.join(output_folder, f"{name}.stl")
 
+        # Reuse a mesh that is already newer than the cloud it came from.
+        #
+        # The reference cube is the case this exists for: the cut does not
+        # touch it, so a run that measures the cube first and cuts the limb
+        # afterwards would otherwise reconstruct the same cube twice. Alpha
+        # shapes are deterministic under a fixed seed, so the reused mesh is
+        # the one that would have been rebuilt.
+        if (os.path.exists(recon_ply)
+                and os.path.getmtime(recon_ply) >= os.path.getmtime(path)):
+            mesh = o3d.io.read_triangle_mesh(recon_ply)
+            mesh.compute_vertex_normals()
+            print(f"  Reusing {name}: {len(mesh.vertices):,} verts, "
+                  f"{len(mesh.triangles):,} faces (cloud unchanged)")
+            recon_paths.append(recon_ply)
+            meshes.append(mesh)
+            continue
+
         result = subprocess.run(
             [sys.executable, _RECONS_WORKER, path, recon_ply,
              "--method", obj_method_name, "--seed", str(seed)],

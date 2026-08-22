@@ -218,31 +218,6 @@ def main():
         predictions, inference_time = run_inference(inference_input, device, args.max_frames)
         print(f"[DBG-stage] stage1 inference: {inference_time:.2f}s")
 
-        # ── Stage 1b: Detection (after VGGT, uses freed GPU) ──
-        detection_seeds = None
-        if getattr(args, "use_detection", False):
-            _dbg_t = time.time()
-            try:
-                from pipeline.detection import detect_objects, seeds_to_xyz_labels
-                print()
-                print("=" * 60)
-                print("STAGE 1b: Object detection (Grounding DINO + SAM)")
-                print("=" * 60)
-                images_for_det = predictions["images"]
-                detection_seeds = detect_objects(images_for_det)
-                if detection_seeds:
-                    mode = getattr(args, "prediction_mode", "pointmap")
-                    wp = predictions.get("world_points" if mode == "pointmap" else "world_points_from_depth")
-                    if wp is not None:
-                        _, _ = seeds_to_xyz_labels(detection_seeds, wp)
-                        args._detection_seeds = detection_seeds
-                print(f"[DBG-stage] stage1b detection: {time.time() - _dbg_t:.2f}s")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f"  WARNING: Detection failed ({e}), falling back to heuristic")
-                detection_seeds = None
-
         # Save predictions (compatible with demo_gradio)
         npz_path = os.path.join(target_dir, "predictions.npz")
         save_dict = {k: v for k, v in predictions.items() if v is not None}

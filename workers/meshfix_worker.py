@@ -49,15 +49,6 @@ def _is_watertight(vertices, faces):
     return bool(m.is_watertight)
 
 
-def _merge_duplicates(vertices, faces, tol=1e-8):
-    """Weld coincident vertices so re-loaders see one watertight mesh."""
-    del tol
-    import trimesh
-    m = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    m.merge_vertices(merge_tex=True, merge_norm=True, digits_vertex=8)
-    return np.asarray(m.vertices, dtype=np.float64), np.asarray(m.faces, dtype=np.int64)
-
-
 def main():
     input_path = sys.argv[1]
     output_path = sys.argv[2]

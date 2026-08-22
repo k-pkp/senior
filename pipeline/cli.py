@@ -61,8 +61,6 @@ Examples:
                    help="Skip watertight repair (export only Poisson reconstruction)")
     p.add_argument("--no-fill", action="store_true",
                    help="Skip bottom cap fill during cleaning")
-    p.add_argument("--use-detection", action="store_true",
-                   help="Use Grounding DINO + SAM for object detection (leg/cube labeling)")
     p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg",
                    help="Disable marker-based leg surface segmentation (enabled by default)")
     p.add_argument("--segment-height-axis", type=str, default="z", choices=["x", "y", "z"],

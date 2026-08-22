@@ -37,73 +37,105 @@ def mls_project(points, colors=None, radius_mult=3.0, min_neighbors=8,
     """
     from scipy.spatial import cKDTree
 
-    pts = np.asarray(points, dtype=np.float64)
-    n = len(pts)
-    if n < min_neighbors:
-        return points, colors, {"moved_mm": 0.0}
+    points = np.asarray(points, dtype=np.float64)
+    point_count = len(points)
 
-    tree = cKDTree(pts)
-    d, _ = tree.query(pts[np.random.default_rng(0).choice(
-        n, min(5000, n), replace=False)], k=2, workers=-1)
-    spacing = float(d[:, 1].mean())
-    radius = spacing * radius_mult
+    def _stats(spacing=0.0, radius=0.0, median_move=0.0, p95_move=0.0, skipped=0):
+        """One shape for the stats dict, whichever way the function returns.
 
-    neighbours = tree.query_ball_point(pts, r=radius, workers=-1)
+        The early return used to hand back {"moved_mm": 0.0} while the normal
+        path returned five different keys, so any caller that read the normal
+        keys would raise KeyError on a cloud too small to project.
+        """
+        return {"spacing": spacing, "radius": radius, "median_move": median_move,
+                "p95_move": p95_move, "skipped": skipped}
 
-    out = pts.copy()
-    moved = np.zeros(n)
-    skipped = 0
+    if point_count < min_neighbors:
+        return points, colors, _stats(skipped=point_count)
 
-    for i, nb in enumerate(neighbours):
-        if len(nb) < min_neighbors:
-            skipped += 1
+    tree = cKDTree(points)
+
+    # Mean nearest-neighbour distance, sampled rather than measured over every
+    # point because the mean converges long before 5000 samples and the query is
+    # the expensive part. k=2 because the nearest neighbour of a point is itself.
+    sample_indices = np.random.default_rng(0).choice(
+        point_count, min(5000, point_count), replace=False)
+    neighbour_distances, _ = tree.query(points[sample_indices], k=2, workers=-1)
+    point_spacing = float(neighbour_distances[:, 1].mean())
+    neighbourhood_radius = point_spacing * radius_mult
+
+    neighbourhoods = tree.query_ball_point(points, r=neighbourhood_radius, workers=-1)
+
+    projected = points.copy()
+    distance_moved = np.zeros(point_count)
+    skipped_count = 0
+
+    for point_index, neighbour_indices in enumerate(neighbourhoods):
+        if len(neighbour_indices) < min_neighbors:
+            skipped_count += 1
             continue
-        q = pts[nb]
-        centroid = q.mean(axis=0)
-        c = q - centroid
 
-        # Local frame: normal is the least-variance direction.
-        _, _, vt = np.linalg.svd(c, full_matrices=False)
-        normal = vt[2]
-        u, v = vt[0], vt[1]
+        neighbour_points = points[neighbour_indices]
+        neighbourhood_centre = neighbour_points.mean(axis=0)
+        centred = neighbour_points - neighbourhood_centre
 
-        # Coordinates in the tangent frame.
-        a = c @ u
-        b = c @ v
-        h = c @ normal
+        # Local frame from the neighbourhood's own spread: the least-variance
+        # direction is the surface normal, the other two span the tangent plane.
+        _, _, principal_axes = np.linalg.svd(centred, full_matrices=False)
+        normal = principal_axes[2]
+        tangent_u, tangent_v = principal_axes[0], principal_axes[1]
 
-        if polynomial and len(nb) >= 6:
-            # h ~ c0 + c1*a + c2*b + c3*a² + c4*ab + c5*b²
-            A = np.column_stack([np.ones_like(a), a, b, a * a, a * b, b * b])
+        # Re-express each neighbour as (position in the tangent plane, height
+        # above it) so the surface can be fitted as a height field.
+        offset_u = centred @ tangent_u
+        offset_v = centred @ tangent_v
+        height = centred @ normal
+
+        if polynomial and len(neighbour_indices) >= 6:
+            # height ~ c0 + c1*u + c2*v + c3*u² + c4*uv + c5*v² — curved, so a
+            # limb keeps its curvature instead of being flattened.
+            design = np.column_stack([np.ones_like(offset_u), offset_u, offset_v,
+                                      offset_u * offset_u,
+                                      offset_u * offset_v,
+                                      offset_v * offset_v])
             try:
-                coef, *_ = np.linalg.lstsq(A, h, rcond=None)
+                coefficients, *_ = np.linalg.lstsq(design, height, rcond=None)
             except np.linalg.LinAlgError:
-                skipped += 1
+                skipped_count += 1
                 continue
         else:
-            A = np.column_stack([np.ones_like(a), a, b])
-            coef, *_ = np.linalg.lstsq(A, h, rcond=None)
-            coef = np.concatenate([coef, np.zeros(3)])
+            # height ~ c0 + c1*u + c2*v — a flat patch. Pad the quadratic terms
+            # with zeros so the evaluation below is the same expression either way.
+            design = np.column_stack([np.ones_like(offset_u), offset_u, offset_v])
+            coefficients, *_ = np.linalg.lstsq(design, height, rcond=None)
+            coefficients = np.concatenate([coefficients, np.zeros(3)])
 
-        # Evaluate the fitted height at this point's own tangent coordinates.
-        pa = float((pts[i] - centroid) @ u)
-        pb = float((pts[i] - centroid) @ v)
-        h_fit = (coef[0] + coef[1] * pa + coef[2] * pb
-                 + coef[3] * pa * pa + coef[4] * pa * pb + coef[5] * pb * pb)
+        # Evaluate the fitted surface at this point's own tangent coordinates,
+        # then move the point there.
+        this_u = float((points[point_index] - neighbourhood_centre) @ tangent_u)
+        this_v = float((points[point_index] - neighbourhood_centre) @ tangent_v)
+        fitted_height = (coefficients[0]
+                         + coefficients[1] * this_u
+                         + coefficients[2] * this_v
+                         + coefficients[3] * this_u * this_u
+                         + coefficients[4] * this_u * this_v
+                         + coefficients[5] * this_v * this_v)
 
-        target = centroid + pa * u + pb * v + h_fit * normal
-        moved[i] = np.linalg.norm(target - pts[i])
-        out[i] = target
+        target = (neighbourhood_centre
+                  + this_u * tangent_u
+                  + this_v * tangent_v
+                  + fitted_height * normal)
+        distance_moved[point_index] = np.linalg.norm(target - points[point_index])
+        projected[point_index] = target
 
-    stats = {
-        "spacing": spacing,
-        "radius": radius,
-        "median_move": float(np.median(moved)),
-        "p95_move": float(np.percentile(moved, 95)),
-        "skipped": skipped,
-    }
+    stats = _stats(spacing=point_spacing,
+                   radius=neighbourhood_radius,
+                   median_move=float(np.median(distance_moved)),
+                   p95_move=float(np.percentile(distance_moved, 95)),
+                   skipped=skipped_count)
     if verbose:
-        print(f"  MLS: radius {radius:.5f} ({radius_mult:.1f}x spacing), "
+        print(f"  MLS: radius {neighbourhood_radius:.5f} "
+              f"({radius_mult:.1f}x spacing), "
               f"moved median {stats['median_move']:.5f}, "
-              f"p95 {stats['p95_move']:.5f}, skipped {skipped:,}")
-    return out.astype(np.float32), colors, stats
+              f"p95 {stats['p95_move']:.5f}, skipped {skipped_count:,}")
+    return projected.astype(np.float32), colors, stats

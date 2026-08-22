@@ -236,24 +236,46 @@ export function Framing({
       >
         {report.frames.map((f) => (
           <Panel key={f.index} pad={0}>
-            <button
-              onClick={() => setZoom(`${baseUrl}/${f.overlay}`)}
-              style={{
-                display: "block", width: "100%", border: 0, padding: 0,
-                background: "transparent", cursor: "zoom-in",
-              }}
-            >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={`${baseUrl}/${f.overlay}`}
-                alt={`${f.source} framing`}
+            {f.overlay ? (
+              <button
+                onClick={() => setZoom(`${baseUrl}/${f.overlay}`)}
                 style={{
-                  width: "100%", display: "block",
+                  display: "block", width: "100%", border: 0, padding: 0,
+                  background: "transparent", cursor: "zoom-in",
+                }}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={`${baseUrl}/${f.overlay}`}
+                  alt={`${f.source} framing`}
+                  style={{
+                    width: "100%", display: "block",
+                    borderTopLeftRadius: "var(--radius)",
+                    borderTopRightRadius: "var(--radius)",
+                  }}
+                />
+              </button>
+            ) : (
+              // No overlay means the file could not be decoded, so there is no
+              // frame to draw boxes on. Say that, rather than rendering a broken
+              // image element.
+              <div
+                style={{
+                  aspectRatio: "3 / 4",
+                  display: "grid",
+                  placeItems: "center",
+                  background: "var(--soft)",
                   borderTopLeftRadius: "var(--radius)",
                   borderTopRightRadius: "var(--radius)",
+                  font: "400 12px/1.5 var(--sans)",
+                  color: "var(--muted)",
+                  textAlign: "center",
+                  padding: 16,
                 }}
-              />
-            </button>
+              >
+                this file could not be opened
+              </div>
+            )}
             <div style={{ padding: "10px 12px 12px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span

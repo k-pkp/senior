@@ -27,6 +27,262 @@ from pipeline.core.fill import (
 
 # ── Core ──
 
+# ── Phase A helpers ────────────────────────────────────────────────────────
+#
+# Stage 3 used to be one 468-line function holding ninety local names, ten of
+# them alive across more than two hundred lines. The phases it printed were
+# already the natural seams, so each is a function now: what used to be implicit
+# shared state is an argument or a return value you can read at the call site.
+
+
+def _load_and_thin(dense_ply):
+    """Read the dense cloud, drop outliers, and thin it enough to cluster.
+
+    The outlier thresholds loosen as the cloud gets smaller: on a sparse cloud a
+    2.5-sigma cut removes real surface, because the mean neighbour distance is
+    itself noisy.
+    """
+    cloud = o3d.io.read_point_cloud(dense_ply)
+    if len(cloud.points) == 0:
+        raise ValueError("Empty dense point cloud")
+    initial_count = len(cloud.points)
+    print(f"Loaded dense cloud: {initial_count:,} points")
+
+    if initial_count < 50000:
+        std_ratio, neighbours = 3.5, 10
+    elif initial_count < 200000:
+        std_ratio, neighbours = 3.0, 15
+    else:
+        std_ratio, neighbours = 2.5, 20
+    cloud, _ = cloud.remove_statistical_outlier(
+        nb_neighbors=neighbours, std_ratio=std_ratio)
+    print(f"SOR: {initial_count:,} → {len(cloud.points):,} (std_ratio={std_ratio})")
+
+    # Purely a speed measure: RANSAC and DBSCAN both scale badly, and this runs
+    # on the whole scene before either. The surface-scale decimation happens
+    # later, in the ghost filter, at a size derived from the cloud itself.
+    if len(cloud.points) > 100000:
+        cloud = cloud.voxel_down_sample(voxel_size=0.002)
+        print(f"Voxel downsample: → {len(cloud.points):,}")
+    return cloud
+
+
+def _split_into_objects(dense_cloud, num_objects):
+    """Separate the scene into the reference cube and the subject.
+
+    The floor is removed from a *copy* first, because while it is present it
+    touches both objects and DBSCAN sees one connected blob. The dense cloud
+    itself keeps its floor — Phase B needs it to find the ground plane.
+    """
+    without_floor = o3d.geometry.PointCloud(dense_cloud)
+    without_floor, _ = remove_dominant_plane(without_floor)
+
+    box_cluster, object_cluster = detect_top_k_objects(without_floor, k=num_objects)
+    if box_cluster is None:
+        box_cluster = without_floor
+        object_cluster = None
+        print("  Only 1 cluster on dense — treating as box")
+    return box_cluster, object_cluster
+
+
+def _detect_marker_planes(object_cluster, height_axis, marker_colour):
+    """Cutting planes from the coloured band, in original VGGT space.
+
+    Detection runs on the dense cluster rather than the filtered one because it
+    is a colour test, and thinning throws away exactly the sparse coloured points
+    it depends on. Returns [] rather than raising: a capture with no band is a
+    valid capture that simply will not be cut.
+    """
+    markers = []
+    if object_cluster is None or len(object_cluster.points) == 0:
+        return markers
+    try:
+        if marker_colour:
+            print(f"  Marker colour from Stage 0: "
+                  f"RGB {[int(v) for v in marker_colour['rgb']]} "
+                  f"(ExG {marker_colour.get('exg', 0):+.0f}) — "
+                  f"thresholds follow the measured band, not the config "
+                  f"defaults")
+        _, summary = segment_point_cloud(object_cluster,
+                                         height_axis=height_axis,
+                                         verbose=False,
+                                         marker_colour=marker_colour)
+        for _, centroid, normal, point_count, _ in summary.get("planes", []):
+            unit_normal = normal / (np.linalg.norm(normal) + 1e-8)
+            markers.append({"centroid": np.array(centroid, dtype=np.float64),
+                            "normal": np.array(unit_normal, dtype=np.float64),
+                            "npts": int(point_count)})
+        print(f"  Dense leg markers: {len(markers)} plane(s) found")
+    except Exception as e:
+        print(f"  Marker detection skipped: {e}")
+    return markers
+
+
+def _save_cluster_debug(debug_dir, object_cluster, box_cluster, markers):
+    """The dense cluster and the planes found on it, in ORIGINAL VGGT space.
+
+    Written before levelling, so these coordinates do not share a frame with any
+    exported mesh. `cutting_line_levelled.json`, written later, is the one a
+    viewer should read.
+    """
+    import json as _json
+
+    source = object_cluster if (object_cluster is not None
+                                and len(object_cluster.points) > 0) else box_cluster
+    if source is not None and len(source.points) > 0:
+        _quick_save_ply(np.asarray(source.points, dtype=np.float32), None,
+                        os.path.join(debug_dir, "leg_cluster.ply"))
+
+    with open(os.path.join(debug_dir, "cutting_line.json"), "w") as f:
+        _json.dump({"markers": [{"centroid": m["centroid"].tolist(),
+                                 "normal": m["normal"].tolist(),
+                                 "npts": m.get("npts", 0)} for m in markers]},
+                   f, indent=2)
+    print("  Saved: debug/leg_cluster.ply + debug/cutting_line.json")
+
+
+def _ghost_filter_scales(dense_cloud):
+    """(dedup voxel size, length scale for the normal filter).
+
+    One size for the whole scene, not per cluster: derived per object the two
+    would differ and leave the cube and the limb at inconsistent densities,
+    which then feeds MLS two different neighbourhood radii.
+
+    GHOST_VOXEL_FACTOR = 0 disables deduplication but the normal filter still
+    needs a length scale, so that is computed either way.
+    """
+    from pipeline.config import GHOST_VOXEL_FACTOR
+    from pipeline.ghost import compute_voxel_size
+
+    all_points = np.asarray(dense_cloud.points, dtype=np.float32)
+    if GHOST_VOXEL_FACTOR <= 0:
+        print("  Ghost voxel dedup: DISABLED (GHOST_VOXEL_FACTOR=0) — keeping "
+              "every point; ghost layers survive for the normal filter to catch")
+        return 0.0, compute_voxel_size(all_points, factor=1.0)
+    voxel_size = compute_voxel_size(all_points)
+    print(f"  Ghost voxel_size: {voxel_size:.4f} (shared across clusters)")
+    return voxel_size, voxel_size
+
+
+def _clean_cluster(cluster, label, voxel_size, normal_filter_scale):
+    """Deduplicate, drop misoriented points, and project onto a fitted surface.
+
+    Runs per cluster so no MLS neighbourhood ever spans two objects.
+    """
+    from pipeline.config import MLS_RADIUS_MULT, MLS_BOX_POLYNOMIAL
+    from pipeline.ghost import voxel_dedup, normal_aware_filter
+
+    if cluster is None or len(cluster.points) == 0:
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.uint8))
+    points = np.asarray(cluster.points, dtype=np.float32)
+    colours = (np.clip(np.asarray(cluster.colors, dtype=np.float32), 0, 1)
+               * 255).astype(np.uint8)
+    before = len(points)
+    points, colours = voxel_dedup(points, colours, voxel_size)
+    points, colours = normal_aware_filter(points, colours, normal_filter_scale)
+    print(f"  Ghost filter [{label}]: {before:,} → {len(points):,} pts")
+
+    if MLS_RADIUS_MULT and MLS_RADIUS_MULT > 0 and len(points) > 50:
+        from pipeline.mls import mls_project
+        # The reference is known to be planar; the limb is not.
+        use_quadratic = MLS_BOX_POLYNOMIAL if label == "box" else True
+        print(f"  MLS [{label}]:", end=" ")
+        points, colours, _ = mls_project(points, colours,
+                                         radius_mult=MLS_RADIUS_MULT,
+                                         polynomial=use_quadratic)
+    return points, colours
+
+
+# ── Phase B and C helpers ──────────────────────────────────────────────────
+
+
+def _level_to_ground(dense_cloud, seed):
+    """Rotate the scene so the ground plane is flat and Z points up.
+
+    Rotates `dense_cloud` IN PLACE and returns the total rotation, because every
+    other cloud -- and the marker planes, which were detected in original VGGT
+    space -- has to receive exactly the same transform. Handing back the matrix
+    is what lets the caller apply it to all of them.
+
+    The second RANSAC decides which way up the scene ended: if the bulk of the
+    non-floor points sits BELOW the floor plane, the fit picked the normal's
+    other direction and everything is upside down.
+    """
+    threshold = auto_ransac_threshold(dense_cloud, base_factor=3)
+    plane_model, _ = detect_plane_ransac_deterministic(
+        dense_cloud, distance_threshold=threshold, num_iterations=1000, seed=seed)
+    ground_normal = plane_model[:3]
+    print(f"RANSAC plane normal: ({ground_normal[0]:.4f}, "
+          f"{ground_normal[1]:.4f}, {ground_normal[2]:.4f})")
+
+    upright_rotation = get_rotation_to_z_axis(ground_normal)
+    total_rotation = np.asarray(upright_rotation, dtype=np.float64)
+    dense_cloud.rotate(upright_rotation, center=(0, 0, 0))
+    levelled_points = np.asarray(dense_cloud.points, dtype=np.float32)
+
+    try:
+        _, floor_indices = detect_plane_ransac_deterministic(
+            dense_cloud, distance_threshold=threshold, num_iterations=500, seed=seed)
+        floor_height = np.mean(levelled_points[floor_indices, 2])
+        off_floor = np.ones(len(levelled_points), dtype=bool)
+        off_floor[floor_indices] = False
+        if off_floor.any() and np.mean(levelled_points[off_floor, 2]) < floor_height:
+            print("Upside-down detected — flipping 180°")
+            flip = o3d.geometry.get_rotation_matrix_from_xyz((np.pi, 0, 0))
+            dense_cloud.rotate(flip, center=(0, 0, 0))
+            levelled_points = np.asarray(dense_cloud.points, dtype=np.float32)
+            total_rotation = np.asarray(flip, dtype=np.float64) @ total_rotation
+    except Exception as e:
+        print(f"Upside-down check failed: {e}")
+
+    return total_rotation, levelled_points
+
+
+def _find_ground_height(dense_cloud, levelled_points, seed):
+    """Height of the floor in levelled space, or None if it cannot be trusted.
+
+    Three tests, all of which must pass, because cutting at a plane that is not
+    the floor would silently remove part of the object:
+      horizontal  -- its normal is within ~32 degrees of vertical
+      at the bottom -- it sits in the lowest quarter of the scene
+      substantial -- it accounts for at least 5% of the points
+
+    Returning None means "do not cut", which is the safe direction: the object
+    keeps a little floor rather than losing its base.
+    """
+    try:
+        threshold = min(auto_ransac_threshold(dense_cloud, base_factor=3), 0.015)
+        plane_model, floor_indices = detect_plane_ransac_deterministic(
+            dense_cloud, distance_threshold=threshold, num_iterations=1000, seed=seed)
+        plane_normal = plane_model[:3]
+        is_horizontal = abs(np.dot(plane_normal, [0, 0, 1])) > 0.85
+
+        heights = levelled_points[:, 2]
+        lowest, highest = np.min(heights), np.max(heights)
+        plane_height = np.median(levelled_points[floor_indices, 2])
+        is_at_the_bottom = (plane_height - lowest) < 0.25 * (highest - lowest)
+        share_of_points = len(floor_indices) / len(levelled_points)
+
+        if is_horizontal and is_at_the_bottom and share_of_points > 0.05:
+            print(f"Floor plane at Z={plane_height:.4f} "
+                  f"(ratio={share_of_points:.1%})")
+            return plane_height
+        print(f"Floor cut skipped (horiz={is_horizontal}, "
+              f"bottom={is_at_the_bottom}, ratio={share_of_points:.1%})")
+    except Exception as e:
+        print(f"Floor detection failed: {e}")
+    return None
+
+
+def _drop_below_floor(points, colours, floor_height, margin=0.008):
+    """Remove everything at or under the floor. A no-op if there is no floor."""
+    if floor_height is None or len(points) == 0:
+        return points, colours
+    above = points[:, 2] > (floor_height + margin)
+    return points[above], colours[above]
+
+
 def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
                         marker_colour=None,
                             segment_leg=False, segment_height_axis="z",
@@ -61,139 +317,40 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     os.makedirs(objects_dir, exist_ok=True)
     os.makedirs(debug_dir_out, exist_ok=True)
 
+    import json as _json
+
     # ── Load ──
-    pcd_dense = o3d.io.read_point_cloud(dense_ply)
-    if len(pcd_dense.points) == 0:
-        raise ValueError("Empty dense point cloud")
-    initial_count = len(pcd_dense.points)
-    print(f"Loaded dense cloud: {initial_count:,} points")
+    pcd_dense = _load_and_thin(dense_ply)
 
-    # SOR
-    if initial_count < 50000:
-        std_ratio, nb_neighbors = 3.5, 10
-    elif initial_count < 200000:
-        std_ratio, nb_neighbors = 3.0, 15
-    else:
-        std_ratio, nb_neighbors = 2.5, 20
-    pcd_dense, _ = pcd_dense.remove_statistical_outlier(
-        nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-    print(f"SOR: {initial_count:,} → {len(pcd_dense.points):,} (std_ratio={std_ratio})")
-
-    if len(pcd_dense.points) > 100000:
-        pcd_dense = pcd_dense.voxel_down_sample(voxel_size=0.002)
-        print(f"Voxel downsample: → {len(pcd_dense.points):,}")
-
-    # ── Phase A: Cluster both flows in original VGGT space ──
+    # ── Phase A: cluster in original VGGT space ──
+    #
+    # Everything here happens BEFORE levelling and before any thinning of the
+    # surface, because both of the things this phase decides -- which cluster is
+    # the reference, and where the marker band is -- are damaged by thinning.
     print()
     print("─" * 40)
     print("PHASE A: Clustering (original VGGT space)")
     print("─" * 40)
 
-    # A1: Remove floor from dense copy for DBSCAN
-    pcd_cluster = o3d.geometry.PointCloud(pcd_dense)
-    pcd_cluster, _ = remove_dominant_plane(pcd_cluster)
+    box_dense, obj_dense = _split_into_objects(pcd_dense, num_objects)
 
-    # A2: DBSCAN on dense → box/obj clusters via cubeness
-    box_dense, obj_dense = detect_top_k_objects(pcd_cluster, k=num_objects)
-    if box_dense is None:
-        box_dense = pcd_cluster
-        obj_dense = None
-        print("  Only 1 cluster on dense — treating as box")
-
-    # A3: Marker detection on dense leg (if segment_leg enabled)
     markers = []
-    if segment_leg and obj_dense is not None and len(obj_dense.points) > 0:
-        try:
-            if marker_colour:
-                print(f"  Marker colour from Stage 0: "
-                      f"RGB {[int(v) for v in marker_colour['rgb']]} "
-                      f"(ExG {marker_colour.get('exg', 0):+.0f}) — "
-                      f"thresholds follow the measured band, not the config "
-                      f"defaults")
-            _, summary = segment_point_cloud(obj_dense,
-                                             height_axis=segment_height_axis,
-                                             verbose=False,
-                                             marker_colour=marker_colour)
-            planes_raw = summary.get("planes", [])
-            for _, centroid, normal, npts, _ in planes_raw:
-                nrm = normal / (np.linalg.norm(normal) + 1e-8)
-                markers.append({"centroid": np.array(centroid, dtype=np.float64),
-                                "normal": np.array(nrm, dtype=np.float64),
-                                "npts": int(npts)})
-            print(f"  Dense leg markers: {len(markers)} plane(s) found")
-        except Exception as e:
-            print(f"  Marker detection skipped: {e}")
+    if segment_leg:
+        markers = _detect_marker_planes(obj_dense, segment_height_axis, marker_colour)
 
-    # Save dense leg cluster and marker cut lines
-    if obj_dense is not None and len(obj_dense.points) > 0:
-        dlp = np.asarray(obj_dense.points, dtype=np.float32)
-        _quick_save_ply(dlp, None, os.path.join(debug_dir_out, "leg_cluster.ply"))
-    elif box_dense is not None and len(box_dense.points) > 0:
-        dlp = np.asarray(box_dense.points, dtype=np.float32)
-        _quick_save_ply(dlp, None, os.path.join(debug_dir_out, "leg_cluster.ply"))
+    _save_cluster_debug(debug_dir_out, obj_dense, box_dense, markers)
 
-    import json as _json
-    cut_data = {"markers": []}
-    for m in markers:
-        cut_data["markers"].append({
-            "centroid": m["centroid"].tolist(),
-            "normal": m["normal"].tolist(),
-            "npts": m.get("npts", 0),
-        })
-    with open(os.path.join(debug_dir_out, "cutting_line.json"), "w") as _f:
-        _json.dump(cut_data, _f, indent=2)
-    print("  Saved: debug/leg_cluster.ply + debug/cutting_line.json")
-
-    # A4: Ghost filter each identified cluster separately.
+    # Ghost filter each identified cluster separately.
     #
     # Filtering before clustering (the old flow) forced a second DBSCAN on a
     # ~14x sparser cloud and left the two results free to disagree about which
-    # object is the box — nothing checked them. Splitting first keeps each
+    # object is the box -- nothing checked them. Splitting first keeps each
     # point's identity, so no label transfer is needed and the segmentation is
     # decided once, on the denser and better-conditioned cloud.
-    #
-    # The voxel size is computed once on the whole dense cloud: derived
-    # per-cluster it would differ per object and give them inconsistent
-    # densities.
-    dense_pts_full = np.asarray(pcd_dense.points, dtype=np.float32)
-    from pipeline.config import GHOST_VOXEL_FACTOR
-    if GHOST_VOXEL_FACTOR <= 0:
-        voxel_size = 0.0
-        # Still needed as a length scale for the normal-aware search radius.
-        nn_scale = compute_voxel_size(dense_pts_full, factor=1.0)
-        print("  Ghost voxel dedup: DISABLED (GHOST_VOXEL_FACTOR=0) — keeping "
-              "every point; ghost layers survive for the normal filter to catch")
-    else:
-        voxel_size = compute_voxel_size(dense_pts_full)
-        nn_scale = voxel_size
-        print(f"  Ghost voxel_size: {voxel_size:.4f} (shared across clusters)")
+    voxel_size, nn_scale = _ghost_filter_scales(pcd_dense)
 
-    def _ghost_filter(cluster, label):
-        if cluster is None or len(cluster.points) == 0:
-            return (np.zeros((0, 3), dtype=np.float32),
-                    np.zeros((0, 3), dtype=np.uint8))
-        pts = np.asarray(cluster.points, dtype=np.float32)
-        cols = (np.clip(np.asarray(cluster.colors, dtype=np.float32), 0, 1) * 255).astype(np.uint8)
-        n_in = len(pts)
-        pts, cols = voxel_dedup(pts, cols, voxel_size)
-        pts, cols = normal_aware_filter(pts, cols, nn_scale)
-        print(f"  Ghost filter [{label}]: {n_in:,} → {len(pts):,} pts")
-
-        # Collapse the ghost sheet onto one surface. Runs per cluster so the
-        # neighbourhood never spans two objects.
-        from pipeline.config import MLS_RADIUS_MULT, MLS_BOX_POLYNOMIAL
-        if MLS_RADIUS_MULT and MLS_RADIUS_MULT > 0 and len(pts) > 50:
-            from pipeline.mls import mls_project
-            # The reference is known to be planar; the limb is not.
-            poly = MLS_BOX_POLYNOMIAL if label == "box" else True
-            print(f"  MLS [{label}]:", end=" ")
-            pts, cols, _ = mls_project(pts, cols,
-                                       radius_mult=MLS_RADIUS_MULT,
-                                       polynomial=poly)
-        return pts, cols
-
-    box_pts_arr, box_cols_arr = _ghost_filter(box_dense, "box")
-    leg_pts_arr, leg_cols_arr = _ghost_filter(obj_dense, "obj")
+    box_pts_arr, box_cols_arr = _clean_cluster(box_dense, "box", voxel_size, nn_scale)
+    leg_pts_arr, leg_cols_arr = _clean_cluster(obj_dense, "obj", voxel_size, nn_scale)
 
     if obj_dense is None and len(box_pts_arr) > 0:
         print("  Only 1 cluster — treating it as the box (no obj)")
@@ -206,39 +363,9 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     print("PHASE B: Leveling (shared transform)")
     print("─" * 40)
 
-    ransac_thresh = auto_ransac_threshold(pcd_dense, base_factor=3)
-    plane_model, _ = detect_plane_ransac_deterministic(
-        pcd_dense, distance_threshold=ransac_thresh, num_iterations=1000, seed=seed)
-    normal = plane_model[:3]
-    print(f"RANSAC plane normal: ({normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f})")
-    R = get_rotation_to_z_axis(normal)
-    # Markers are detected in original VGGT space, so they must follow every
-    # rotation the clouds receive — including the upside-down flip below.
-    R_total = np.asarray(R, dtype=np.float64)
-
-    pcd_dense.rotate(R, center=(0, 0, 0))
-    dense_pts = np.asarray(pcd_dense.points, dtype=np.float32)
-
-    leg_pts_rot = _rotate_points(leg_pts_arr, R)
-    box_pts_rot = _rotate_points(box_pts_arr, R)
-
-    # Upside-down check
-    try:
-        _, inliers_rot = detect_plane_ransac_deterministic(
-            pcd_dense, distance_threshold=ransac_thresh, num_iterations=500, seed=seed)
-        plane_z_val = np.mean(dense_pts[inliers_rot, 2])
-        non_plane_mask = np.ones(len(dense_pts), dtype=bool)
-        non_plane_mask[inliers_rot] = False
-        if non_plane_mask.any() and np.mean(dense_pts[non_plane_mask, 2]) < plane_z_val:
-            print("Upside-down detected — flipping 180°")
-            flip_R = o3d.geometry.get_rotation_matrix_from_xyz((np.pi, 0, 0))
-            pcd_dense.rotate(flip_R, center=(0, 0, 0))
-            dense_pts = np.asarray(pcd_dense.points, dtype=np.float32)
-            leg_pts_rot = _rotate_points(leg_pts_rot, flip_R)
-            box_pts_rot = _rotate_points(box_pts_rot, flip_R)
-            R_total = np.asarray(flip_R, dtype=np.float64) @ R_total
-    except Exception as e:
-        print(f"Upside-down check failed: {e}")
+    R_total, dense_pts = _level_to_ground(pcd_dense, seed)
+    leg_pts_rot = _rotate_points(leg_pts_arr, R_total)
+    box_pts_rot = _rotate_points(box_pts_arr, R_total)
 
     # ── Phase C: Post-leveling cuts + cap ──
     print()
@@ -246,34 +373,9 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     print("PHASE C: Cuts and export")
     print("─" * 40)
 
-    # Floor cut on dense, apply to clean
-    floor_z, floor_margin = None, 0.008
-    try:
-        r_thresh = auto_ransac_threshold(pcd_dense, base_factor=3)
-        r_thresh = min(r_thresh, 0.015)
-        plane_model2, inliers2 = detect_plane_ransac_deterministic(
-            pcd_dense, distance_threshold=r_thresh, num_iterations=1000, seed=seed)
-        normal2 = plane_model2[:3]
-        is_horiz = abs(np.dot(normal2, [0, 0, 1])) > 0.85
-        z_vals = dense_pts[:, 2]
-        z_min, z_max = np.min(z_vals), np.max(z_vals)
-        pz = np.median(dense_pts[inliers2, 2])
-        is_bottom = (pz - z_min) < 0.25 * (z_max - z_min)
-        ratio = len(inliers2) / len(dense_pts)
-        if is_horiz and is_bottom and ratio > 0.05:
-            floor_z = pz
-            print(f"Floor plane at Z={floor_z:.4f} (ratio={ratio:.1%})")
-        else:
-            print(f"Floor cut skipped (horiz={is_horiz}, bottom={is_bottom}, ratio={ratio:.1%})")
-    except Exception as e:
-        print(f"Floor detection failed: {e}")
-
-    if floor_z is not None and len(leg_pts_rot) > 0:
-        lk = leg_pts_rot[:, 2] > (floor_z + floor_margin)
-        leg_pts_rot = leg_pts_rot[lk]; leg_cols_arr = leg_cols_arr[lk]
-    if floor_z is not None and len(box_pts_rot) > 0:
-        bk = box_pts_rot[:, 2] > (floor_z + floor_margin)
-        box_pts_rot = box_pts_rot[bk]; box_cols_arr = box_cols_arr[bk]
+    floor_z = _find_ground_height(pcd_dense, dense_pts, seed)
+    leg_pts_rot, leg_cols_arr = _drop_below_floor(leg_pts_rot, leg_cols_arr, floor_z)
+    box_pts_rot, box_cols_arr = _drop_below_floor(box_pts_rot, box_cols_arr, floor_z)
     print(f"Floor cut: leg → {len(leg_pts_rot):,}, box → {len(box_pts_rot):,}")
 
     # Rotate the marker planes into levelled space. This happens before any

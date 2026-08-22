@@ -94,49 +94,6 @@ def marker_mask_by_contrast(colors_uint8, band_rgb, limb_rgb,
     }
 
 
-def thresholds_from_colour(rgb, hue_tol=30.0):
-    """Turn a measured marker colour into detection thresholds.
-
-    The defaults in config describe one khaki band, and its own notes record how
-    narrow that tuning is -- raising the excess-green floor by five lost the only
-    marker in the dataset. Stage 0 now locates the band by description rather
-    than by colour, so it can measure what the marker actually is and the
-    thresholds can follow it instead of the other way round. That is what makes
-    a red or blue band work without editing anything.
-
-    Excess green is kept only when the marker really is green-dominant; for any
-    other colour it is meaningless and would only add false positives, so it is
-    disabled and the hue window carries the detection.
-    """
-    r, g, b = (float(v) for v in rgb)
-    mx, mn = max(r, g, b), min(r, g, b)
-    delta = mx - mn
-    if delta < 1e-9:
-        h = 0.0
-    elif mx == r:
-        h = (60.0 * ((g - b) / delta) + 360.0) % 360.0
-    elif mx == g:
-        h = (60.0 * ((b - r) / delta) + 120.0) % 360.0
-    else:
-        h = (60.0 * ((r - g) / delta) + 240.0) % 360.0
-    sat = 0.0 if mx < 1e-9 else (delta / mx) * 100.0
-    val = (mx / 255.0) * 100.0
-    exg = 2 * g - r - b
-
-    out = {
-        # The hue test is a plain min < h < max, so a window straddling 0/360
-        # cannot be expressed. Clamp rather than silently wrap: a red marker
-        # then leans on the half of its window that is representable.
-        "hue_min": max(0.0, h - hue_tol),
-        "hue_max": min(360.0, h + hue_tol),
-        "sat_min": max(10.0, sat * 0.45),
-        "val_min": max(5.0, val * 0.35),
-        # Half the measured value, so shaded parts of the same band still pass.
-        "exg_min": exg * 0.5 if exg > 4 else 1e9,
-    }
-    return out
-
-
 def detect_markers(colors_uint8, hue_min=None, hue_max=None, sat_min=None,
                    val_min=None, exg_min=None):
     """Detect green marker points by hue window and Excess Green Index.

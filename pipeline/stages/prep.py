@@ -61,10 +61,6 @@ LIMB_BAND_CUBE_HEIGHTS = 1.6
 # Margin added around the subject union before squaring.
 PAD_FRAC = 0.05
 
-# Segmentation model. Nano is enough: the mask only has to bound a limb, not
-# delineate it, and it runs in well under a second per frame.
-SEG_MODEL = "yolo11n-seg.pt"
-
 # Side length of the emitted square, in pixels. VGGT resizes whatever it is
 # given to 518 anyway, and for a square input its arithmetic is exact —
 # round(518/14)*14 is 518, so the centre-crop branch never fires and nothing is
@@ -393,9 +389,144 @@ def _square_window(union, shape, cube, pad=PAD_FRAC,
     return np.array([0.0, y0, float(w), y0 + side]), clipped
 
 
+def _box_fits_inside(window, box, margin_frac):
+    """Does `box` sit inside `window` with a margin, in pixels?
+
+    The margin scales with the box's own larger side rather than being a fixed
+    number of pixels, so the same rule means the same thing on a cube filling
+    the frame and on one far away. A box of None never fits: "not detected" and
+    "detected but clipped" are different answers and only one of them is a fit.
+    """
+    if box is None:
+        return False
+    margin = margin_frac * max(box[2] - box[0], box[3] - box[1])
+    # One pixel of slack, so a box touching the window edge exactly is not
+    # rejected by floating-point rounding alone.
+    tolerance = 1.0
+    return bool(box[0] >= window[0] + margin - tolerance
+                and box[1] >= window[1] + margin - tolerance
+                and box[2] <= window[2] - margin + tolerance
+                and box[3] <= window[3] - margin + tolerance)
+
+
+def _average_band_colour(per_frame_colours):
+    """One marker colour for the capture, from the per-frame traces.
+
+    Median rather than mean across frames: a frame where the trace wandered off
+    the cord reports a wildly different colour, and one such frame would drag a
+    mean far enough to matter. Stage 3 receives this instead of the fixed khaki
+    thresholds in config, which is what lets a band of any colour work.
+    """
+    if not per_frame_colours:
+        return None
+
+    median_bgr = np.median(
+        np.array([c["bgr"] for c in per_frame_colours], dtype=float), axis=0)
+    blue, green, red = (float(v) for v in median_bgr)
+
+    with_limb = [c["limb_bgr"] for c in per_frame_colours if "limb_bgr" in c]
+    limb_bgr = (np.median(np.array(with_limb, dtype=float), axis=0)
+                if with_limb else None)
+
+    return {
+        # The limb's own colour matters as much as the band's: what separates
+        # them is the contrast between the two, not either one alone.
+        "limb_rgb": None if limb_bgr is None else
+                    [round(float(limb_bgr[2]), 1), round(float(limb_bgr[1]), 1),
+                     round(float(limb_bgr[0]), 1)],
+        "bgr": [round(blue, 1), round(green, 1), round(red, 1)],
+        "rgb": [round(red, 1), round(green, 1), round(blue, 1)],
+        "exg": round(2 * green - red - blue, 1),
+        "hsv": per_frame_colours[len(per_frame_colours) // 2]["hsv"],
+        "n_frames": len(per_frame_colours),
+    }
+
+
+def _write_frame_for_vggt(image, window, should_crop, output_size, out_path):
+    """Write the frame VGGT will read, cropped or whole.
+
+    Anything not croppable goes out untouched -- both the usable case, where
+    VGGT's own centre crop keeps what matters, and every rejection. Cropping a
+    frame already judged unframeable would only choose, arbitrarily, which part
+    of the evidence to destroy.
+    """
+    if not should_crop:
+        cv2.imwrite(out_path, image)
+        return
+
+    left, top, right, bottom = [int(round(v)) for v in window]
+    cropped = image[top:bottom, left:right]
+    if output_size and cropped.shape[0] != output_size:
+        # Reducing: INTER_AREA averages the discarded pixels instead of dropping
+        # them. Enlarging: Lanczos holds marker edges, which the scale check reads.
+        shrinking = cropped.shape[0] > output_size
+        cropped = cv2.resize(cropped, (output_size, output_size),
+                             interpolation=cv2.INTER_AREA if shrinking
+                             else cv2.INTER_LANCZOS4)
+    cv2.imwrite(out_path, cropped)
+
+
+def _locate_subject(image_bgr, image_pil):
+    """Everything this stage needs to find in one photograph.
+
+    The band is looked for whether or not the cube could be bounded. Skipping it
+    when the cube was short of faces once reported "band not found" on a frame
+    whose band detects perfectly well at 0.74 confidence -- it had simply never
+    been looked for. They are independent measurements and are taken as such.
+
+    Returns (cube face quads, cube box, limb mask, band box, band colour).
+    """
+    grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    face_quads = _cube_faces(grey)
+    cube_box = _cube_bbox(grey, image_pil)
+
+    limb_mask, limb_box = _leg_mask(image_pil, cube_box)
+    band_box = _band_bbox(image_pil, image_bgr, limb_box)
+
+    band_colour = None
+    if band_box is not None:
+        band_colour = vlm.trace_band_colour(image_bgr, band_box)
+    return face_quads, cube_box, limb_mask, band_box, band_colour
+
+
+def _subject_bounds(cube_box, band_box, limb_mask, band_heights, pad):
+    """The region a crop has to keep: the cube, the band, and the limb between.
+
+    The limb is included only over the span from the band down to the cube's
+    base. Its full mask reaches the thigh and the torso, and a square containing
+    those is larger than the photograph.
+
+    When no band was found its height is estimated from the cube instead: the
+    cube stands on the floor so its base fixes floor level and its height fixes
+    the scale, and the band is tied at one place on the limb.
+    """
+    cube_height = cube_box[3] - cube_box[1]
+    band_top = (band_box[1] if band_box is not None
+                else cube_box[3] - band_heights * cube_height)
+
+    bounds = _grow(cube_box, pad)
+    if band_box is not None:
+        padded_band = _grow(band_box, pad)
+        bounds = np.array([min(bounds[0], padded_band[0]),
+                           min(bounds[1], padded_band[1]),
+                           max(bounds[2], padded_band[2]),
+                           max(bounds[3], padded_band[3])])
+
+    if limb_mask is not None:
+        limb_strip = limb_mask[max(0, int(band_top)):int(cube_box[3]), :]
+        if limb_strip.any():
+            occupied_columns = np.where(limb_strip.any(axis=0))[0]
+            bounds = np.array([min(bounds[0], occupied_columns.min()),
+                               min(bounds[1], band_top),
+                               max(bounds[2], occupied_columns.max()),
+                               max(bounds[3], cube_box[3])])
+    bounds[1] = min(bounds[1], band_top)
+    return bounds
+
+
 def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
                    pad=PAD_FRAC, centre_on_subject=CENTRE_ON_SUBJECT,
-                   seg_model=SEG_MODEL, output_size=OUTPUT_SIZE, strict=True,
+                   output_size=OUTPUT_SIZE, strict=True,
                    min_frames=MIN_FRAMES, crop=CROP_ENABLED):
     """Crop every frame to its subject; return the manifest.
 
@@ -425,46 +556,36 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
           f"out={output_size or 'native'})")
     print("=" * 60)
 
-    for i, path in enumerate(paths):
+    for frame_index, path in enumerate(paths):
         img = cv2.imread(path)
         if img is None:
-            print(f"  {os.path.basename(path)}: unreadable — skipped")
+            # Record it, do not drop it. Skipping silently removed the frame from
+            # the report altogether: `submitted` under-counted the photos the user
+            # actually gave, the frame numbering gained a gap, and the one thing
+            # this stage exists to say -- which photo to re-take -- went unsaid
+            # for the photo that most needed re-taking.
+            print(f"  {os.path.basename(path):<16} UNREADABLE — cannot be decoded")
+            records.append({
+                "index": frame_index + 1, "source": os.path.basename(path),
+                "overlay": None, "reasons": ["file unreadable, very crucial"],
+                "output": None, "frame_size": None, "window": [0, 0, 0, 0],
+                "cube_bbox": None, "band_bbox": None, "clipped": False,
+                "offset_px": 0.0, "mode": "unreadable",
+                "cube_ok": False, "band_ok": False,
+                "cube_seen": False, "band_seen": False,
+                "severity": "very crucial",
+            })
             continue
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        frame_height, frame_width = img.shape[:2]
         image_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        faces = _cube_faces(gray)
-        cube = _cube_bbox(gray, image_pil)
-
-        # Find the limb and the band regardless of whether the cube can be
-        # bounded. These are independent measurements, and skipping them when
-        # the cube is short of two faces reported "band not found" on a frame
-        # whose band detects perfectly well at 0.74 confidence -- the band was
-        # never looked for.
-        leg, leg_box = _leg_mask(image_pil, cube)
-        band = _band_bbox(image_pil, img, leg_box)
-        if band is not None:
-            colour = vlm.trace_band_colour(img, band)
-            if colour:
-                band_colours.append(colour)
+        faces, cube, leg, band, colour = _locate_subject(img, image_pil)
+        if colour:
+            band_colours.append(colour)
 
         if cube is not None:
-            cube_h = cube[3] - cube[1]
-            band_top = (band[1] if band is not None
-                        else cube[3] - band_heights * cube_h)
-            union = _grow(cube, pad)
-            if band is not None:
-                b = _grow(band, pad)
-                union = np.array([min(union[0], b[0]), min(union[1], b[1]),
-                                  max(union[2], b[2]), max(union[3], b[3])])
-            if leg is not None:
-                strip = leg[max(0, int(band_top)):int(cube[3]), :]
-                if strip.any():
-                    xs = np.where(strip.any(axis=0))[0]
-                    union = np.array([min(union[0], xs.min()), min(union[1], band_top),
-                                      max(union[2], xs.max()), max(union[3], cube[3])])
-            union[1] = min(union[1], band_top)
-            window, clipped = _square_window(union, (h, w), cube, pad,
+            union = _subject_bounds(cube, band, leg, band_heights, pad)
+            window, clipped = _square_window(union, (frame_height, frame_width),
+                                             cube, pad,
                                              centre_on_subject)
             mode = "crop-clipped" if clipped else "crop"
         else:
@@ -472,9 +593,10 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             # is going to cut a window; if it is not, nothing can be clipped by
             # us and the frame is simply a viewpoint where the limb happens to
             # occlude part of the reference.
-            side = float(min(h, w))
-            window = np.array([(w - side) / 2, (h - side) / 2,
-                               (w + side) / 2, (h + side) / 2], dtype=float)
+            side = float(min(frame_height, frame_width))
+            window = np.array([(frame_width - side) / 2, (frame_height - side) / 2,
+                               (frame_width + side) / 2, (frame_height + side) / 2],
+                              dtype=float)
             clipped = False
             mode = "unbounded"
 
@@ -484,113 +606,77 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
         # a cube -- but it is still a real viewpoint, and VGGT's own crop may
         # keep everything that matters. So: prefer our window, fall back to
         # VGGT's, and reject only when the reference survives neither.
-        def _fits_window(win, box, margin_frac=pad):
-            if box is None:
-                return False
-            m = margin_frac * max(box[2] - box[0], box[3] - box[1])
-            tol = 1.0
-            return bool(box[0] >= win[0] + m - tol and box[1] >= win[1] + m - tol
-                        and box[2] <= win[2] - m + tol
-                        and box[3] <= win[3] - m + tol)
+        def _fits(window, box):
+            return _box_fits_inside(window, box, pad)
 
-        seen = np.concatenate(faces) if faces else None
-        visible_cube = (None if seen is None else
-                        np.array([seen[:, 0].min(), seen[:, 1].min(),
-                                  seen[:, 0].max(), seen[:, 1].max()]))
+        visible_face_corners = np.concatenate(faces) if faces else None
+        visible_cube = (None if visible_face_corners is None else
+                        np.array([visible_face_corners[:, 0].min(), visible_face_corners[:, 1].min(),
+                                  visible_face_corners[:, 0].max(), visible_face_corners[:, 1].max()]))
 
         can_crop = (crop and cube is not None and len(faces) >= 1
-                    and _fits_window(window, cube)
-                    and band is not None and _fits_window(window, band))
+                    and _fits(window, cube)
+                    and band is not None and _fits(window, band))
 
         vggt_win = _vggt_window(img.shape)
         # Uncropped is acceptable when whatever IS visible of the reference
         # survives VGGT's crop, and any band we found does too.
-        can_pass_through = (_fits_window(vggt_win, visible_cube)
-                            and (band is None or _fits_window(vggt_win, band)))
+        can_pass_through = (_fits(vggt_win, visible_cube)
+                            and (band is None or _fits(vggt_win, band)))
 
-        ok = bool(can_crop or can_pass_through)
-        cube_ok = bool(can_crop or _fits_window(vggt_win, visible_cube))
-        band_ok = bool(band is None or _fits_window(window if can_crop else vggt_win,
+        usable = bool(can_crop or can_pass_through)
+        cube_ok = bool(can_crop or _fits(vggt_win, visible_cube))
+        band_ok = bool(band is None or _fits(window if can_crop else vggt_win,
                                                     band))
         if can_crop:
             mode = "crop-clipped" if clipped else "crop"
         elif can_pass_through:
             mode = f"{mode}->uncropped" if crop else "original"
-        x0, y0, x1, y1 = [int(round(v)) for v in
+        left, top, right, bottom = [int(round(edge)) for edge in
                           (window if can_crop else vggt_win)]
 
-        wx0, wy0, wx1, wy1 = [int(round(v)) for v in window]
-        out_path = os.path.join(out_dir, f"frame_{i:02d}.png")
-        if can_crop:
-            cropped = img[wy0:wy1, wx0:wx1]
-            if output_size and cropped.shape[0] != output_size:
-                cropped = cv2.resize(cropped, (output_size, output_size),
-                                     interpolation=cv2.INTER_AREA if
-                                     cropped.shape[0] > output_size
-                                     else cv2.INTER_LANCZOS4)
-            cv2.imwrite(out_path, cropped)
-        else:
-            # Anything we cannot frame ourselves goes to VGGT untouched.
-            #
-            # That covers both the usable case -- a pose where the cube's bounds
-            # cannot be recovered but VGGT's own centre crop keeps what matters
-            # -- and every rejection. A rejected frame is still written so it can
-            # be inspected, and so that continuing past the gate does not need a
-            # second pass over the inputs. Cropping a frame we have already
-            # judged unframeable would only choose, arbitrarily, which part of
-            # the evidence to destroy.
-            cv2.imwrite(out_path, img)
-            if not can_pass_through:
-                mode = f"{mode}->uncropped" if crop else "original"
+        out_path = os.path.join(out_dir, f"frame_{frame_index:02d}.png")
+        _write_frame_for_vggt(img, window, can_crop, output_size, out_path)
+        if not can_crop and not can_pass_through:
+            # Rejected AND not croppable: the frame still goes out whole so it
+            # can be inspected, and the mode records that VGGT will be the one
+            # doing the cropping.
+            mode = f"{mode}->uncropped" if crop else "original"
 
         cube_seen = cube is not None
         band_seen = band is not None
         notes, severity = _reject_reasons(cube_seen, band_seen, cube_ok, band_ok)
         cv2.imwrite(
             os.path.join(debug_dir,
-                         f"{i:02d}_{os.path.splitext(os.path.basename(path))[0]}.png"),
-            _debug_overlay(img, window, cube, band, ok, mode, notes,
+                         f"{frame_index:02d}_{os.path.splitext(os.path.basename(path))[0]}.png"),
+            _debug_overlay(img, window, cube, band, usable, mode, notes,
                            effective=(window if can_crop else vggt_win)))
 
-        off_px = np.hypot((x0 + x1) / 2 - w / 2, (y0 + y1) / 2 - h / 2)
+        offset_from_centre_px = np.hypot((left + right) / 2 - frame_width / 2,
+                                         (top + bottom) / 2 - frame_height / 2)
 
         records.append({
-            "index": i + 1, "source": os.path.basename(path),
-            "overlay": f"{i:02d}_{os.path.splitext(os.path.basename(path))[0]}.png",
+            "index": frame_index + 1, "source": os.path.basename(path),
+            "overlay": f"{frame_index:02d}_{os.path.splitext(os.path.basename(path))[0]}.png",
             "reasons": notes, "output": os.path.basename(out_path),
-            "frame_size": [w, h], "window": [x0, y0, x1, y1],
+            "frame_size": [frame_width, frame_height],
+            "window": [left, top, right, bottom],
             "cube_bbox": None if cube is None else cube.tolist(),
             "band_bbox": None if band is None else band.tolist(),
             "clipped": bool(clipped),
-            "offset_px": float(off_px), "mode": mode,
+            "offset_px": float(offset_from_centre_px), "mode": mode,
             "cube_ok": cube_ok, "band_ok": band_ok,
             "cube_seen": cube_seen, "band_seen": band_seen,
             "severity": severity,
         })
         verdict = "ok" if (cube_ok and band_ok) else "REJECTED"
         print(f"  {os.path.basename(path):<16} -> {os.path.basename(out_path)}  "
-              f"{mode:<13} {x1-x0}px ({(x1-x0)/min(w,h):.0%} of frame)  {verdict}"
+              f"{mode:<13} {right-left}px ({(right-left)/min(frame_width,frame_height):.0%} of frame)  {verdict}"
               f"{('  [' + severity + ']') if severity else ''}"
               f"{('  ' + '; '.join(notes)) if notes else ''}")
 
-    marker_colour = None
-    if band_colours:
-        arr = np.array([c["bgr"] for c in band_colours], dtype=float)
-        med = np.median(arr, axis=0)
-        b, g, r = (float(v) for v in med)
-        limb = np.median(np.array([c["limb_bgr"] for c in band_colours
-                                   if "limb_bgr" in c], dtype=float), axis=0) \
-            if any("limb_bgr" in c for c in band_colours) else None
-        marker_colour = {
-            "limb_rgb": None if limb is None else
-                        [round(float(limb[2]), 1), round(float(limb[1]), 1),
-                         round(float(limb[0]), 1)],
-            "bgr": [round(b, 1), round(g, 1), round(r, 1)],
-            "rgb": [round(r, 1), round(g, 1), round(b, 1)],
-            "exg": round(2 * g - r - b, 1),
-            "hsv": band_colours[len(band_colours) // 2]["hsv"],
-            "n_frames": len(band_colours),
-        }
+    marker_colour = _average_band_colour(band_colours)
+    if marker_colour:
         print(f"\n  Marker colour learned from {len(band_colours)} frames: "
               f"RGB {[int(v) for v in marker_colour['rgb']]}, "
               f"excess-green {marker_colour['exg']:+.0f} "

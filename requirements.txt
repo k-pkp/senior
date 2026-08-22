@@ -23,8 +23,17 @@ tqdm
 pymeshfix
 pyvista
 pandas
-warp-lang>=1.3.0    # optional: GPU voxelization for Stage 7 (~40x faster than trimesh)
+warp-lang>=1.3.0    # optional: GPU voxelization for Stage 6 (~40x faster than trimesh)
 scikit-learn>=1.3.0
 psutil>=5.9.0
 alphashape>=1.3.1
 shapely>=2.0.0
+
+# Web compute service (service/, serve.sh). Without these `./serve.sh` fails on
+# import and only the precomputed samples in web/public/samples work.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+# fastapi pulls pydantic in anyway, but service/app.py imports it directly, so
+# it is declared rather than depended on transitively.
+pydantic>=2.0

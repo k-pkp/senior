@@ -107,6 +107,10 @@ temp_output_compare_recon/
 
 
 # 3D assets (large)
+#
+# The web app ships precomputed sample meshes and they must be committed, or a
+# fresh clone renders an empty viewer with no error. The blanket rule below hid
+# them once already; the negation has to come after the rule to take effect.
 *.ply
 *.obj
 *.glb
@@ -117,6 +121,9 @@ temp_output_compare_recon/
 *.usdz
 *.blend
 *.blend1
+
+# ...except the web app's shipped samples, which are the demo.
+!web/public/samples/**
 
 # Media
 *.mp4

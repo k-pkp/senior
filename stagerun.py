@@ -361,6 +361,17 @@ def run_stage0(args, name):
 
 def run_stage1(args, name):
     from vggt.utils.device import get_device
+
+    # Guard the same trap when the stages are run separately. Stage 0's summary
+    # tells you to re-point -i at its output; this says so again at the moment it
+    # would otherwise be ignored, rather than leaving a silently unframed run.
+    prep_images = os.path.join(stage_dir(name, 0, create=False), "images")
+    if (os.path.isdir(prep_images)
+            and os.path.abspath(prep_images) != os.path.abspath(args.image_folder)):
+        print(f"  WARNING: stage 0 output exists at {prep_images}")
+        print(f"           but this stage is reading {args.image_folder}")
+        print(f"           VGGT will crop these frames itself — Stage 0's framing "
+              f"is being ignored.")
     from pipeline.stages.inference import run_inference
 
     d = stage_dir(name, 1)
@@ -790,6 +801,21 @@ def main():
         t0 = time.time()
         RUNNERS[n](args, name)
         print(f"\n  stage {n} took {time.time() - t0:.1f}s")
+
+        # Stage 0 rewrites the frames, so every later stage in this run must read
+        # what it produced rather than the folder the user typed.
+        #
+        # Without this, `stagerun.py 0-6 -i inputs/foo` framed every photo, wrote
+        # the crops, and then handed VGGT inputs/foo anyway -- Stage 0 ran and its
+        # entire output was discarded, silently. The run still looked correct: the
+        # framing report was written, the marker colour was learned and used, and
+        # only the pixels the model saw were wrong.
+        if n == 0:
+            prep_images = os.path.join(stage_dir(name, 0, create=False), "images")
+            if os.path.isdir(prep_images):
+                args.image_folder = prep_images
+                print(f"  -> later stages will read {prep_images}")
+
         # --src redirects only the first stage of a range; once a stage has run
         # under `name`, later stages must read what it just wrote.
         args.src = None

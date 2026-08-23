@@ -59,6 +59,12 @@ MARKER_CM = 6.3
 # largest real band and a third of the smallest false one. See _band_bbox.
 BAND_MAX_LIMB_FRAC = 0.35
 
+# Pad around the limb box before running the band detector on a crop of it. The
+# band sits at the leg's edge, so a tight box would cut it off, and the pad keeps
+# the leg context the prompt ("on the leg") relies on. As a fraction of the box's
+# larger side. See _band_bbox.
+BAND_CROP_PAD_FRAC = 0.2
+
 # What fraction of the submitted frames must independently show the band before
 # its colour is trusted, rounded up.
 #
@@ -419,6 +425,19 @@ def _band_bbox(image_pil, bgr, leg_box, limb_mask=None):
     contrast to separate them by.
     """
     box, score = vlm.detect(image_pil, vlm.BAND_PROMPT)
+    if leg_box is not None:
+        # Re-run on a padded crop of the limb. The full-image pass is the
+        # fallback: it keeps distractors (a houseplant, another limb) in view,
+        # and cropping removes them. The crop is padded, not tight, so the band
+        # at the leg's edge survives and the "on the leg" context is retained.
+        crop_box = _grow(leg_box, BAND_CROP_PAD_FRAC)
+        l, t = int(max(0, crop_box[0])), int(max(0, crop_box[1]))
+        r, b = int(min(image_pil.size[0], crop_box[2])), int(min(image_pil.size[1], crop_box[3]))
+        if r - l > 16 and b - t > 16:
+            cbox, cscore = vlm.detect(image_pil.crop((l, t, r, b)), vlm.BAND_PROMPT)
+            if cbox is not None:
+                box = [cbox[0] + l, cbox[1] + t, cbox[2] + l, cbox[3] + t]
+                score = cscore
     if box is None:
         return None
     if leg_box is not None:

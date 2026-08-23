@@ -31,7 +31,8 @@ service together.
 ## Install
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+conda create -n senior python=3.11 -y
+conda activate senior
 pip install -r requirements.txt
 ```
 
@@ -88,6 +89,28 @@ cube's own volume, and the 14 cm cube reads 19.18 × 19.47 × 14.09 because the
 dimensions are an axis-aligned box around a tilted cube, which measures its
 diagonal. Neither is a measurement error; both are the method reporting itself.
 The parked method reads 13.97 × 14.33 × 14.54 and 2694.24 cm³ on the same capture.
+
+---
+
+## Web app
+
+First run only — install the front-end dependencies:
+
+```bash
+cd web && npm install
+```
+
+Start the site and the compute service together (`serve.sh` uses the `senior`
+interpreter directly, so no `conda activate` is needed):
+
+```bash
+./serve.sh
+```
+
+Open `http://localhost:3111` for the site; it drives the compute service on
+port 8000. Ctrl-C stops both. See
+[`docs/running_the_web_app.md`](docs/running_the_web_app.md) for letting a phone
+on the same wifi reach it.
 
 ---
 

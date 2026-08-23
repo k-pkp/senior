@@ -199,12 +199,22 @@ one and *why*, and a filename alone does not communicate that.
 
 The reason comes with a **severity chip**, because rejection is not one thing:
 
-| reason | severity | rejected? |
+| condition | verdict | what the frame is told |
 |---|---|---|
-| `marker missing, not crucial` | not crucial | **no** |
-| `cube missing, crucial` | crucial | yes |
-| `marker and cube missing, very crucial` | very crucial | yes |
-| `objects out of window` | crucial / very crucial | yes |
+| everything found and framed | **pass** | — |
+| band missing | **warning** | marker missing — the cut must be placed by hand |
+| band found but clipped | **warning** | marker out of window — the suggested cut may be off |
+| cube found but clipped | **warning** | cube out of window — VGGT will centre-crop instead |
+| cube not detected | **reject** | cube missing — the scale cannot be recovered |
+| nothing detected | **reject** | nothing detected — no cube and no marker |
+| file cannot be decoded | **reject** | file unreadable — cannot be decoded |
+
+**A warning is a usable frame.** The distinction is what a defect *costs*. The
+reference cube sets the scale of every number, so if it is not detected at all
+there is nothing to recover from — that is a reject. Everything else degrades the
+result without making it impossible: a clipped cube falls back to VGGT's own
+centre crop, and a missing band only means the cut is placed by a person in the
+review step, which it is anyway. Only rejects stop the run.
 
 A missing marker band costs the *cut* but not the *scale*, and the cut only needs
 the band on some photos — so that photo is flagged and still used. A missing or
@@ -447,7 +457,7 @@ Worth stating plainly, because a supervisor will ask.
 Because one step in the pipeline is a judgement, not a calculation. Where the limb
 is cut determines the volume, and that plane comes from detecting a coloured band,
 which can fail — it has failed, on real data, in ways described in
-`docs/changes_newVSold.md`. A number produced from a wrong cut looks exactly like a
+`docs/progress.md`. A number produced from a wrong cut looks exactly like a
 number produced from a right one.
 
 The web app makes that step visible and correctable: it shows where the cut landed,

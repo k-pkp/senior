@@ -10,12 +10,17 @@ node labels.
 | 2 | [Stage 3 · Phase A](#figure-2--stage-3-phase-a--clustering) | clustering |
 | 3 | [Marker detection](#figure-3--marker-detection) | colour rule and plane fit |
 | 4 | [Stage 3 · Phase B+C](#figure-4--stage-3-phase-b--c--level-cut-close) | levelling, cut, close |
-| 5 | [Stage 4](#figure-5--stage-4-alpha-selection) | α selection |
+| 5 | [Stage 4](#figure-5--stage-4-poisson-with-α-selection-as-the-fallback) | Poisson, α fallback |
 | 6 | [Stage 6](#figure-6--stage-6-volume-and-scale) | volume and scale |
 | 7 | [Full system](#figure-7--full-system-with-website) | pipeline + website |
 | 8 | [Review screen](#figure-8--review-screen-coordinate-flow) | coordinate handling |
 
 Then a [per-stage I/O reference](#per-stage-io-reference).
+
+> For **one** chart containing every stage and every sub-process with its
+> inputs and outputs, see [`full_flowchart.md`](full_flowchart.md). This file
+> is for reading a stage at a time; that one is for seeing where anything sits
+> in the whole.
 
 Everything runs **locally** — VGGT on one GPU, the web app on `localhost:3111`,
 the compute service on `localhost:8000`. Nothing is sent to a cloud service.
@@ -28,13 +33,23 @@ Conventions: blue = a file on disk · amber dashed = **not built yet**.
 > below, but **not yet redrawn in Figures 2-8**, which still show the older shape:
 >
 > 1. **Stage 0 exists.** A framing gate runs before Stage 1 and can refuse a
->    capture outright. `pipeline/stages/prep.py`.
+>    capture outright. `pipeline/stages/prep.py`. Its output is now chained into
+>    Stage 1 automatically — `stagerun.py 0-6` used to write the crops and then
+>    hand VGGT the raw photographs anyway, discarding the whole stage silently.
 > 2. **The cut is deferred.** Stage 3 runs twice per measurement — once to detect
 >    the plane (`--no-cut`), then once to apply the plane a person confirmed
->    (`--cut-only`). Figure 4 shows detection and cutting as one pass.
+>    (`--cut-only`). Figure 4 shows detection and cutting as one pass. Stages 4-6
+>    also run before the confirmation, but **only on the reference cube**, to
+>    produce the scale the Review screen draws in; Figure 1 now shows that branch,
+>    and `service/jobs.py:_postcondition` fails the job if that pass ever measures
+>    the subject.
 > 3. **Stage 6 is reverted to main's version**, pending review by its author. The
 >    scale derivation in Figure 6 describes the *parked* method, not what runs.
 >    See `docs/stage06_experiments.md`.
+> 4. **Stage 4 defaults to Poisson**, not alpha shape, with alpha as an automatic
+>    per-object fallback whenever Poisson's mesh does not repair to χ = 2.
+>    Changed 2026-08-23 after Stage 5 was fixed to call `pymeshfix.repair()`
+>    rather than `fill_holes()` alone — see `experiments.md`, E-psr-adopted.
 
 ---
 
@@ -50,46 +65,68 @@ flowchart LR
     S1["STAGE 1<br/>VGGT inference"]
     F1[/"predictions.npz"/]:::file
     S2["STAGE 2<br/>point cloud"]
-    F2[/"points.ply<br/>~541k pts"/]:::file
+    F2[/"points.ply<br/>~859k pts"/]:::file
     S3["STAGE 3 --no-cut<br/>segment · detect plane"]
     F3[/"leg_open · leg_no_cut<br/>box · cutting_line"/]:::file
-    S4["STAGE 4<br/>alpha shape"]
+    CAL["STAGES 4-6<br/>reference cube ONLY"]:::cal
+    FCAL[/"volumes.csv<br/>reference row only"/]:::file
+    CONFIRM{"cut<br/>confirmed?"}
+    S3B["STAGE 3 --cut-only<br/>apply the chosen plane"]
+    S4["STAGE 4<br/>Poisson, alpha shape as fallback"]
     F4[/"*_recon.ply"/]:::file
     S5["STAGE 5<br/>watertight"]
     F5[/"*.ply + *.stl"/]:::file
     S6["STAGE 6<br/>volume"]
     F6[/"volumes.csv"/]:::file
-    CONFIRM{"cut<br/>confirmed?"}
-    S3B["STAGE 3 --cut-only<br/>apply the chosen plane"]
     DONE[/"measured volume"/]:::file
 
     IN --> S0 --> G
     G -- no --> RETAKE
-    G -- yes --> F0 --> S1 --> F1 --> S2 --> F2 --> S3 --> F3 --> S4 --> F4 --> S5 --> F5 --> S6 --> F6
-    F6 --> CONFIRM
-    CONFIRM -- "move the plane" --> S3B --> S4
-    CONFIRM -- yes --> DONE
+    G -- yes --> F0 --> S1 --> F1 --> S2 --> F2 --> S3 --> F3 --> CONFIRM
+    S3 -. "calibration only" .-> CAL --> FCAL -. "cm per unit<br/>for the review" .-> CONFIRM
+    CONFIRM -- "adjust plane" --> S3B --> CONFIRM
+    CONFIRM -- yes --> S4 --> F4 --> S5 --> F5 --> S6 --> F6 --> DONE
 
     classDef file fill:#eef4fb,stroke:#4a72a8,color:#16324f
+    classDef cal fill:#fbf3e6,stroke:#a8752a,color:#573a10
 ```
 
+**The subject is never measured before the cut is confirmed.** That is the one
+property this shape exists to guarantee, and it is enforced rather than assumed:
+`service/jobs.py:_postcondition` fails the job if a `--no-cut` pass leaves a
+`leg_cut.ply` on disk or a non-reference row in `volumes.csv`.
+
 Stage 3 appears twice on purpose. The first pass runs with `--no-cut`: it detects
-the cutting plane, publishes it, and deliberately writes no `leg_cut.ply`, so
-Stages 4-6 measure only the reference cube. The limb is not reconstructed until a
-person has agreed where it ends.
+the cutting plane, publishes it, and deliberately writes no `leg_cut.ply`.
+
+The amber branch is the part that is easy to misread. Stages 4-6 do run before the
+confirmation — but **only on the reference cube**, and only to produce the
+`linear_scale` in centimetres per mesh unit that the Review screen needs to draw
+the cutting plane in real units. Nothing about the subject is reconstructed,
+measured or displayed on that pass.
+
+Deriving that scale without the detour was measured and rejected: an oriented
+bounding box on Stage 3's own segmented cube cloud gives **40.6 cm/unit against
+Stage 6's 60.86 — 33% out**, because that cloud carries the wall points added when
+the base is extended to the floor. The cube has to pass through reconstruction for
+its size to be known. See `docs/experiments.md`, E-preconfirm-scale.
 
 | stage | time | in | out |
 |---|---|---|---|
 | 0 framing | ~25 s | image folder | `frame_NN.png` (518²), `framing.json` |
-| 1 inference | ~38–55 s | Stage 0 frames | `predictions.npz` |
-| 2 point cloud | ~2 s | `predictions.npz` | `points.ply` |
-| 3 clean | ~14–20 s | `points.ply` | 4 PLY + 2 JSON |
-| 4 reconstruct | ~5–20 s | `objects/*.ply` | `*_recon.ply` |
-| 5 watertight | ~1 s | `*_recon.ply` | `*.ply` + `.stl` |
-| 6 volume | ~2 s | watertight meshes | `volumes.csv` |
-| 3 again | ~1 s | `leg_open.ply` + confirmed planes | `leg_cut.ply` |
+| 1 inference | ~19 s | Stage 0 frames | `predictions.npz` |
+| 2 point cloud | ~1 s | `predictions.npz` | `points.ply` |
+| 3 clean `--no-cut` | ~8 s | `points.ply` | 4 PLY + 2 JSON, **no `leg_cut.ply`** |
+| 4-6 calibration | ~14 s | `objects/box.ply` | `volumes.csv`, reference row only |
+| *review* | — | `leg_no_cut.ply` + `cutting_line.json` | the confirmed planes |
+| 3 `--cut-only` | ~1 s | `leg_open.ply` + confirmed planes | `leg_cut.ply` |
+| 4 reconstruct | ~12 s | `objects/*.ply` | `*_recon.ply` |
+| 5 watertight | ~0.1 s | `*_recon.ply` | `*.ply` + `.stl` |
+| 6 volume | ~0.1 s | watertight meshes | `volumes.csv` |
 
-Cold run end to end on `inputs/small_leg`: **91 s**.
+Cold run end to end on `inputs/small_leg`: **80 s** (re-measured 2026-08-22,
+after Stage 0's output stopped being discarded). The re-cut after a review costs
+about 10 s, because Stage 1 is not repeated.
 
 ---
 
@@ -248,21 +285,28 @@ floor-closed for review, while the cut runs on the unfilled cloud.
 
 ---
 
-## Figure 5 — Stage 4 α selection
+## Figure 5 — Stage 4: Poisson, with α selection as the fallback
 
 ```mermaid
 flowchart TD
     IN[/"objects/*.ply"/]:::file
-    R1["Downsample only above<br/>90,000 points"]
+    P1["Poisson · adaptive depth 6-9"]
+    P2["Trim the lowest 2-5% density<br/>REQUIRED — the extrapolated skin<br/>is what breaks the topology"]
+    P3["_survives_repair()<br/>run the SAME repair Stage 5 will"]
+    P4{"chi = 2 ?<br/>a single closed SOLID,<br/>not merely watertight"}
+    P5["Keep the Poisson mesh<br/>p95 1.30 mm to the cloud<br/>vs alpha's 2.39 mm"]
+    R1["FALLBACK, this object only:<br/>rebuild with alpha_shape"]
     R2["Delaunay tetrahedralisation<br/>ONCE"]
-    R3["Next alpha<br/>8x .. 90x"]
+    R3["Next alpha<br/>8x .. 200x"]
     R4["Keep largest component"]
     R5{"watertight<br/>AND euler = 2 ?"}
-    R6["Select this alpha"]
+    R6["Select this alpha<br/>the GUARANTEE Poisson lacks"]
     R7["Cleanup<br/>revert if it reopens"]
     OUT[/"*_recon.ply"/]:::file
 
-    IN --> R1 --> R2 --> R3 --> R4 --> R5
+    IN --> P1 --> P2 --> P3 --> P4
+    P4 -->|yes| P5 --> OUT
+    P4 -->|"no · e.g. chi = -18"| R1 --> R2 --> R3 --> R4 --> R5
     R5 -->|no| R3
     R5 -->|yes| R6 --> R7 --> OUT
 
@@ -473,27 +517,43 @@ thresholds, which is what lets a marker of any colour work. `mode` in
 
 Failures carry a reason and a severity (`_reject_reasons()`):
 
-| condition | reason | severity | rejected? |
-|---|---|---|---|
-| band missing, cube seen | `marker missing, not crucial` | not crucial | no |
-| cube missing, band seen | `cube missing, crucial` | crucial | yes |
-| both missing | `marker and cube missing, very crucial` | very crucial | yes |
-| detected, does not fit | `objects out of window` | crucial / very crucial | yes |
+| condition | verdict | what the frame is told |
+|---|---|---|
+| everything found and framed | **pass** | — |
+| band missing | **warning** | marker missing — the cut must be placed by hand |
+| band found but clipped | **warning** | marker out of window — the suggested cut may be off |
+| cube found but clipped | **warning** | cube out of window — VGGT will centre-crop instead |
+| cube not detected | **reject** | cube missing — the scale cannot be recovered |
+| nothing detected | **reject** | nothing detected — no cube and no marker |
+| file cannot be decoded | **reject** | file unreadable — cannot be decoded |
 
-A missing band costs the cut, not the scale, so that frame is reported and kept. A
-missing or clipped cube costs the scale of every number the run reports.
+**A warning is a usable frame.** The distinction is what a defect *costs*. The
+reference cube sets the scale of every number, so if it is not detected at all
+there is nothing to recover from — that is a reject. Everything else degrades the
+result without making it impossible: a clipped cube falls back to VGGT's own
+centre crop, and a missing band only means the cut is placed by a person in the
+review step, which it is anyway. Only rejects stop the run.
+
+Only a reject stops the run; `--continue-on-rejected` overrides even that.
+
+An unreadable file used to be skipped in silence — it vanished from the report,
+`submitted` under-counted the photos actually given, and the frame numbering
+gained a gap, for the one photo that most needed re-taking. It is now recorded
+like any other failure, with `overlay: null` since there is nothing to annotate.
 
 **Anything not croppable is written out raw**, rejected frames included — the window
 that could not hold the cube and the band would cut one of them, so VGGT does its
-own preprocessing instead. `--continue-on-rejected` decides whether the run
-proceeds, not whether the frames are written.
+own preprocessing instead. `--continue-on-rejected` decides whether a **rejected**
+frame stops the run, not whether the frames are written.
 
 ---
 
 ### Stage 1 — inference · `pipeline/stages/inference.py`
 
 **In:** Stage 0's `00_prep/images/`, 6–12 frames orbiting the subject, cube
-visible in every shot.
+visible in every shot. Within a `stagerun.py` range this is chained
+automatically; running stage 1 on its own against a different folder prints a
+warning, because doing so silently discards the framing.
 **Out:** `01_inference/predictions.npz`.
 
 | sub-process | in | out | notes |
@@ -542,11 +602,21 @@ Phases: A → figure 2, marker sub-flow → figure 3, B and C → figure 4.
 
 **In:** `03_clean/objects/*.ply` · **Out:** `04_recon/mesh/*_recon.ply`
 
-Methods: `alpha_shape` (default), `poisson`, `poisson_omp1`, `box_primitive`.
-`ball_pivot` was removed — it never produced a usable mesh.
+Methods: **`poisson` (default)**, `alpha_shape`, `poisson_omp1`,
+`box_primitive`. `ball_pivot` was removed — it never produced a usable mesh.
 
-α multipliers: `[8, 10, 12, 14, 16, 20, 25, 30, 40, 55, 70, 90]` × mean NN
-distance. Detail → figure 5.
+**Poisson first, alpha as an automatic per-object fallback.** After
+reconstructing, Stage 4 runs the same repair Stage 5 will and checks the Euler
+characteristic. Not χ = 2 → that object is rebuilt with `alpha_shape`, whose
+ladder selects on χ = 2 and therefore guarantees it. The trigger is **χ ≠ 2, not
+"not watertight"**: a tunnelled surface is closed and `is_watertight` returns
+True for it.
+
+α multipliers: `[8, 10, 12, 14, 16, 20, 25, 30, 40, 55, 70, 90, 110, 140, 170,
+200]` × mean NN distance. Detail → figure 5.
+
+Note `--recon-method` does **not** reach the reference cube; that is resolved
+from `_DEFAULT_BOX_METHOD` and only `--box-recon-method` overrides it.
 
 ---
 
@@ -555,8 +625,14 @@ distance. Detail → figure 5.
 **In:** `*_recon.ply` · **Out:** `05_watertight/mesh/*.ply` + `.stl`, plus
 `scene_colour.ply`
 
-Skips repair when the mesh is already closed **and says so**. Repair firing is a
-signal that Stage 4 struggled and the result deserves suspicion.
+Calls `pymeshfix.repair()` — not `fill_holes()` alone, which left the
+self-intersections and non-manifold edges that make a mesh watertight but
+invalid. Skips repair entirely when the mesh is already closed **and says so**.
+
+Also **computes the Euler characteristic of every final mesh** and warns loudly
+when it is not 2, naming the fallback. Nothing in the live pipeline checked χ
+before 2026-08-23; the only such check was in the *parked* Stage 6 code, so a
+closed-but-tunnelled mesh was integrated and reported in silence.
 
 ---
 

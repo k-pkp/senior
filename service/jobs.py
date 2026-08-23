@@ -194,7 +194,44 @@ class Registry:
                           log=tail)
                 return
 
+        problem = _postcondition(job, extra, done_state)
+        if problem:
+            job.touch(state="failed", error=problem, log=[])
+            return
+
         job.touch(state=done_state, log=[])
+
+
+def _postcondition(job: Job, extra: list[str], done_state: str) -> str | None:
+    """Refuse to report success if a deferred cut leaked a measured subject.
+
+    The reference-calibration pass runs stages 1-6 with --no-cut, so it looks
+    from the outside like a full measurement. The one thing that must be true
+    when it finishes is that the subject was NOT measured: no leg_cut.ply, and
+    no subject row in volumes.csv. If either appears, a volume exists for a cut
+    nobody confirmed, and the review that follows is a formality rather than a
+    gate. That is the failure this whole two-pass split exists to prevent, so it
+    is checked rather than assumed.
+    """
+    if "--no-cut" not in extra:
+        return None
+
+    leaked = os.path.join(job.dir, "03_clean", "objects", "leg_cut.ply")
+    if os.path.exists(leaked):
+        return ("deferred-cut violation: leg_cut.ply exists after a --no-cut "
+                "pass, so the subject was measured before the cut was confirmed")
+
+    csv_path = os.path.join(job.dir, "06_volume", "volumes.csv")
+    if os.path.exists(csv_path):
+        import csv as _csv
+        with open(csv_path, newline="") as fh:
+            subject = [r for r in _csv.DictReader(fh)
+                       if str(r.get("is_ref", "")).strip().lower() != "true"]
+        if subject:
+            names = ", ".join(r.get("name", "?") for r in subject)
+            return (f"deferred-cut violation: volumes.csv reports a subject "
+                    f"({names}) after a --no-cut pass")
+    return None
 
 
 def _expand(spec: str) -> list[int]:

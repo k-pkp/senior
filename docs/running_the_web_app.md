@@ -99,12 +99,22 @@ them itself, and whatever that crop removes is lost.
 
 Each problem frame carries a severity, shown as a chip on its card:
 
-| reason | severity | frame rejected? |
+| condition | verdict | what the frame is told |
 |---|---|---|
-| `marker missing, not crucial` | not crucial | **no** — costs the cut, not the scale |
-| `cube missing, crucial` | crucial | yes |
-| `marker and cube missing, very crucial` | very crucial | yes |
-| `objects out of window` | crucial / very crucial | yes |
+| everything found and framed | **pass** | — |
+| band missing | **warning** | marker missing — the cut must be placed by hand |
+| band found but clipped | **warning** | marker out of window — the suggested cut may be off |
+| cube found but clipped | **warning** | cube out of window — VGGT will centre-crop instead |
+| cube not detected | **reject** | cube missing — the scale cannot be recovered |
+| nothing detected | **reject** | nothing detected — no cube and no marker |
+| file cannot be decoded | **reject** | file unreadable — cannot be decoded |
+
+**A warning is a usable frame.** The distinction is what a defect *costs*. The
+reference cube sets the scale of every number, so if it is not detected at all
+there is nothing to recover from — that is a reject. Everything else degrades the
+result without making it impossible: a clipped cube falls back to VGGT's own
+centre crop, and a missing band only means the cut is placed by a person in the
+review step, which it is anyway. Only rejects stop the run.
 
 Which object left the window is not reported, because the window is not adjustable —
 it is the largest square the photo allows. The remedy is the same either way: step
@@ -155,3 +165,10 @@ is released between stages rather than accumulating across jobs.
   method the reference cube reports exactly 2744.00 cm³ by construction, which is
   an identity rather than a measurement. Treat volumes as provisional until
   Stage 6 settles.
+- **The two shipped samples were measured with the parked Stage 6**, so they do
+  not match what a live job now produces. `small_leg` ships as 1071.46 cm³ with
+  the reference at 2692.89; uploading the same six photos today gives 1081.94 cm³
+  with the reference at 2744.00. Both are the same capture — the gap is the two
+  scale derivations, not a regression. The samples are kept as they are because
+  regenerating them would lose the only worked example of the parked schema the
+  viewer has to keep supporting.

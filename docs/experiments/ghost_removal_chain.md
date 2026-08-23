@@ -2,13 +2,23 @@
 
 Every transformation the point cloud passes through between Stage 2's raw output
 and a single clean surface, with the same cross-section drawn after each one.
-Section is 23 cm above the limb's base — its widest point within the upper 60% of
-its span, so it is the calf rather than the foot.
+Section is 15.9 cm above the floor, chosen because it is a **closed ring** — all
+36 of 36 ten-degree sectors occupied, in every cloud drawn. See
+[`FIGURES.md`](FIGURES.md) for why "widest point" was the wrong rule.
 
 ![the chain](ghost_removal_chain.png)
 
 Reproduce: `python stagerun.py 0-3 -i inputs/small_leg --name verify --continue-on-rejected`,
 then the script in the session scratchpad that replays Phase A step by step.
+
+> **Counts re-measured 2026-08-22**, after the fix that stopped `stagerun.py`
+> discarding Stage 0's crops — the cloud entering this chain changed slightly
+> (858,554 points rather than 860,182), so every count below was re-read from a
+> post-fix run. The **figures** on this page are the pre-fix ones. Nothing in
+> them changes shape: the reductions moved by well under a percentage point and
+> every conclusion below is unchanged. The one number worth re-quoting is the
+> cost of removing `ghost_voxel_downsample`, re-measured at **+2.59%** on the limb volume
+> against the +2.70% first recorded.
 
 ---
 
@@ -24,7 +34,7 @@ actually do, because they are easy to confuse — they run the **same arithmetic
 > centroid. Nothing else. They differ only in cell size and in where that size
 > comes from.
 
-| | `voxel_down_sample` (step 3) | `voxel_dedup` (step 6) |
+| | `voxel_down_sample` (step 3) | `ghost_voxel_downsample` (step 6) |
 |---|---|---|
 | cell | **1.2 mm, fixed** (`0.002` units) | **3.0 mm, derived** (`0.65 × mean spacing`) |
 | runs on | the whole scene, before clustering | one object's cloud, after clustering |
@@ -53,24 +63,34 @@ Panel 5 is the payoff: 1.21 mm → **0.23 mm**, a single line. MLS could not hav
 done that on panel 3's cloud, because at that density its neighbourhood would have
 been too narrow to hold both sheets at once.
 
-### Could it just be `open3d.voxel_down_sample`?
+### It is now `open3d.voxel_down_sample`
+
+> **Decided 2026-08-23 — the swap was made.** The hand-rolled 30-line grid
+> (`voxel_dedup`) is deleted; `ghost_voxel_downsample` is a thin wrapper around
+> Open3D's call. The section below is the measurement the decision rests on.
+> What ships now reports **1081.94 cm³** on `inputs/small_leg` where the
+> hand-rolled version reported 1081.94 — the 0.15% below.
 
 ![dedup vs open3d](dedup_vs_open3d.png)
 
 Same call site, same 3.0 mm cell, same patch — only the function swapped.
 
+> Re-measured 2026-08-23 on the post-Stage-0-fix tree, by patching `ghost_voxel_downsample`
+> to call Open3D and running stages 3-6 from the same cached Stage 1.
+
 | | box | limb | into Stage 4 | limb volume |
 |---|---|---|---|---|
-| `voxel_dedup` (current) | 105,045 → 16,432 | 118,478 → 17,683 | 14,722 | 1091.79 cm³ |
-| `o3d.voxel_down_sample` | 105,045 → 16,385 | 118,478 → 17,736 | 14,811 | 1088.59 cm³ |
+| `ghost_voxel_downsample` (current) | 106,832 → 17,979 | 114,282 → 17,979 | 15,447 | **1081.94 cm³** |
+| `o3d.voxel_down_sample` | 106,832 → 17,827 | 114,282 → 17,979 | 15,447 | **1081.94 cm³** |
 
-**0.29% apart.** The only real difference is where the grid is anchored:
-`voxel_dedup` uses `points.min(axis=0)`, Open3D uses its own origin. Cells fall in
+**0.15% apart** — closer than the 0.29% first recorded, and the conclusion is
+unchanged. The only real difference is where the grid is anchored:
+`ghost_voxel_downsample` uses `points.min(axis=0)`, Open3D uses its own origin. Cells fall in
 slightly different places, so a few points end up on the other side of a boundary
 and the centroids shift — visible in panel 4 as circles with no dot inside them.
 After MLS even that mostly washes out, 0.23 mm either way.
 
-So `voxel_dedup` is ~30 lines doing what one library call does. Three things the
+So `ghost_voxel_downsample` is ~30 lines doing what one library call does. Three things the
 swap would have to preserve: colours (Open3D averages them only if the cloud
 carries them), the `voxel_size <= 0` escape hatch that `GHOST_VOXEL_FACTOR = 0`
 relies on, and the deterministic grid origin.
@@ -78,20 +98,25 @@ relies on, and the deterministic grid origin.
 Two claims worth keeping apart when presenting this:
 
 - **The step is load-bearing.** Removing it costs 2.70% of the reported volume.
-- **This implementation of it is not.** A library call gets within 0.29%.
+- **This implementation of it is not.** A library call gets within 0.15%.
 
 Note also that shell thickness disagreed with volume here: measured on the
 cross-section these two came out 0.59 mm against 0.75 mm, a 27% gap that made
-`voxel_dedup` look clearly better. On volume they are 0.29% apart. Shell RMS in one
+`ghost_voxel_downsample` look clearly better. On volume they are 0.15% apart. Shell RMS in one
 slice is a noisy proxy; volume integrates the whole surface. Where the two
 disagree, believe the volume.
 
-> **NO DECISION TAKEN.** Nothing is being swapped on the strength of this. 0.29% is
-> small, but it is measured on one capture against the pipeline itself, not against
-> a known volume — and 0.29% is not obviously below the noise floor of a system
-> whose reference cube carries a ~2% residual. **Re-run this A/B on the first
-> dataset with independent ground truth and decide it there**, alongside
-> `normal_aware_filter`. Until then `voxel_dedup` stays exactly as it is.
+> **DECIDED 2026-08-23 — swapped.** This note previously said no decision would be
+> taken until a dataset with independent ground truth existed. That was overruled
+> deliberately: re-measured on the current tree the two implementations are
+> **0.15%** apart, which is well inside the noise floor of a system whose
+> reference cube carries a ~2% residual, and 30 lines of hand-rolled voxel
+> gridding is not worth maintaining for a difference that small. `voxel_dedup`
+> is deleted and `ghost_voxel_downsample` calls Open3D.
+>
+> What has **not** changed: whether this *step* belongs at all. Removing it still
+> costs +2.59% on the reported volume, which is a real effect and still wants
+> ground truth. `normal_aware_filter` is likewise still undecided.
 
 ---
 
@@ -105,7 +130,7 @@ mis-attributed twice before it was measured.
 **Job.** Delete isolated flyers — points whose mean distance to their 20 nearest
 neighbours is more than 2.5σ above the cloud's average. These come from depth
 predicted at a silhouette edge, where the ray grazes the object and lands in space.
-**Earns.** 860,182 → 828,460 (−3.7%). Effect on the cross-section: none
+**Earns.** 858,554 → 823,550 (−4.1%). Effect on the cross-section: none
 measurable, 1.38 → 1.36 mm.
 **Not.** Not a ghost step. A ghost sheet is dense and well-connected, so it looks
 perfectly normal to this test.
@@ -113,7 +138,7 @@ perfectly normal to this test.
 ### `voxel_down_sample(0.002)` · open3d
 **Job.** Make the next two steps tractable. RANSAC and DBSCAN both scale badly, and
 this runs on the whole scene — floor, cube and limb together — before either.
-**Earns.** 828,460 → 442,540 (−47%), and the stage runs in seconds rather than
+**Earns.** 823,550 → 445,654 (−46%), and the stage runs in seconds rather than
 minutes.
 **Not.** Not chosen for surface quality. 0.002 is a speed setting; the
 surface-scale decimation happens later at 0.005.
@@ -121,7 +146,7 @@ surface-scale decimation happens later at 0.005.
 ### `remove_dominant_plane` · RANSAC
 **Job.** Delete the floor. The floor touches both the cube and the limb, so while it
 is present DBSCAN sees one connected blob rather than separate objects.
-**Earns.** 442,540 → 228,175 (−49%). It is also what makes clustering possible at
+**Earns.** 445,654 → 225,808 (−49.3%). It is also what makes clustering possible at
 all — without it there is nothing to cluster.
 **Not.** Not the same as the floor plane used later for levelling and closing the
 base; that one is re-fitted in the levelled frame.
@@ -130,21 +155,26 @@ base; that one is re-fitted in the levelled frame.
 **Job.** Split what remains into objects and decide which is the reference. Cubeness
 is `min_extent / max_extent`; the most cube-like cluster is the reference and the
 other is the subject.
-**Earns.** 228,175 → 118,478 for the limb. Identity, not just geometry: every later
+**Earns.** 225,808 → 114,282 for the limb. Identity, not just geometry: every later
 stage needs to know which cloud sets the scale.
 **Not.** Not a quality filter — it selects, it does not clean.
 
-### `voxel_dedup(voxel = 0.65 × spacing)` · **the one people misread**
+### `ghost_voxel_downsample(voxel = 0.65 × spacing)` · **the one people misread**
 **Job.** Set the point spacing so that MLS's neighbourhood is physically wide enough
 to span the ghost. `MLS_RADIUS_MULT` is measured in *spacings*, so decimating is
 what converts it into millimetres: 0.94 mm spacing gives a 3.75 mm radius, 2.10 mm
 spacing gives 8.38 mm, against a ~2 mm sheet separation.
-**Earns.** 118,478 → 18,221 (−85%), about 6.5 points per voxel. After MLS: 0.59 mm
+**Earns.** 114,282 → 17,979 (−84%), about 6.4 points per voxel. After MLS: 0.59 mm
 against 0.75 mm for a plain voxel downsample at the same voxel size, and 1.12 mm
-with no decimation at all. On the reported volume, **+2.70% if it is removed** —
-larger than the reference cube's own residual, so it is not noise. It also keeps
-Stage 4's input at 14,722 points rather than 84,751, which is most of the
-reconstruction time.
+with no decimation at all. On the reported volume, **+2.59% if it is removed**
+(1081.94 cm³ with dedup, 1111.62 cm³ with `GHOST_VOXEL_FACTOR = 0`, same cached
+Stage 1) — larger than the reference cube's own residual, so it is not noise. It
+also keeps Stage 4's input at 15,447 points rather than 76,736, which is most of
+the reconstruction time.
+
+Note that the reference cube reports 2744.00 cm³ in **both** arms, because main's
+Stage 6 calibrates on that cube's own volume. The reference cannot corroborate
+this measurement; only the limb moves.
 **Not.** **It does not collapse the ghost.** Two sheets 2 mm apart fall in different
 voxels and both survive. On its own it leaves the shell at 1.62 mm — no better than
 a random subsample's 1.39 mm. It is a downsample, and its value is entirely in what
@@ -155,7 +185,7 @@ it enables downstream.
 against the mean normal of the 20 nearest, rejected past `1 − |dot| > 0.3` (~45°).
 A surviving ghost fragment is sparse, so its normals scatter where a real surface's
 agree.
-**Earns.** 17,684 kept of 18,221 (−2.9%), 0.59 → 0.52 mm after MLS, and
+**Earns.** 17,443 kept of 17,979 (−3.2%), 0.59 → 0.52 mm after MLS, and
 **−0.08% on the reported volume** — indistinguishable from nothing.
 **Not.** Not load-bearing.
 
@@ -165,7 +195,7 @@ agree.
 > against a known volume. The failure this step guards against — misoriented points
 > seeding spurious tetrahedra in the alpha shape — is the kind that appears on a
 > *bad* capture, not a good one. **Decide it on a dataset with independent ground
-> truth**, per the rule in [`experiments.md`](experiments.md); until then it stays.
+> truth**, per the rule in [`experiments.md`](../experiments.md); until then it stays.
 
 ### `mls_project(radius_mult=4.0, polynomial=True)`
 **Job.** Move every point onto a surface fitted to its neighbourhood, collapsing
@@ -201,14 +231,14 @@ integrated over a doubled surface is not the object's volume.
 | 3 | `voxel_down_sample(0.002)` | 442,540 | 53.4% | 1.57 mm |
 | 4 | `remove_dominant_plane` | 228,175 | 51.6% | 1.57 mm |
 | 5 | `detect_top_k_objects` (DBSCAN) | 118,478 | 51.9% | 1.57 mm |
-| 6 | **`voxel_dedup`** | **18,221** | **15.4%** | 1.92 mm |
+| 6 | **`ghost_voxel_downsample`** | **18,221** | **15.4%** | 1.92 mm |
 | 7 | **`normal_aware_filter`** | 17,684 | 97.1% | 1.76 mm |
 | 8 | `mls_project` | 17,684 | 100% | **0.79 mm** |
 
 **Read the two columns separately.** Point count is what the ghost steps act on;
 shell thickness is what MLS acts on. Neither metric describes both.
 
-### 6 · `voxel_dedup` — a downsample, and that is the point
+### 6 · `ghost_voxel_downsample` — a downsample, and that is the point
 
 Grid the space at `voxel_size = GHOST_VOXEL_FACTOR × mean nearest-neighbour
 distance` (0.65 × spacing, so 0.0050 units here), then replace every occupied
@@ -262,8 +292,8 @@ Four ways of reaching ~18k points, measured on the same section.
 | no decimation at all | 118,478 | 1.48 mm | 1.12 mm |
 | random subsample | 17,682 | 1.39 mm | 0.79 mm |
 | plain voxel downsample | 18,292 | 1.91 mm | 0.75 mm |
-| `voxel_dedup` only | 18,221 | — | 0.59 mm |
-| **`voxel_dedup` + `normal_aware_filter`** | 17,682 | 1.62 mm | **0.52 mm** |
+| `ghost_voxel_downsample` only | 18,221 | — | 0.59 mm |
+| **`ghost_voxel_downsample` + `normal_aware_filter`** | 17,682 | 1.62 mm | **0.52 mm** |
 
 **Yes, it is a downsample — and that is exactly its job.** Before MLS it is no
 better than random decimation. After MLS it is clearly better: 0.52 mm against
@@ -276,7 +306,7 @@ millimetres**:
 | cloud | spacing | MLS radius |
 |---|---|---|
 | full limb cluster, 118k | 0.94 mm | 3.75 mm |
-| after `voxel_dedup`, 18k | 2.10 mm | **8.38 mm** |
+| after `ghost_voxel_downsample`, 18k | 2.10 mm | **8.38 mm** |
 
 The ghost sheets sit about 2 mm apart. At 3.75 mm the neighbourhood barely spans
 them, so most local fits see one sheet and MLS has nothing to merge — which is why
@@ -300,10 +330,10 @@ source, with each step disabled in turn.
 |---|---|---|---|
 | **A** full chain | 14,722 | 1091.79 cm³ | — |
 | **B** no `normal_aware_filter` | 15,057 | 1090.97 cm³ | **−0.08%** |
-| **C** no `voxel_dedup` | 84,751 | 1121.22 cm³ | **+2.70%** |
+| **C** no `ghost_voxel_downsample` | 84,751 | 1121.22 cm³ | **+2.70%** |
 | **D** neither | 90,321 | 1118.89 cm³ | +2.48% |
 
-`voxel_dedup` earns its place: 2.7% is larger than the reference cube's own
+`ghost_voxel_downsample` earns its place: 2.7% is larger than the reference cube's own
 residual. Without it the ghost survives, the surface stays a thick band, and the
 alpha shape wraps a fatter solid — the volume inflates, which is the direction the
 mechanism predicts.
@@ -353,6 +383,6 @@ pair, but that is a property of this data, not a guarantee.
 
 Two parameters it depends on. `MLS_RADIUS_MULT = 4.0` is in units of point
 spacing, so the physical radius moves with the decimation — which is the whole
-reason `voxel_dedup` matters, and why running MLS on the undecimated cloud
+reason `ghost_voxel_downsample` matters, and why running MLS on the undecimated cloud
 under-performs. And there is no distance weighting, so a neighbour at the edge of
 the radius counts as much as one underfoot.

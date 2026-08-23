@@ -161,8 +161,10 @@ resolution is not available as a lever.
 
 Implication: effective resolution can only be gained by making the subject fill
 more of the 518 frame (tight object-centric crop), not by enlarging the frame.
-Grounding DINO + SAM already exist in `pipeline/detection.py` to locate a crop
-box.
+Grounding DINO + SAM already exist in `pipeline/core/vlm_detect.py` to locate a
+crop box. **This is what Stage 0 became** — the object-centric crop suggested here
+was built, and `pipeline/detection.py`, the earlier module that held these models,
+was deleted once Stage 0 superseded it.
 
 ## Stage 2 tests
 
@@ -214,7 +216,8 @@ larger alpha and loses volume. **Needs a stage 3–6 accuracy run to pick.**
 
 `export_ply` (legacy) applies statistical outlier removal; `export_ply_dual`
 does not. Same threshold gives 2.13 mm (no-ghost) vs 2.30 mm (ghost). Not lost
-— Stage 3 applies SOR at `clean.py:111` — but the dense cloud handed to Stage 3
+— Stage 3 applies SOR at `clean.py:57`, inside `_load_and_thin` — but the dense
+cloud handed to Stage 3
 is dirtier than the legacy path's.
 
 ### Context
@@ -351,15 +354,17 @@ invasive: it moves points rather than removing them.
 - [ ] Measure the can with calipers (height, diameter) — gates every accuracy claim
 - [ ] **Water displacement on a held-out object** — the missing ground truth, and
       the tiebreaker for three deferred decisions. When it exists, re-run:
-      E-ghost-steps (does `normal_aware_filter` stay? does `voxel_dedup`?),
-      E-dedup-impl (can `voxel_dedup` become a library call?), and the Stage 6
+      E-ghost-steps (does `normal_aware_filter` stay? does `ghost_voxel_downsample`?),
+      E-dedup-impl (can `ghost_voxel_downsample` become a library call?), and the Stage 6
       scale question in `stage06_experiments.md`. All three are currently measured
       against the pipeline itself, which cannot settle any of them.
 - [ ] `mode="pad"` vs `"crop"` — crop currently discards 44% of each photo
 - [ ] `conf_thres` sweep — untested, controls shell thickness
 - [ ] length-based scale instead of `k^(1/3)` — more correct, ~3% shift
-- [ ] multi-view consistency filter (`debug_ghost.py:165`, written but unwired)
-- [ ] single-cluster scene exports nothing (`clean.py:234-252`)
+- [ ] multi-view consistency filter (`pipeline/multiview.py`, written but never
+      wired into Stage 2 — its own docstring says where it belongs)
+- [ ] single-cluster scene exports nothing (`clean.py:175`, the empty-cluster guard
+      in `_clean_cluster` returns empty arrays and nothing downstream notices)
 
 ---
 
@@ -379,6 +384,30 @@ therefore calibrated on a colour the data never contains: true band points score
 median of 0.298 along an axis thresholded at 0.50, so 85% of the band was discarded
 (193 points → 40) and the surviving strip measured 0.21 × 0.04 × 0.03 cm — too thin
 to determine a normal.
+
+
+> **Re-measured 2026-08-23, and the "off perpendicular" column does not
+> reproduce.** Re-running all three arms on the current tree gives the *tilt*
+> column almost exactly — main's detector at 19.73° against the 19.7° recorded
+> here, the fix at 19.04° against 18.4° — but the derived "off perpendicular"
+> figures come out 10.49°, 24.52° and 9.37°, not 3.2°, 20.8° and 1.3°. That
+> quantity is the 3D angle between the plane normal and a fitted limb axis, and
+> it is extremely sensitive to how the axis is fitted: the same three planes
+> score 12.5° / 22.6° / 12.2° against one reasonable axis estimate and 10.5° /
+> 24.5° / 9.4° against another. **The single-number claim should not be quoted.**
+>
+> What does reproduce, and is what the fix is actually worth:
+>
+> | | band points | normal's tilt from vertical |
+> |---|---|---|
+> | main's hardcoded khaki window | 193 | 19.73° |
+> | traced, `dilate=0` — the bug | **45** | **27.06°** |
+> | traced, `dilate=±3` — ships | **296** | **19.04°** |
+>
+> The limb's own axis, fitted on `leg_open.ply` over the upper 60% of its span,
+> leans **19.01°**. The shipping detector matches that to 0.03°; the bug is 8°
+> out and fits its plane through 45 points instead of 296. Figure:
+> [`experiments/cut_plane_band_colour.png`](experiments/cut_plane_band_colour.png).
 
 | variant | marker pts | off perpendicular | verdict |
 |---|---|---|---|
@@ -410,7 +439,10 @@ each point its own pixel from its own view.
 
 **Corroboration.** Three independent lines agree: the limb axis at that height is
 18.0°, main's detector puts the plane at 19.7°, the fixed learned detector at 18.4°.
-Volumes agree to 0.33% (1071.46 against 1075.04 cm³).
+Volumes agree to 0.33% (1071.46 against 1075.04 cm³) — both under the **parked**
+Stage 6. What ships today reports 1081.94 cm³ for the same capture, because Stage 6
+is reverted to main's volume-ratio scale; the 0.33% is the agreement between two
+*detectors*, and holds whichever Stage 6 consumes them.
 
 **Scope.** `small_leg` only. `est_325` has no band, so the claim that a learned
 colour generalises to a red or blue marker is argued, not demonstrated.
@@ -449,7 +481,14 @@ instead. `stagerun.py` also re-derived its own copy of the reasons from bounding
 boxes, and had drifted: its summary still said `"cube not contained"` after the
 stage began distinguishing a cube never seen from one the window cuts.
 
-**Now**, from a single helper `_reject_reasons(cube_seen, band_seen, cube_ok,
+> **SUPERSEDED 2026-08-23.** The two-outcome taxonomy below was replaced by the
+> three-verdict model — `pass` / `warning` / `reject` — in E-stage0-verdicts.
+> `_reject_reasons` is now `_frame_verdict`, and the important change is that a
+> clipped cube and a missing band are both **warnings** rather than rejections:
+> refusing them was costing captures that were perfectly measurable. This entry
+> is kept for the reasoning about *severity*, which carried over intact.
+
+**Then**, from a single helper `_reject_reasons(cube_seen, band_seen, cube_ok,
 band_ok)` in `prep.py`, used by both the stage and the summary:
 
 | condition | reason | severity | rejected? |
@@ -522,7 +561,7 @@ imprecisely is not much better than one not written down.
 
 ## E-ghost-steps — which cleaning steps change the answer · Aug 2026
 
-**Question.** `voxel_dedup` and `normal_aware_filter` both look like decimation.
+**Question.** `ghost_voxel_downsample` and `normal_aware_filter` both look like decimation.
 Does either change the reported volume, or are they ceremony?
 
 **Method.** Stages 3-6 re-run four times from one shared Stage 1-2 source
@@ -534,10 +573,10 @@ Both files restored afterwards and verified identical to the commit.
 |---|---|---|---|
 | A · full chain | 14,722 | 1091.79 cm³ | — |
 | B · no `normal_aware_filter` | 15,057 | 1090.97 cm³ | **−0.08%** |
-| C · no `voxel_dedup` | 84,751 | 1121.22 cm³ | **+2.70%** |
+| C · no `ghost_voxel_downsample` | 84,751 | 1121.22 cm³ | **+2.70%** |
 | D · neither | 90,321 | 1118.89 cm³ | +2.48% |
 
-**`voxel_dedup` — KEPT.** 2.7% is larger than the reference cube's own residual,
+**`ghost_voxel_downsample` — KEPT.** 2.7% is larger than the reference cube's own residual,
 so it is not noise. The direction matches the mechanism: without it the ghost
 survives, the surface stays a thick band, and the alpha shape wraps a fatter
 solid. It also keeps Stage 4's input at 14.7k points rather than 84.8k.
@@ -563,23 +602,23 @@ capture* failure. **Re-run this A/B on the first dataset with independent ground
 truth and decide it there.**
 
 Full working, with the cross-section after every function:
-[`ghost_removal_chain.md`](ghost_removal_chain.md).
+[`ghost_removal_chain.md`](experiments/ghost_removal_chain.md).
 
 ---
 
-## E-dedup-impl — is `voxel_dedup` replaceable by `open3d.voxel_down_sample`? · Aug 2026
+## E-dedup-impl — is `ghost_voxel_downsample` replaceable by `open3d.voxel_down_sample`? · Aug 2026
 
-**Question.** `voxel_dedup` is ~30 hand-written lines. Open3D ships the same
+**Question.** `ghost_voxel_downsample` is ~30 hand-written lines. Open3D ships the same
 operation. Same call site, same voxel size, only the function swapped — does the
 answer change?
 
 | | box | limb | into Stage 4 | limb volume |
 |---|---|---|---|---|
-| `voxel_dedup` (current) | 105,045 → 16,432 | 118,478 → 17,683 | 14,722 | 1091.79 cm³ |
+| `ghost_voxel_downsample` (current) | 105,045 → 16,432 | 118,478 → 17,683 | 14,722 | 1091.79 cm³ |
 | `o3d.voxel_down_sample` | 105,045 → 16,385 | 118,478 → 17,736 | 14,811 | 1088.59 cm³ |
 
 **0.29% apart.** The only substantive difference is the grid anchor —
-`voxel_dedup` uses `points.min(axis=0)`, Open3D its own origin — so cells fall
+`ghost_voxel_downsample` uses `points.min(axis=0)`, Open3D its own origin — so cells fall
 elsewhere, a few points cross a boundary and the centroids shift. After MLS the
 patch spread is 0.23 mm either way.
 
@@ -594,10 +633,719 @@ averaging (Open3D does it only when the cloud carries colours), the
 step, and a deterministic grid origin.
 
 **Method note worth keeping.** These two measured 0.59 mm against 0.75 mm on
-cross-section shell thickness — a 27% gap suggesting `voxel_dedup` was clearly
+cross-section shell thickness — a 27% gap suggesting `ghost_voxel_downsample` was clearly
 better — while on volume they differ by 0.29%. Shell RMS in one slice is a noisy
 proxy and was over-read earlier in this investigation. Where a proxy and the
 reported volume disagree, the volume decides.
 
-Figure: [`dedup_vs_open3d.png`](dedup_vs_open3d.png), working in
-[`ghost_removal_chain.md`](ghost_removal_chain.md).
+Figure: [`dedup_vs_open3d.png`](experiments/dedup_vs_open3d.png), working in
+[`ghost_removal_chain.md`](experiments/ghost_removal_chain.md).
+
+---
+
+## E-recon-method — why alpha shape, when Poisson and ball pivoting look better · Aug 2026
+
+> **Partly superseded 2026-08-23.** The comparison of *fidelity* and the argument
+> that **χ, not watertightness, is the discriminator** both stand and are the
+> reason the χ warning now exists. But the Poisson column was measured against a
+> Stage 5 that never called `repair()`; with that fixed Poisson reaches χ = 2 and
+> is now the default. Ball pivoting is unaffected — it fails at χ = 256 either
+> way. See **E-psr-adopted**.
+
+**Question.** Alpha shape produces the least attractive surface of the three
+available reconstructors. Ball pivoting interpolates the points exactly and
+Poisson is smooth. Is the choice defensible, or is it inertia?
+
+**Method.** All three run on the **same** Stage 3 clouds from
+`work/parity_stagerun` (box 19,573 pts, limb 15,447 pts), with the same normal
+estimation, and each is then put through the pipeline's own Stage 5 repair path
+(`workers/meshfix_worker.py`: `pymeshfix.fill_holes()`, then Open3D
+`fill_holes()`). Volumes are scaled by each arm's own reference cube, exactly as
+main's Stage 6 does, so the comparison is like for like.
+
+Figure: [`experiments/recon_method_comparison.png`](experiments/recon_method_comparison.png).
+
+**As produced, before any repair**
+
+| method | faces | components | χ | watertight | p95 point-to-surface |
+|---|---|---|---|---|---|
+| alpha shape (25×) | 15,880 | **1** | **2** | **yes** | 2.39 mm |
+| Poisson, depth 9 | 62,164 | 11 | 0 | no | **1.02 mm** |
+| ball pivoting | 28,012 | 133 | −2057 | no | **0.00 mm** |
+
+Ball pivoting passes through **every input point exactly** — it interpolates
+rather than approximates — and Poisson fits 2.5× closer than alpha. On fidelity
+alone, alpha shape is the worst of the three, and the intuition that the other
+two "look better" is correct.
+
+**After the pipeline's own repair**
+
+| method | χ after | limb volume | vs alpha |
+|---|---|---|---|
+| alpha shape | **2** | 1081.94 cm³ | — |
+| Poisson | 22 | 1069.56 cm³ | −1.1% |
+| ball pivoting | 256 | 1409.99 cm³ | **+30.3%** |
+
+**Verdict — the discriminator is χ, not watertightness.** All three become
+watertight after repair, so "not watertight" is not the argument and never was:
+PyMeshFix will close a topological mess into something `is_watertight` calls
+true. What it closes ball pivoting's 133 shredded shells into is a bag of small
+separate blobs, and the signed volume of that is 30% wrong while the mesh reports
+as closed.
+
+χ = 2 is the test that separates *one closed genus-0 solid* from *a closed
+something*. It is a yes/no property of the surface rather than a judgement, which
+is why Stage 4's ladder selects on it and why the fallback ranking uses
+`|χ − 2|`.
+
+Poisson is the closest competitor and worth recording as such: −1.1% with a
+2.5× better fit. Its problem is that χ = 22 carries no guarantee — nothing says
+how wrong it might be on a different capture, and nothing would flag it.
+
+**An earlier run of this comparison** is in
+[`stage06_experiments.md`](stage06_experiments.md), on a different Stage 3 cloud
+(the leg mesh with a fabricated base). Its qualitative conclusion is the same —
+alpha shape is the only method that closes without repair — but its post-repair
+numbers are **−5.5% for Poisson and −25.8% for ball pivoting**, where this run
+gives −1.3% and **+30.8%**.
+
+That the sign of ball pivoting's error flips between two captures is not a
+contradiction to explain away; it is the strongest form of the argument. A method
+whose error is −26% on one cloud and +31% on another, both times reporting
+`is_watertight == True` after repair, cannot be corrected for or bounded. Alpha
+shape's χ = 2 requirement is what refuses that class of answer up front rather
+than discovering it later.
+
+The structural reason, from that earlier entry: alpha shape works from a 3D
+Delaunay tetrahedralisation and **never uses normals**. Poisson integrates a
+normal field and ball pivoting seeds its ball on normals, and the fabricated base
+— a flat cap plus a swept skirt — has no well-defined normal.
+
+**A fourth property, measured later.** Alpha shape is also the most *robust* of
+the three. Perturbing the input cloud by removing a few percent of its points
+moves alpha's volume by 0.03%, Poisson's by 5.8%, and ball pivoting's by a factor of four.
+See E-slice-outliers below.
+
+**Not tested.** Poisson at other depths or trim quantiles; ball pivoting at other
+radii. Neither is likely to move χ into range, but neither was swept.
+
+---
+
+## E-preconfirm-scale — can the Review screen get its scale without Stages 4-6? · Aug 2026
+
+**Question.** The chart puts Stages 4-6 after the cut confirmation, but they also
+run before it, on the reference cube alone, to produce the cm-per-unit scale the
+Review screen needs to draw the cutting plane in real units. Can that scale come
+from Stage 3 instead, so 4-6 run exactly once?
+
+**Method.** Take the oriented bounding box of Stage 3's own segmented
+`box.ply`, identify the vertical axis from the OBB's rotation, and derive
+`14.0 / mean(horizontal edges)`. Compare against Stage 6's measured
+`linear_scale`.
+
+| source | scale |
+|---|---|
+| Stage 3 cube cloud, OBB mean horizontal edge | **40.59 cm/unit** |
+| Stage 3 cube cloud, OBB min horizontal edge | 42.48 cm/unit |
+| Stage 6 (main's, volume ratio) | **60.87 cm/unit** |
+| Stage 6 (parked, fitted faces) | 59.79 cm/unit |
+
+**Verdict — rejected, 33% out.** The OBB's smallest extent is 0.3296 units where
+the cube's true edge is `14 / 60.86 = 0.2300`, so the box is 43% too large. The
+cause is that `box.ply` is not only the cube: Phase C extends the base to the
+floor, adding 1,199 wall points below it, and the OBB spans those too.
+
+The cube has to pass through reconstruction for its size to be known, so the
+calibration branch stays. It is now labelled as calibration in the chart and in
+`service/app.py`, and a postcondition check (`service/jobs.py:_postcondition`)
+fails the job if that pass ever measures the *subject* — the thing the two-pass
+split exists to prevent.
+
+**Not tested.** Fitting the cube's faces on the point cloud directly (RANSAC
+parallel-plane pairs), which is what `pipeline/core/faces.py` does for a mesh.
+That would likely work and would let 4-6 run once, at the cost of a second scale
+derivation to keep honest.
+
+---
+
+## E-slice-outliers — per-z-level outlier removal after MLS · Aug 2026
+
+**The idea, and it is a good one.** In the cross-section of
+`recon_method_comparison.png` a few points on the right sit well away from the
+outline, and alpha shape reaches out and wraps them, producing a visible notch.
+The proposal: a limb is a stack of closed cross-sections, so judge each point
+against **its own horizontal slice** rather than against the 3D cloud. A point
+can sit at a perfectly ordinary 3D density and still be nowhere near its slice's
+outline, because its neighbours are above and below it rather than around it. A
+global statistical filter cannot see that; a per-slice one can.
+
+Figure: [`experiments/slice_outlier_removal.png`](experiments/slice_outlier_removal.png).
+
+**Method.** Slices of 3 × mean NN spacing, overlapping by half so no point is
+judged only by a bin edge. Inside each slice, work in 2D: a point's isolation is
+its k-th nearest neighbour distance among the slice's own members, and it is
+flagged if that exceeds `mult` × the slice's median. A point is removed only if
+flagged in **every** slice containing it. Then all three reconstructors are re-run
+on the filtered cloud, both objects, and calibrated as Stage 6 does.
+
+The filter is not in the pipeline. Its implementation is in the appendix below so
+it can be revived without rewriting it.
+
+**What it removes**
+
+| threshold | limb removed | cube removed |
+|---|---|---|
+| `mult = 4.0` | 2 pts (0.01%) | 0 |
+| `mult = 3.0` | 453 pts (2.93%) | 111 pts (0.57%) |
+| `mult = 2.0` | 627 pts (4.06%) | 837 pts (4.28%) |
+
+**What it changes**
+
+| | alpha raw vol | alpha χ | alpha rung | Poisson χ | ball pivot χ |
+|---|---|---|---|---|---|
+| no filter | — | 2 | 25× | 22 | 256 |
+| `mult = 3.0` | **−0.03%** | 2 | 25× | **2** | 334 |
+| `mult = 2.0` | −2.48% | 2 | 25× | **2** | 398 |
+
+**Verdict — sound idea, three findings, and it is not being wired in.**
+
+**1. The thing it was aimed at is not an outlier.** The notch survives every
+arm, and the reason is visible in the side view: those points are **256 of them,
+spanning 74 mm of height, in the same DBSCAN cluster as the body** at an 8 mm
+epsilon. It is a connected protrusion, not scatter. It only looks isolated
+because a ±4 mm cross-section cuts a thin sample through something that is sparse
+in that plane and dense along its own length. The filter is behaving correctly by
+leaving it alone; a filter that removed it would be deleting real geometry.
+
+**2. Alpha shape is barely affected — which is itself a result.** Removing 453
+genuinely isolated points changes the limb's raw volume by **0.03%**, far below
+the noise floor. At 25 × point spacing alpha's ball is about 62 mm across, so a
+handful of stray points distort the *outline* visibly while contributing almost
+no *volume*. The defect looks far worse than it costs. Push the threshold to
+`mult = 2.0` and the volume moves −2.48%, but by then it is removing 4% of the
+cloud and starting to eat real surface — the cube loses 4.3%, which is a flat
+dense face that should have no outliers at all.
+
+**3. It helps Poisson substantially, and harms ball pivoting.** PSR's Euler
+characteristic goes **22 → 2** on the limb and 30 → 4 on the cube — the filter is
+enough to make Poisson topologically valid, which nothing else achieved. That is the
+largest single improvement anywhere in this experiment, and it is worth
+remembering: if Poisson is ever wanted, this is the preprocessing that moves it
+towards viable. Ball pivoting goes the other way — 256 → 334 → 398 — because it
+needs dense coverage and every removed point opens another hole for the repair to
+close arbitrarily. Its volume swings to 6151 cm³ then 3951.
+
+So the filter does not improve what ships, but it does explain something the
+method comparison left open: **alpha shape's advantage is partly robustness.** It
+is the only one of the three whose answer barely moves when the input cloud is
+perturbed by a few percent.
+
+**Not tested.** Whether the notch is anatomy, a fold, or a reconstruction
+artifact — that needs the photographs, not the cloud. Whether a *shape*-aware
+per-slice rule (fit the outline, drop points far from it) would do better than a
+density rule; it would catch the notch, which is exactly why it might be wrong to
+use.
+
+### Appendix — the filter
+
+```python
+def slice_outlier_removal(points, colors=None, slice_h=None, k=6,
+                          mult=3.0, min_pts=12):
+    """Drop points isolated within their own horizontal slice."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    points = np.asarray(points, dtype=np.float64)
+    n = len(points)
+    if n < min_pts:
+        return points, colors, {"removed": 0}
+    d, _ = cKDTree(points).query(points, k=2, workers=-1)
+    spacing = float(d[:, 1].mean())
+    slice_h = slice_h or 3.0 * spacing
+    z = points[:, 2]
+    lo, hi, step = z.min(), z.max(), slice_h / 2.0
+    flagged = np.zeros(n, dtype=np.int32)
+    seen = np.zeros(n, dtype=np.int32)
+    for i in range(int(np.ceil((hi - lo) / step)) + 1):
+        z0 = lo + i * step
+        m = np.where((z >= z0) & (z < z0 + slice_h))[0]
+        if len(m) < min_pts:
+            continue
+        xy = points[m][:, :2]
+        kk = min(k, len(xy) - 1)
+        dd, _ = cKDTree(xy).query(xy, k=kk + 1, workers=-1)
+        iso = dd[:, -1]
+        med = float(np.median(iso))
+        seen[m] += 1
+        if med > 0:
+            flagged[m] += (iso > mult * med).astype(np.int32)
+    keep = ~((seen > 0) & (flagged == seen))
+    stats = {"removed": int((~keep).sum()), "slice_h": slice_h, "spacing": spacing}
+    if colors is None:
+        return points[keep], None, stats
+    return points[keep], np.asarray(colors)[keep], stats
+```
+
+---
+
+## E-outline-statistic — the cross-section outline, and a number it invented · Aug 2026
+
+**Prompted by looking at the picture.** In `mls_ghost_limb_section.png` the
+cross-section outline has sharp corners — a pronounced vertex near the top, and
+another on the right. A leg has no corners. That observation turned out to be
+about the *measurement*, and it invalidates one number the rework had been
+quoting.
+
+Figure: [`experiments/outline_statistic.png`](experiments/outline_statistic.png).
+
+**What the outline was.** Angular wedges around the centroid, and in each wedge
+the **maximum** radius. Every vertex is therefore a single extreme point, and the
+polygon connecting them is spiky by construction. That is the whole explanation of
+the corners: they are the most distant point in each 20° wedge, not features of
+the limb.
+
+**What that does to the number.** The consequence is worse than cosmetic. Before
+MLS the surface is a doubled shell 1.76 mm thick. A max-radius outline traces its
+**outer** face. MLS collapses the shell to 0.79 mm, so the outer face moves inward
+by roughly half the reduction — and the metric reports that as a large loss of
+cross-sectional area which the limb never had.
+
+Same points, same slice, only the per-wedge statistic changed:
+
+| statistic | area (cm²) | plane vs no MLS | quadratic vs no MLS |
+|---|---|---|---|
+| max | 65.3 | **−7.57%** | **−6.41%** |
+| p90 | 63.7 | −6.22% | −5.13% |
+| mean | 60.9 | −1.41% | −0.50% |
+| **median** | **60.7** | **−0.59%** | **+0.42%** |
+
+The recorded figures were **−7.64% and −6.67%**. The max row reproduces them to
+about a tenth of a percentage point, which is how the cause was identified rather
+than guessed. Those two percentages are withdrawn.
+
+**What survives, and is now much better supported.** The reason the quadratic fit
+is preferred over the plane:
+
+| statistic | quadratic − plane | positive in |
+|---|---|---|
+| max | +1.05 pp | 98% of slices |
+| p90 | +1.17 pp | 98% |
+| mean | +1.01 pp | 98% |
+| median | **+1.10 pp** | **100%** |
+
+Median of 40 slices spanning 15-90% of the limb's height, IQR +0.86 to +1.47 pp.
+The conclusion was drawn from **one** slice with a metric that inflated it; it now
+rests on 40 slices and holds under every statistic tried. A plane fitted to a
+curved surface sits inside it, the quadratic does not, and the difference is about
+one percentage point of cross-sectional area.
+
+**Verdict.** The absolute area percentages in
+[`experiments/rework_main_vs_current.md`](experiments/rework_main_vs_current.md)
+were an artifact of the outline statistic and are corrected there. The
+plane-versus-quadratic decision was right, and is now measured properly. Use the
+**median** radius per wedge for any future cross-section, at 5° rather than 20°
+— at 20° the polygon still undershoots a convex outline by a few percent even
+with a robust statistic.
+
+**Not tested.** Whether the same statistic was used for the shell-RMS column.
+That column is a distance distribution, not an outline, so it is not exposed to
+this; but it was not re-derived.
+
+---
+
+## E-ghost-origin — the two sheets are two groups of cameras · Aug 2026
+
+**Prompted by a theory**: if the ghost is a doubled surface, perhaps one of the
+two sheets is the true one — specifically the **inner** one — and MLS projecting
+onto the midpoint is therefore biasing every surface outward.
+
+Testing that first needed to establish what the two sheets actually are. They
+turn out to be something more specific than "a duplicate".
+
+**Method.** Stage 1 produces `world_points` per view, shape `(S,518,518,3)`, so
+every point's source camera is known by construction. Rebuild the cloud with a
+view label attached, levelled with the same `R_total`, take a slab through the
+limb, split each 5° wedge at the largest radial gap, and ask which views
+contributed to each side.
+
+**Result — the split is perfectly clean.**
+
+| view | points on the inner sheet | on the outer sheet |
+|---|---|---|
+| 0 | 0 | 107 |
+| 1 | 0 | 45 |
+| **2** | **264** | 0 |
+| 3 | 0 | 15 |
+| **4** | **167** | 0 |
+| 5 | 0 | 142 |
+
+Views **2 and 4** place the surface about **2.70 mm inside** where views
+**0, 1, 3 and 5** place it, and no wedge mixes them. This is not scatter, and it
+is not a duplicate emitted by the model per-pixel: it is a **systematic
+disagreement between two groups of cameras**, i.e. a pose or scale inconsistency
+in VGGT's own registration.
+
+The same 2.7 mm separation appears on the reference cube, so it is a property of
+the reconstruction, not of the subject.
+
+**On the theory itself — unresolved, and the obvious tests are confounded.**
+
+- **Density does not decide it.** In wedges where both sheets appear they are
+  evenly populated: limb 51.9% inner against 48.1% outer, cube 48.0% / 52.0%.
+  Neither sheet is a faint copy of the other.
+- **Vote does not decide it.** Four views say outer, two say inner — but the two
+  inner views contribute *more points* in the wedges where both appear.
+- **Comparing the groups directly is confounded.** Measuring the cube and the
+  limb from each group separately gives a scale-invariant ratio differing by
+  9.5%, but the two groups see different faces, so partial coverage contaminates
+  that number. It is recorded here as *not evidence*.
+
+**Why it matters, if it can be settled.** The offset is additive, so it does not
+cancel under calibration. A surface offset δ inflates the cube's edge by 2δ on a
+~230 mm edge and the limb's diameter by 2δ on a ~108 mm diameter — the limb is
+affected about twice as hard in relative terms. If the inner sheet is the truth
+and MLS lands on the midpoint, the limb is being over-measured by roughly a
+percent of diameter more than the cube is, which does not divide out.
+
+**What would settle it.** An independent length in the scene. The ArUco markers
+are printed at a known size, so recovering their 3D corners per view group and
+comparing against that printed size would say which group has the correct scale —
+that is the experiment to run, and it needs `REFERENCE_MARKER_CM` measured with a
+ruler first. Failing that, water displacement on a held-out object.
+
+**Not tested.** Whether the split is stable across captures, or whether it tracks
+something identifiable about those two camera poses (they may be the two most
+oblique views). Both are cheap once a second dataset exists.
+
+---
+
+## E-psr-swap — can Poisson replace alpha shape? · Aug 2026
+
+> **SUPERSEDED 2026-08-23 — the conclusion was wrong.** Everything below was
+> measured against a Stage 5 that called only `pymeshfix.fill_holes()` and never
+> `repair()`. With the stronger repair in place Poisson reaches χ = 2 on both
+> objects in 38 of 46 configurations rather than 0 of 48, and it is now the
+> pipeline's default. See **E-psr-adopted**. The reasoning below about *why* χ
+> matters still holds; the verdict against Poisson does not.
+
+**Why it was asked.** In E-slice-outliers, adding the per-slice filter pushed
+Poisson's Euler characteristic on the **limb** from 22 to 2. If it can be made
+topologically valid it is the better surface — it fits the points 2.3× closer
+than alpha (p95 1.02 mm against 2.39 mm).
+
+**Method.** Sweep the three knobs that could plausibly fix it — Poisson depth
+(8, 9, 10, 11), low-density trim quantile (0, 0.01, 0.03, 0.10) and the per-slice
+filter (off, mult 3.0, mult 2.0) — on **both** objects, each put through the
+pipeline's own Stage 5 repair. 48 configurations, 96 reconstructions.
+
+Both objects matter: the reference cube sets the scale, so a cube that is not a
+single closed solid makes every number derived from it invalid too.
+
+**Result**
+
+| | closes at χ = 2 |
+|---|---|
+| the limb | **36 of 48** configurations |
+| the reference cube | **0 of 48** |
+
+The cube's χ was 4 in 23 configurations, and 6, 8, 10, 12, 22 or 30 in the rest.
+No depth, no trim, and no amount of pre-filtering closed it.
+
+**Why, and it is structural.** Poisson solves for a smooth indicator function and
+extracts an isosurface. The limb *is* smooth, so it does well. A cube is nothing
+but sharp 90° edges and flat faces — exactly what a smooth indicator cannot
+represent — so it rounds the edges and leaves handles where the normal field
+disagrees with itself along them. Alpha shape has no such trouble because it is a
+subcomplex of the points' own Delaunay tetrahedralisation: its topology comes
+from the samples, not from a fitted field.
+
+**And the number is not stable.** Across the 48 configurations the reported limb
+volume ranges **972 to 1174 cm³ — a 21% spread**. Alpha shape over the same three
+filter settings spans 1055 to 1082, a 2.5% spread. A method whose answer moves
+20% with a parameter that has no principled setting is not a measurement
+instrument.
+
+**Verdict — no. Alpha shape stays.** The proposal is defeated by the reference
+object rather than by the subject, which is worth stating plainly: if this
+pipeline ever measured only smooth organic shapes, Poisson would be a serious
+candidate. It measures a cube and a limb with the same code, and only alpha shape
+handles both.
+
+**Not tested.** Screened Poisson with explicit sharp-feature weighting, or
+reconstructing the two objects with *different* methods — the pipeline already
+supports `--box-recon-method` and `--obj-recon-method` separately, so a
+Poisson limb with an alpha-shape cube is a configuration nobody has measured. It
+would need the scale question settled first, since the two methods disagree by
+about 1% on the same cloud.
+
+---
+
+## E-mixed-recon — alpha shape for the cube, Poisson for the limb · Aug 2026
+
+> **SUPERSEDED 2026-08-23 — the conclusion was wrong.** Everything below was
+> measured against a Stage 5 that called only `pymeshfix.fill_holes()` and never
+> `repair()`. With the stronger repair in place Poisson reaches χ = 2 on both
+> objects in 38 of 46 configurations rather than 0 of 48, and it is now the
+> pipeline's default. See **E-psr-adopted**. The reasoning below about *why* χ
+> matters still holds; the verdict against Poisson does not.
+
+**The idea.** E-psr-swap found that Poisson closes the limb easily (36 of 48
+configurations) and the reference cube **never** (0 of 48), for a structural
+reason: a cube is nothing but sharp edges and a smooth indicator function cannot
+represent them. So use each method where it works — alpha shape on the cube,
+Poisson on the limb. The pipeline already supports this:
+`--box-recon-method alpha_shape --obj-recon-method poisson`.
+
+**Method.** Run stages 4-6 both ways from the same cached Stage 3, on **two**
+captures. `small_leg` (6 photos, 5 accepted by Stage 0) and `short_leg`
+(8 photos). Everything before Stage 4 is identical between the two arms.
+
+> **`short_leg` is a badly framed capture.** Stage 0 rejected essentially every
+> frame with `objects out of window`, and the run only proceeded under
+> `--continue-on-rejected`, with all frames handed to VGGT uncropped. It is
+> included precisely because a method should be judged on the capture that went
+> wrong, not only the one that went right.
+
+**Result — it works on one capture and fails on the other.**
+
+| | `small_leg` | `short_leg` |
+|---|---|---|
+| cube, alpha shape | χ = **2** | χ = **2** |
+| limb, alpha shape | χ = **2** | χ = **2** |
+| limb, Poisson after Stage 4 | χ = −1, not closed | χ = −10, not closed |
+| limb, Poisson **after repair** | χ = **2** ✓ | χ = **−4** ✗ |
+| volume vs alpha/alpha | −1.02% | **−16.13%** |
+
+**The number comes from the repair, not the reconstruction.** This is the part
+that decides it. Poisson's mesh is not closed when Stage 4 hands it over, so
+whatever Stage 5's PyMeshFix does to close it is part of the answer:
+
+| | Stage 4 → Stage 5 volume change |
+|---|---|
+| alpha shape, both captures | **+0.00%** — already closed, repair is a no-op |
+| Poisson, `small_leg` | **−4.22%** |
+| Poisson, `short_leg` | **+158.08%** |
+
+A 158% swing is the repair inventing geometry to bridge holes it cannot see the
+shape of. Alpha shape never enters that regime because Stage 4 does not hand over
+anything open — the ladder searches until it is closed.
+
+**What Poisson genuinely wins.** Fidelity, and by a lot:
+
+| | alpha p95 | Poisson p95 |
+|---|---|---|
+| `small_leg` | 2.39 mm | **1.30 mm** |
+| `short_leg` | 11.84 mm | **1.70 mm** |
+
+Poisson tracks the points about twice as closely on a good capture and **seven
+times** as closely on the bad one. That is a real advantage and it is worth
+recording, because it says something uncomfortable about alpha shape: on
+`short_leg` its surface sits nearly 12 mm from the cloud at p95. Alpha buys its
+guarantee with a coarse α (40× spacing there), and coarse means loose.
+
+**Verdict — no, but this was the closest anything has come.** The proposal is
+sound in principle, gets both objects to χ = 2 on a good capture, and is defeated
+by generality: on the second capture the limb closes at χ = −4 and the number
+moves 16%. A method that depends on the repair for between 4% and 158% of its
+volume cannot be trusted to report a measurement.
+
+**What would change the answer.** Poisson's problem here is holes, and holes come
+from sparse or inconsistent coverage. If the framing gate were enforced rather
+than overridden — `short_leg` should never have been measured at all — Poisson's
+failure case might simply not occur. That is testable the moment a second
+*well-framed* capture exists, and it is the experiment to run before dismissing
+this idea for good.
+
+**Not tested.** Screened Poisson with sharp-feature weighting; whether alpha's
+11.84 mm p95 on `short_leg` is the capture's fault or the ladder giving up too
+coarse; per-slice contour smoothing as a way to close Poisson's holes without
+PyMeshFix.
+
+---
+
+## E-stage0-verdicts — three bad band detections, one unreadable format, and a redesign · Aug 2026
+
+**Prompted by looking at an overlay**: on a capture with no marker band at all,
+Stage 0 had drawn a band box around the leg.
+
+### Three ways the band detector was wrong
+
+**1. It found a band where there was none.** `_band_bbox` only checked that the
+detected box *overlapped* the limb. An open-vocabulary detector always returns
+its best candidate for "cord", and with no cord in the scene that candidate is
+the leg — which is entirely on the leg, so the overlap test passed trivially.
+There was no size check. Band area as a fraction of the limb's mask:
+
+| capture | ratio |
+|---|---|
+| `inputs/small_leg` — a real band | **0.04 – 0.07** |
+| `inputs/est_325` — no band | 1.23 |
+| `inputs/short_leg` — no band | 2.19 – 4.02 |
+
+A cord tied round a limb cannot be larger than the limb. `BAND_MAX_LIMB_FRAC`
+= 0.35 — five times the largest real band, a third of the smallest false one.
+
+**2. One detection was enough to set the marker colour.** On `short_leg` a single
+74 × 60 px false positive on 1 of 8 frames — small enough to pass the size guard —
+taught the pipeline that the marker is RGB(217, 207, 198). That is the floor tile.
+Measured consequence, running Stage 3's detector both ways on the same cloud:
+
+| marker colour | Stage 3 |
+|---|---|
+| the spurious floor colour | **198 points, cut at 61% of the limb's height** |
+| none at all | **no plane** — the correct answer |
+
+`BAND_MIN_FRAME_FRAC` = 0.6 now requires most of the capture to agree, rounded up:
+4 of 6 frames, 5 of 8. A fixed count does not scale — two of six is
+corroboration, two of twenty is noise. When the colour is discarded the frames
+that thought they saw a band are downgraded with it, so the report cannot say
+`pass` on a frame whose band the capture just threw away.
+
+**3. A missing band disabled cropping entirely.** `can_crop` read
+`band is not None and _fits(window, band)`, making a band a **precondition for
+cropping at all**. On any capture without a marker — `est_325` has none by design
+— `can_crop` was always False and the stage silently fell back to VGGT's own
+centre crop, which is the exact failure Stage 0 exists to prevent.
+
+### It could not read HEIC
+
+`cv2.imread` returns None for HEIC and only `vggt/utils/load_fn.py` registers the
+opener — that is Stage 1's loader. Every frame of a HEIC capture reached Stage 0
+as None and was recorded `file unreadable`. On `est_325` that was **all 8 of 8**:
+the gate had never once looked at that dataset. Stage 0 now falls back to PIL with
+`pillow_heif`, and prints the decode error instead of returning None in silence.
+
+### The redesign: three verdicts
+
+Two outcomes could not express the situation. A capture with no marker band is
+perfectly measurable — it simply cannot be cut automatically — and refusing it
+outright was costing good captures.
+
+| condition | verdict |
+|---|---|
+| everything found and framed | **pass** |
+| band missing, band clipped, **or cube clipped** | **warning** — used, with a caveat |
+| cube not detected, nothing detected, file unreadable | **reject** — not used |
+
+A clipped cube is a warning and not a rejection because the cube *was* found, so
+the frame is a real viewpoint; what fails is only this stage's crop, and VGGT's
+centre crop takes over. Only a genuine absence is unrecoverable.
+
+Four consumers were out of step with the new model and were fixed with it: the
+per-frame `summary.txt` line re-derived its own verdict and printed `REJECTED`
+for frames the pipeline was using; `framing.json` carried no per-frame `verdict`
+and no `rejected` list; the end-of-stage summary only printed when something was
+rejected, so a warning-only run said nothing at all; and `service/app.py` gated
+`/run` on `all_passed`, which a warning-only capture can never satisfy — it would
+have refused every band-free upload.
+
+### What it is worth
+
+| capture | before | after |
+|---|---|---|
+| `inputs/small_leg` | 5 of 6 usable, colour RGB [44,37,16] | **unchanged** |
+| `inputs/short_leg` | 1 of 8, run refused | **8 of 8**, colour correctly discarded |
+| `inputs/est_325` | 0 of 8, all unreadable | **8 of 8**, colour correctly discarded |
+
+**Not tested.** Whether `BAND_MAX_LIMB_FRAC` = 0.35 holds for a wide bandage or a
+band seen edge-on; both would read larger than a cord. Whether 0.6 is right when a
+band is genuinely occluded on half the orbit. Both want a second banded capture.
+
+**Consequence for earlier work.** `short_leg` was described in E-mixed-recon as
+"a badly framed capture", and that was wrong — it was well framed and rejected for
+a hallucinated band. Every frame now reaches VGGT cropped rather than raw, so the
+`short_leg` baseline and the Poisson comparison built on it both need re-running.
+
+---
+
+## E-psr-adopted — Poisson becomes the default, after Stage 5 was fixed · Aug 2026
+
+> **This entry supersedes E-psr-swap and E-mixed-recon.** Both concluded against
+> Poisson, and both were measuring a Stage 5 that was not doing its job.
+
+**The mistake.** `workers/meshfix_worker.py` called `pymeshfix.fill_holes()` and
+nothing else, on the reasoning that it never drops faces and so preserves shape.
+PyMeshFix also has `repair()`, which additionally removes self-intersections and
+non-manifold edges. The pipeline never called it. `fill_holes` closes the
+boundary but leaves exactly the defects that make a mesh watertight-but-invalid,
+so every Poisson mesh arrived at Stage 6 closed and topologically wrong — and I
+attributed that to Poisson.
+
+**What changed when Stage 5 was fixed**
+
+| | `fill_holes` | `repair()` |
+|---|---|---|
+| `small_leg` box | χ = 30 | **χ = 2** |
+| `small_leg` limb | χ = 22 | **χ = 2** |
+| `short_leg` box | χ = 10 | **χ = 2** |
+| `short_leg` limb | χ = 14 | χ = −16 |
+
+And it is free: the reported volume moves **0.005%** (1069.56 → 1069.61 cm³).
+The shape is preserved after all; it is the tunnels that go. `joincomp` and
+`remove_smallest_components` were both tried and changed nothing, so both stay
+off. **Alpha-shape meshes are byte-identical either way**, because they arrive
+already closed and Stage 5 is a no-op on them.
+
+**The parameter sweep, re-run.** 48 configurations — depth 8–11, trim 0–0.10,
+with and without the per-slice filter:
+
+| | χ = 2 on **both** objects |
+|---|---|
+| with `fill_holes` | **0 of 48** |
+| with `repair()` | **38 of 46** (two killed as redundant; depth 10 and 11 agreed everywhere) |
+
+In the shipped configuration — no pre-filter — all twelve depth/trim combinations
+with `trim ≥ 0.01` give χ = 2 on both objects, and the limb volume spans
+**1069.44 to 1072.89 cm³, a 0.32% spread**. The earlier figure of 21% was the
+spread across configurations that were mostly invalid.
+
+**`trim > 0` is a hard requirement.** Every `trim = 0.00` row gives box χ = 4:
+Poisson's low-density extrapolated skin is what breaks the topology, and
+discarding the bottom 1% is enough. The pipeline already trims at 2–5%.
+
+**Head-to-head, three arms, two captures**
+
+| `small_leg` | limb cm³ | box χ | limb χ | Stage 5 moved | p95 to cloud |
+|---|---|---|---|---|---|
+| alpha / alpha | 1081.94 | 2 | 2 | +0.00% | 2.39 mm |
+| alpha cube + PSR limb | 1070.85 | 2 | 2 | −4.22% | **1.30 mm** |
+| **PSR / PSR** | **1074.32** | **2** | **2** | −4.22% | **1.30 mm** |
+
+| `short_leg` | limb cm³ | box χ | limb χ | Stage 5 moved | p95 to cloud |
+|---|---|---|---|---|---|
+| alpha / alpha | 2763.24 | 2 | **2** | +0.00% | 21.80 mm |
+| PSR / PSR | 2146.39 | 2 | **−18** | +2.25% | **2.19 mm** |
+
+**Decision: Poisson is now the default for both objects.** It fits the points
+1.8× closer on `small_leg` and 10× closer on `short_leg`, reaches χ = 2 on both
+objects there, and is insensitive to its own parameters at 0.32%.
+
+**What it costs, stated plainly.** Alpha shape's ladder *guarantees* χ = 2 because
+it selects on it; Poisson has no such guarantee and on `short_leg` closes at
+χ = −18 — a surface with about ten handles, whose signed volume is not the volume
+of a solid, and which reads 22% below the alpha answer.
+
+That capture is unusual for a specific reason: with no marker band there is no
+cut, so the object is the **entire leg including the foot** — toes, arch, the gap
+under the instep. Genuine topological complexity, not a reconstruction defect.
+
+**The mitigation, which matters more than the default.** Stage 5 now computes the
+Euler characteristic of every final mesh and prints a loud warning when it is not
+2, naming the fallback:
+
+```
+leg_cut: 47,653 verts, 95,342 faces, watertight, chi=-18 ** NOT A SIMPLE SOLID **
+  WARNING: leg_cut is closed but has chi=-18 (~10 handles or extra pieces). Its
+  signed volume is NOT the volume of a solid, and Stage 6 will report it anyway.
+  Re-run this object with --obj-recon-method alpha_shape, whose selection
+  guarantees chi=2.
+```
+
+Before this change nothing in the live pipeline checked χ at all — the only such
+check was in the **parked** Stage 6 code. A closed-but-holed mesh returns True
+from `is_watertight`, so Stage 6 integrated it and reported a number with no sign
+that anything was wrong. That gap existed under alpha shape too; it simply could
+not fire, because Stage 4's ladder never emitted such a mesh.
+
+**Not tested.** Whether Poisson holds up on a *cut* limb from a second capture —
+both successes here are `small_leg` and both failures are the same uncut foot.
+That is the experiment that would settle whether the default is right.

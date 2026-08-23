@@ -5,7 +5,7 @@ estimator, the oriented bounding box, and above all the **scale calibration** �
 from the state on `origin/main` (`bab2bbc`) to now.
 
 Companion documents: [`experiments.md`](experiments.md) for pipeline-wide
-experiments, [`changes_newVSold.md`](changes_newVSold.md) for the full change set,
+experiments, [`progress.md`](progress.md) for the full change set,
 [`pipeline_flowchart.md`](pipeline_flowchart.md) figure 6 for the dataflow.
 
 > `experiments.md` still describes this as "Stage 7" and states
@@ -33,7 +33,7 @@ experiments, [`changes_newVSold.md`](changes_newVSold.md) for the full change se
 > Two consequences to be aware of:
 >
 > - Dimensions come from an axis-aligned box again (M5 is parked), so the 14 cm
->   cube reports **18.80 × 19.30 × 14.06 cm** — an AABB around a tilted cube
+>   cube reports **19.18 × 19.47 × 14.09 cm** — an AABB around a tilted cube
 >   measures its diagonal.
 > - The CSV columns changed back (`ext_x/ext_y/ext_z/size_*_cm`) from the parked
 >   method's `obb_a/obb_b/obb_c/height_cm`. The web viewer now reads both and
@@ -41,7 +41,7 @@ experiments, [`changes_newVSold.md`](changes_newVSold.md) for the full change se
 >   the scales differ (59.79 cm/unit from fitted faces against 60.86 from the
 >   volume ratio), and main's axis-aligned extents must **not** be used for scale:
 >   on a tilted cube they measure the diagonal and give 44.01, a 26% error. See
->   `changes_newVSold.md` §3.5.
+>   `progress.md` §3.5.
 >
 > Stages 0–5 are unaffected — verified by re-running them after the revert and
 > byte-comparing the meshes, which came out identical.
@@ -102,7 +102,7 @@ the time: *"the cube cannot validate scale on its own."*
 **Verdict:** replaced at the time, on the reasoning above — and then reverted to,
 in Aug 2026, as a hand-off rather than a reversal of that reasoning. Both defects
 still hold and are reproducible on demand: a cold run on `inputs/small_leg` reports
-the cube at exactly 2744.00 cm³ and 18.80 × 19.30 × 14.06 cm. A calibration that
+the cube at exactly 2744.00 cm³ and 19.18 × 19.47 × 14.09 cm. A calibration that
 guarantees its own success is not a calibration; that judgement has not changed,
 only who gets to make it.
 
@@ -462,6 +462,13 @@ poisson_d9                   90,319 tri  wt=False  chi=260  207 comp        —
 ball_pivot                   34,087 tri  wt=False  chi=-576  40 comp        —
   + pymeshfix                60,874 tri  wt=True   chi= 66   40 comp    797.7 cm3  -25.8%
 ```
+
+> **Re-run 2026-08-23 on the current Stage 3 cloud** —
+> [`experiments/recon_method_comparison.png`](experiments/recon_method_comparison.png)
+> and `experiments.md` under E-recon-method. Same conclusion, but note that ball
+> pivoting's post-repair error came out **+30.3%** there against **−25.8%** here.
+> The two runs use different clouds; the instability of the sign is itself the
+> argument against the method, since both report watertight after repair.
 
 **Alpha shape is the only method that closes without repair**, and the reason is
 structural: it works from a 3D Delaunay tetrahedralisation and **never uses

@@ -97,8 +97,36 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
         is_wt = verify_watertight(wt_ply)
         size_mb = os.path.getsize(wt_ply) / (1024 * 1024)
         wt_status = "watertight" if is_wt else "NOT watertight (recon fallback)"
+
+        # Watertight is NOT sufficient, and this is the one place it can be
+        # caught. A closed surface with handles or tunnels has chi != 2, and its
+        # signed volume is not the volume of a solid — but `is_watertight`
+        # returns True for it and Stage 6 will happily integrate it and report a
+        # number with no sign that anything is wrong. Alpha shape cannot reach
+        # here in that state, because Stage 4's ladder selects on chi = 2.
+        # Poisson can: measured chi = -18 on inputs/short_leg, whose volume came
+        # out 22% below the alpha-shape answer for the same cloud.
+        euler = None
+        try:
+            import trimesh as _tm
+            euler = int(_tm.load(wt_ply, process=False).euler_number)
+        except Exception as exc:
+            print(f"  {name}: could not compute Euler characteristic ({exc})")
+        chi_note = ""
+        if euler is not None and euler != 2:
+            chi_note = f", chi={euler} ** NOT A SIMPLE SOLID **"
+        elif euler is not None:
+            chi_note = ", chi=2"
+
         print(f"  {name}: {len(mesh.vertices):,} verts, "
-              f"{len(mesh.triangles):,} faces, {wt_status} ({size_mb:.1f} MB)")
+              f"{len(mesh.triangles):,} faces, {wt_status}{chi_note} ({size_mb:.1f} MB)")
+        if euler is not None and euler != 2:
+            genus = (2 - euler) / 2
+            print(f"    WARNING: {name} is closed but has chi={euler} "
+                  f"(~{genus:.0f} handles or extra pieces). Its signed volume is "
+                  f"NOT the volume of a solid, and Stage 6 will report it anyway. "
+                  f"Re-run this object with --obj-recon-method alpha_shape, whose "
+                  f"selection guarantees chi=2.")
 
         watertight_paths.append(wt_ply)
         meshes.append(mesh)

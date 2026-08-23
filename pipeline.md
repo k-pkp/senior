@@ -21,7 +21,8 @@ Input images
 Seven stages, two of which take a human decision. Stages 0 and 1 run neural
 networks; everything else is geometry.
 
-Cold run on `inputs/small_leg`: **91 s** end to end.
+Cold run on `inputs/small_leg`: **80 s** end to end (Stage 1 inference 19 s; the
+rest is Stage 0's detectors and Stage 4's alpha ladder).
 
 ---
 
@@ -46,22 +47,30 @@ which is what lets a marker of any colour work.
 
 ### Rejection reasons
 
-| condition | reason | severity | rejected? |
-|---|---|---|---|
-| band missing, cube seen | `marker missing, not crucial` | not crucial | no |
-| cube missing, band seen | `cube missing, crucial` | crucial | yes |
-| both missing | `marker and cube missing, very crucial` | very crucial | yes |
-| detected, does not fit | `objects out of window` | crucial / very crucial | yes |
+| condition | verdict | what the frame is told |
+|---|---|---|
+| everything found and framed | **pass** | — |
+| band missing | **warning** | marker missing — the cut must be placed by hand |
+| band found but clipped | **warning** | marker out of window — the suggested cut may be off |
+| cube found but clipped | **warning** | cube out of window — VGGT will centre-crop instead |
+| cube not detected | **reject** | cube missing — the scale cannot be recovered |
+| nothing detected | **reject** | nothing detected — no cube and no marker |
+| file cannot be decoded | **reject** | file unreadable — cannot be decoded |
 
-A missing band costs the cut but not the scale, and the cut only needs the band on
-some frames, so that frame is kept. A missing or clipped cube costs the scale of
-every number the run reports, silently — which is why this stage refuses rather
-than warns.
+**A warning is a usable frame.** The distinction is what a defect *costs*. The
+reference cube sets the scale of every number, so if it is not detected at all
+there is nothing to recover from — that is a reject. Everything else degrades the
+result without making it impossible: a clipped cube falls back to VGGT's own
+centre crop, and a missing band only means the cut is placed by a person in the
+review step, which it is anyway. Only rejects stop the run.
+
+`--continue-on-rejected` lets a run proceed past a **reject**; warnings never
+needed it.
 
 Anything not croppable is written out **raw** for VGGT to handle, rejected frames
 included, so a refused capture can still be inspected.
-`--continue-on-rejected` decides whether the run proceeds, not whether the frames
-are written.
+`--continue-on-rejected` decides whether a **rejected** frame stops the run, not
+whether the frames are written.
 
 ---
 
@@ -176,26 +185,49 @@ combined transform `R_total` is applied to the marker planes too; applying only
 
 **File**: `pipeline/stages/reconstruct.py` → `workers/recons_methods_worker.py`
 
-Default **`alpha_shape` for both objects**.
+Default **`poisson` for both objects, with `alpha_shape` as an automatic
+per-object fallback.** Changed 2026-08-23; see `experiments.md`, E-psr-adopted.
 
-**alpha_shape** is interpolating — the surface passes through the actual points.
-Alpha is swept over `ALPHA_MULTIPLIERS` (8–40 × mean NN distance) and the
-**smallest value producing a watertight mesh** is selected: the tightest
-enclosing surface. Selecting on "first alpha returning any triangles" instead
-picks the smallest alpha and returns a shredded non-manifold shell (−91% volume
-on a known can).
+**Why Poisson.** It approximates rather than interpolates, and it tracks the
+points about twice as closely: p95 point-to-surface 1.30 mm against alpha's
+2.39 mm on `inputs/small_leg`, and 2.19 mm against 21.80 mm on `inputs/short_leg`.
+Across depth 8-11 and trim 0.01-0.10 its answer spans **0.32%**, so it is not
+sensitive to its own parameters.
 
-**Why not Poisson** — it fits a smooth *approximating* implicit surface whose
-smoothness prior rounds flat faces and sharp rims inward, losing real volume
-(−8.3% on a 325 ml can where the point cloud itself was within ±3%).
-alpha_shape beat Poisson for the object at every fixed reference method and
-under all four volume-measurement methods.
+**Why it was rejected before, and why that was wrong.** Poisson's meshes reached
+Stage 6 closed but topologically invalid, and the cause was Stage 5: it called
+`pymeshfix.fill_holes()` and never `repair()`, so self-intersections and
+non-manifold edges survived. With `repair()` in place Poisson reaches χ = 2 on
+both objects in **38 of 46** sweep configurations rather than 0 of 48.
+
+**What Poisson does not give, and alpha does.** A *guarantee*. Alpha shape sweeps
+α over 8-200 × mean NN distance and selects the smallest value that is both
+watertight **and** χ = 2 — the tightest surface that is still a single closed
+solid. Poisson has no such selection, and on `inputs/short_leg` — an uncut whole
+leg including the foot — it closes at χ = −18, about ten handles, reading 22%
+below the alpha answer.
+
+**So the fallback is automatic.** After reconstructing an object, Stage 4 runs the
+same repair Stage 5 will and checks the Euler characteristic. If the result is not
+χ = 2 it rebuilds **that object** with `alpha_shape` and re-checks:
+
+```
+leg_cut_recon: poisson gives chi=-18, not a single closed solid
+               — rebuilding with alpha_shape, whose ladder guarantees chi=2
+leg_cut_recon: fallback gives chi=2 — a valid solid
+```
+
+The trigger is **χ ≠ 2, not "not watertight"** — a surface with tunnels is closed
+and `is_watertight` returns True for it, so testing watertightness alone would let
+exactly this case through. It is per object, so the cube can keep Poisson while
+the limb falls back. If the *check itself* errors, no fallback happens and the
+reason is printed: silently swapping methods because trimesh hiccupped would be
+worse than the problem. Stage 5 independently warns if any final mesh is still
+not χ = 2.
 
 **Why not a fitted primitive for the box** — `box_primitive` is still available
-but no longer default. It builds a *bounding* prism, so on a ~2 mm-noisy shell
-it sits 4.8 mm outside the points and inflates the reference ~11%. alpha_shape
-sits at median offset 0.000 from the cloud. One method for both objects is also
-easier to defend than a primitive for the reference and a solver for the target.
+but not default. It builds a *bounding* prism, so on a ~2 mm-noisy shell it sits
+4.8 mm outside the points and inflates the reference ~11%.
 
 `ball_pivot` was removed — it produced 5.5×10⁷ cm³ and non-watertight output.
 
@@ -226,7 +258,7 @@ open.
 > **Reverted to main's version**, pending review by the stage's author. What runs
 > is `linear_scale = (2744 / V_ref_mesh)^(1/3)` with axis-aligned extents, so the
 > reference cube reports exactly 2744.00 cm³ on every run — an identity, not a
-> measurement — and the 14 cm cube reads 18.80 × 19.30 × 14.06 cm.
+> measurement — and the 14 cm cube reads 19.18 × 19.47 × 14.09 cm.
 >
 > The section below describes the **parked** method, kept as a commented block at
 > the bottom of `volume.py`. See `docs/stage06_experiments.md`.
@@ -250,8 +282,10 @@ compounds any deviation three times. At 2.2% off cubic that under-read the edge
 
 Using the edge directly also leaves the reference's own volume **free to
 disagree with nominal**. Under the old scheme the box always printed exactly
-2744 cm³ because it was the denominator; it now reads ~2500 cm³, and that gap is
-a real error bar instead of one forced to zero.
+2744 cm³ because it was the denominator; under the parked method it reads
+2694.2 cm³ on the leg scene (−1.8%), and that gap is a real error bar instead of
+one forced to zero. An earlier figure of ~2500 cm³ quoted here predated the
+fitted-face fix, which is what moved it from −10.3% to −1.8%.
 
 ### Volume measurement
 
@@ -294,7 +328,7 @@ output/
   box_mesh.ply / .stl          the ArUco reference
   scene_mesh.ply / .stl        both merged, vertex colours in the PLY
   for_debug/
-    01_inference/   predictions.npz, target/
+    01_inference/   predictions.npz, raw/
     02_pointcloud/  points.ply
     03_clean/       objects/  debug/
     04_recon/       mesh/
@@ -346,7 +380,7 @@ JSON.
 | `--no-fill` | off | skip bottom cap and floor extend |
 | `--no-segment-leg` | off | required for objects with no marker band |
 | `--no-watertight` | off | publish Stage 4 recon as the final meshes |
-| `--recon-method` | `alpha_shape` | also `poisson`, `poisson_omp1`, `box_primitive` |
+| `--recon-method` | `poisson` | also `alpha_shape`, `poisson_omp1`, `box_primitive`. **Does not affect the reference cube** — use `--box-recon-method` for that |
 | `--box-recon-method` / `--obj-recon-method` | — | per-object override |
 | `--voxel-res` | 150 | cross-check resolution |
 | `--seed` | 42 | |
@@ -391,12 +425,14 @@ stagerun.py               stage-by-stage runner with per-stage diagnostics
 viewer.py                 PLY/STL viewer
 volume.py                 standalone volume CLI
 pipeline/
-  orchestrator.py         drives stages 1-6, publishes final meshes
+  orchestrator.py         drives stages 0-6, publishes final meshes
   cli.py  config.py
-  ghost.py                voxel dedup + normal-aware filter
-  detection.py            Grounding DINO + SAM (available, not wired into scale)
-  stages/                 inference pointcloud clean reconstruct watertight volume
-  core/                   plane cluster segmentation fill filters mesh
+  ghost.py                the whole ghost chain: voxel dedup, normal-aware
+                          filter, MLS surface projection
+  multiview.py            multi-view ghost filter (written, not wired into Stage 2)
+  stages/                 prep inference pointcloud clean reconstruct watertight volume
+  core/                   plane cluster segmentation fill filters mesh faces
+                          markers3d vlm_detect
   utils/                  seeding runlog
 workers/
   recons_methods_worker.py   reconstruction subprocess
@@ -406,12 +442,18 @@ service/                  HTTP front end: upload, run, serve artifacts
 serve.sh                  starts the web app and the service together
 web/                      viewer and review UI (Next.js)
 docs/
-  changes_newVSold.md     every change against main, plus the derivations
+  updates.md              what changed against main and why it is better
+  full_flowchart.md       every stage and sub-process, in one chart
+  progress.md             the full progress log: every finding, derivation and
+                          measurement, in the order they were established
   experiments.md          every test, result and verdict
   pipeline_flowchart.md   diagrams and per-stage I/O
+  repo_review.md          contract and silent-failure sweep, with outcomes
   running_the_web_app.md  how to run the web app and the compute service
   stage06_experiments.md  Stage 6 method history and what blocks accuracy
   web_explaination.md     the web app explained from first principles
+  experiments/            figure-backed write-ups: ghost removal, MLS, main vs now
+  experiments/FIGURES.md  which figures are reproduced from a verified run
 work/                     stagerun outputs, one folder per stage's experiments
 ```
 

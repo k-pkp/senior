@@ -1,4 +1,20 @@
-# What changed, and why — this tree against `senior-ict/senior` `main`
+# Progress log — findings, derivations and measurements
+
+Everything this project has established, in the order it was established, with
+the reasoning and the arithmetic kept rather than summarised. It began as a
+change log against `senior-ict/senior` `main` and grew into the working record:
+what was tried, what it measured, what the measurement meant, and which claims
+were later withdrawn.
+
+**What this file is for.** It is the source to write a proposal or a report from.
+[`updates.md`](updates.md) is the polished "what is better and how do you know";
+[`experiments.md`](experiments.md) is the indexed experiment register. This one
+keeps the derivations, the dead ends and the corrections, because those are the
+parts that are hard to reconstruct later and the parts a reviewer asks about.
+
+> **Claims withdrawn during this work are marked in place rather than deleted.**
+> Three numbers that were quoted here turned out not to reproduce, and knowing
+> which they were is more useful than a file that looks clean.
 
 Reference point: `origin/main` at `bab2bbc`. This tree is `keng-branch` at `38d0392`
 plus uncommitted work. Two layers, described separately because they were done at
@@ -239,9 +255,9 @@ supersedes it.
 
 | file | purpose |
 |---|---|
-| `pipeline/detection.py` (200) | object detection seeds for segmentation |
+| ~~`pipeline/detection.py` (200)~~ | object detection seeds — **deleted 2026-08-22**; the code that called it discarded both of its return values, so the flag cost two model loads and changed nothing. The models it wrapped now live in `pipeline/core/vlm_detect.py`, used by Stage 0. |
 | `pipeline/ghost.py` (99) | ghost-sheet dedup — VGGT's duplicated surfaces |
-| `pipeline/mls.py` (109) | moving-least-squares surface projection |
+| ~~`pipeline/mls.py`~~ (109) | moving-least-squares surface projection — **merged into `pipeline/ghost.py` on 2026-08-23** and deleted; the three ghost steps are only legible together. Verified behaviour-neutral (bit-identical `volumes.csv`) |
 | `pipeline/multiview.py` (94) | multi-view consistency filter |
 | `stagerun.py` (593) | per-stage runner, so a stage can be re-run without redoing inference |
 
@@ -586,6 +602,16 @@ more surface. Same failing run then produced 850.42 cm³.
 | `pipeline/orchestrator.py` | `target/images` copied the *submitted* folder, which stopped being what VGGT saw once Stage 0 could rewrite frames. Now copies the actual inference input |
 | `pipeline/cli.py`, `stagerun.py` | `--prep-*` flags, `--continue-on-rejected`, `--no-prep-crop`, `--inference` |
 
+> **`--no-prep-crop` does nothing on the `run.py` path.** `pipeline/cli.py` parses
+> it into `args.prep_crop`, but `orchestrator.py:202` calls `prepare_frames`
+> without `crop=` (and without `output_size=`), so the value is never read and
+> Stage 0 crops regardless. `stagerun.py:325` passes both. Verified 2026-08-22 by
+> stubbing `prepare_frames` and inspecting the keyword arguments each entry point
+> actually sends: `run.py` sends `band_heights, centre_on_subject, min_frames,
+> pad, strict` and nothing else. Not fixed — the one-line fix is to add the two
+> keywords to the orchestrator's call, but the flag has no test and no user, so
+> it is recorded here rather than changed silently.
+
 ---
 
 # Layer 3 — after this document was first written
@@ -616,6 +642,30 @@ each other), so SVD returned an essentially arbitrary one.
 
 The fix is one parameter: `dilate=3`, sampling three rows either side of the traced
 cord so the colour describes the cord's body.
+
+
+> **Re-measured 2026-08-23, and the "off perpendicular" column does not
+> reproduce.** Re-running all three arms on the current tree gives the *tilt*
+> column almost exactly — main's detector at 19.73° against the 19.7° recorded
+> here, the fix at 19.04° against 18.4° — but the derived "off perpendicular"
+> figures come out 10.49°, 24.52° and 9.37°, not 3.2°, 20.8° and 1.3°. That
+> quantity is the 3D angle between the plane normal and a fitted limb axis, and
+> it is extremely sensitive to how the axis is fitted: the same three planes
+> score 12.5° / 22.6° / 12.2° against one reasonable axis estimate and 10.5° /
+> 24.5° / 9.4° against another. **The single-number claim should not be quoted.**
+>
+> What does reproduce, and is what the fix is actually worth:
+>
+> | | band points | normal's tilt from vertical |
+> |---|---|---|
+> | main's hardcoded khaki window | 193 | 19.73° |
+> | traced, `dilate=0` — the bug | **45** | **27.06°** |
+> | traced, `dilate=±3` — ships | **296** | **19.04°** |
+>
+> The limb's own axis, fitted on `leg_open.ply` over the upper 60% of its span,
+> leans **19.01°**. The shipping detector matches that to 0.03°; the bug is 8°
+> out and fits its plane through 45 points instead of 296. Figure:
+> [`experiments/cut_plane_band_colour.png`](experiments/cut_plane_band_colour.png).
 
 | | marker points | plane tilt | off perpendicular to the limb |
 |---|---|---|---|
@@ -774,7 +824,8 @@ which looks identical to every other blank.
                               main      keng-branch     this session
 limb alpha closure              —             —          140x -> 25x
 marker colour             hard-coded     hard-coded      measured per capture
-cut squareness to limb          —             —          20.8 deg -> 1.3 deg off
+cut squareness to limb          —             —          27.1 deg -> 19.0 deg tilt,
+                                                          against a limb leaning 19.0
 capture validation            none          none         gate, per-frame reasons
 ```
 
@@ -789,7 +840,7 @@ every run, because scale is derived as `(real_vol / mesh_vol)^(1/3)` from that s
 cube. That is not an accuracy result — it is an identity. The stage currently emits
 no error signal about itself.
 
-Cold full run, `inputs/small_leg`, after the revert: 91 s wall, 5 of 6 frames
+Cold full run, `inputs/small_leg`, after the revert: 80 s wall, 5 of 6 frames
 accepted, 302 marker points, plane 18.4°, alpha 55× watertight with euler 2, limb
 1091.79 cm³.
 
@@ -814,18 +865,30 @@ across those edits. That whole file is now main's anyway.
 1. **Stage 6 is unresolved by design** — reverted to main's version pending review
    by the stage's author. While it is, scale comes from the volume ratio, the
    reference agrees with itself by construction, and dimensions come from an
-   axis-aligned box, which reports the 14 cm cube as 18.80 × 19.30 × 14.06 cm
+   axis-aligned box, which reports the 14 cm cube as 19.18 × 19.47 × 14.09 cm
    because an AABB around a tilted cube measures its diagonal.
 2. **Two Stage 6 CSV schemas are in circulation.** The viewer handles both
    (§3.5), but they are not equivalent: main's scale comes from a volume ratio
    and its extents are axis-aligned, so displayed centimetres differ by ~2% and
-   reported dimensions by much more — the 14 cm cube reads 18.80 × 19.30 × 14.06.
+   reported dimensions by much more — the 14 cm cube reads 19.18 × 19.47 × 14.09.
    This resolves when Stage 6 does.
-3. **The two entry points disagree on identical input.** `run.py` keeps 12,375
-   points and reports 1083.54 cm³; `stagerun.py` keeps 11,864 and reports
-   1091.79 cm³ — 4% and 0.8%. Pre-existing, unrelated to the revert, and it bounds
-   how precisely any Stage 6 number can be quoted. Most likely a Stage 0 or Stage 3
-   argument one caller passes and the other does not. Not chased down.
+3. ~~**The two entry points disagree on identical input.**~~ **Closed
+   2026-08-22.** The guess recorded here — "most likely a Stage 0 or Stage 3
+   argument one caller passes and the other does not" — was right in shape and
+   wrong in detail. It was not an argument: `stagerun.py` ran Stage 0, wrote the
+   crops, and then handed Stage 1 the **raw photographs anyway**, so the whole
+   framing stage was discarded on that path while `orchestrator.py:207` chained it
+   correctly. That is why `run.py` read 1081.94 cm³ and `stagerun.py` read
+   1091.79 — they were measuring different pixels.
+
+   Fixed by chaining Stage 0's output into the next stage inside a range
+   (`stagerun.py`, `run_stage_range`). Re-measured on `inputs/small_leg` after the
+   fix, both entry points now produce **bit-identical** `volumes.csv` —
+   `leg_cut.ply` at `0.00479626174799353` mesh units and **1081.9362025528196
+   cm³** from both, `box.ply` at `0.012164249800904262`. The only difference left
+   is row order (`run.py` writes the limb first, `stagerun.py` the reference),
+   which no consumer depends on. The 0.8% is not an error bar on Stage 6; it was
+   this bug.
 4. **The marker-colour fix is validated on one dataset.** `small_leg` only —
    `est_325` has no band. The claim that a learned colour generalises to a red or
    blue marker is argued but not demonstrated; a capture with a differently
@@ -848,7 +911,8 @@ expectation.
 
 # Appendix — the mathematics, stage by stage
 
-Merged in from `update.md` (written 2026-08-12), which answered the same question
+Merged in from `update.md` (written 2026-08-12, deleted after the merge — this
+appendix is the surviving copy), which answered the same question
 as this document and is now folded into it rather than kept alongside. It goes
 deeper than the sections above on the **committed** work — every constant with the
 measurement that produced it — and it is the reference to read when you need the
@@ -890,9 +954,9 @@ New, untracked on `main`:
 | path | what |
 |---|---|
 | `pipeline/ghost.py` | voxel dedup + normal-aware ghost filter |
-| `pipeline/mls.py` | moving-least-squares surface projection |
+| ~~`pipeline/mls.py`~~ | moving-least-squares surface projection — now part of `pipeline/ghost.py` |
 | `pipeline/multiview.py` | multi-view consistency (**disabled** — documented failure) |
-| `pipeline/detection.py` | Grounding DINO + SAM seed detection |
+| ~~`pipeline/detection.py`~~ | Grounding DINO + SAM seed detection — **deleted 2026-08-22**, superseded by `pipeline/core/vlm_detect.py` |
 | `stagerun.py` | per-stage runner with caching and metrics |
 | `web/` | Next.js review/result front end |
 | `docs/` | this file, experiments, web brief |
@@ -1134,7 +1198,7 @@ dev = 1.0 - np.abs(np.einsum("ij,ij->i", normals, mean_n))
 *parallel* to the true surface, so its normals agree with the neighbourhood and
 δ stays small. It removes edge noise and stragglers only.
 
-#### 3.4 MLS surface projection — `pipeline/mls.py` (new)
+#### 3.4 MLS surface projection — `pipeline/ghost.py` (new; lived in `pipeline/mls.py` until 2026-08-23)
 
 Since neither multi-view consistency nor normal filtering can see a parallel
 ghost, the ghost is collapsed rather than deleted. Each point is projected onto
@@ -1782,3 +1846,374 @@ circular. Both meshes reach Stage 5 already watertight with χ = 2.
    whether it is noise or real surface.
 7. **Marker detection rests on a ~24-unit ExG margin** on one subject. A
    saturated green band would make this robust.
+
+---
+
+# Session log — August 2026
+
+Everything below was established after the layer-by-layer sections above. It is
+ordered as it happened, because several findings only make sense as corrections
+to earlier ones.
+
+---
+
+## 1. Two entry points, one answer
+
+**The claim it replaced.** This file previously recorded that `run.py` and
+`stagerun.py` disagreed by 0.8% on identical input, cause unknown, "not chased
+down".
+
+**What it actually was.** `stagerun.py` ran Stage 0, wrote the 518² crops, and
+then handed Stage 1 the **original photographs**. The entire framing stage was
+computed and discarded on that path, while `pipeline/orchestrator.py:207` chained
+it correctly. The two entry points were measuring different pixels.
+
+**After the fix**, both emit a bit-identical `volumes.csv`. This is now the
+standing regression test: any change that makes them differ has broken the
+chaining.
+
+**Why a gate that is computed and thrown away is worse than no gate**: it reports
+success. Stage 0 printed its verdicts, wrote its crops, and the run proceeded —
+with none of it in effect.
+
+---
+
+## 2. The reference is measured by its own volume, and what that costs
+
+Stage 6 as it currently ships derives scale from the cube's mesh volume:
+
+```
+k            = V_real / V_mesh          =  2744 cm³ / 0.012164 units³
+linear_scale = k^(1/3)                  =  60.87 cm per unit
+V_subject    = V_subject_mesh × k
+```
+
+Substituting the reference into its own formula:
+
+```
+V_ref_reported = V_ref_mesh × (V_real / V_ref_mesh) = V_real  ≡  2744.00 cm³
+```
+
+**The cube reports 2744.00 on every run by construction.** It is an identity, not
+a measurement, and it carries no information about accuracy. Any report quoting
+it as evidence of correctness is quoting a tautology.
+
+The alternative — parked in `pipeline/stages/volume.py` — calibrates on a
+*measured edge* instead:
+
+```
+linear_scale = REFERENCE_REAL_SIZE_CM / mean(two horizontal fitted-face edges)
+```
+
+which leaves the cube's volume **free to disagree**, and on `small_leg` it does:
+2694 cm³ against 2744 nominal, −1.8%. That residual is the only internal error
+signal the system has, and the shipping method sets it to zero by definition.
+
+**Why the cube root matters.** Deriving scale as `(V_real/V_mesh)^(1/3)` uses
+`V_mesh^(1/3)` as the edge length, which is exact only for a perfect cube. For a
+box of edges `a, b, c` the cube root returns the geometric mean `(abc)^(1/3)`,
+and for a reconstruction 2.2% off cubic that under-reads the true edge by about
+3.1% — which inflates every reported volume by roughly `1.031³ − 1 ≈ 10%`.
+
+---
+
+## 3. Why alpha shape, and the topology that decides it
+
+> **Updated 2026-08-23 — Poisson is now the default.** The evidence below was
+> measured against a Stage 5 that called `pymeshfix.fill_holes()` and never
+> `repair()`, which left every Poisson mesh closed but topologically invalid. With
+> that fixed, Poisson reaches χ = 2 on both objects, fits the points ~2× closer,
+> and is the default; **alpha shape is now an automatic per-object fallback**,
+> fired whenever a mesh does not repair to χ = 2. The argument below — that χ,
+> not watertightness, is what makes a volume meaningful — is unchanged and is
+> exactly why the fallback and the Stage 5 warning exist. See `experiments.md`,
+> E-psr-adopted.
+
+**The Euler characteristic.** For a triangulated surface,
+
+```
+χ = V − E + F
+```
+
+and for a closed orientable surface of genus `g`, `χ = 2 − 2g`. So:
+
+- `χ = 2` — a single closed surface with no handles, genus 0. A solid.
+- `χ = 0` — one handle. A torus.
+- `χ < 0` — many handles, or several components with handles.
+- `χ` large and positive — many separate closed pieces.
+
+Only `χ = 2` guarantees that "the volume enclosed" is a single well-defined
+quantity. **This is the property Stage 4 searches for**, over a ladder of α from
+8× to 200× the mean point spacing, taking the *smallest* α that is both watertight
+and `χ = 2` — the tightest surface that is still one solid.
+
+**Watertightness alone is not sufficient, and this was measured.** All three
+reconstructors become watertight after the pipeline's own repair. What they close
+*into* differs completely:
+
+| method | fits the points (p95) | χ after repair | limb volume |
+|---|---|---|---|
+| ball pivoting | **0.00 mm** — interpolates every point exactly | **256** | 1410 cm³, **+30.3%** |
+| Poisson (PSR) | 1.02 mm | 22 | 1070 cm³, −1.1% |
+| alpha shape | 2.39 mm — the *worst* fit | **2** | 1082 cm³ |
+
+Ball pivoting passes through every input point and is 30% wrong. PyMeshFix will
+happily close 133 shredded shells into a bag of small separate blobs, and
+`is_watertight` returns True for the result. **Fidelity to the data and validity
+of the enclosed volume are independent properties**, and only the second one is
+what a volume measurement needs.
+
+**Why alpha shape has the guarantee structurally.** An alpha shape is a
+subcomplex of the Delaunay tetrahedralisation of the points themselves: a
+simplex is included iff its circumsphere is empty and has radius ≤ α. Its
+topology therefore comes from the samples. Poisson instead solves
+
+```
+∇·(∇χ̃) = ∇·V⃗           for an indicator field χ̃, from an oriented normal field V⃗
+```
+
+and extracts an isosurface of `χ̃`. Nothing in that construction constrains the
+genus of the result — where the normal field is inconsistent, the isosurface
+grows handles. On a **cube** the normal field is inconsistent along every one of
+the twelve sharp edges, which is why:
+
+> **Poisson closed the limb at χ = 2 in 36 of 48 parameter configurations, and
+> the reference cube in 0 of 48.** Depth 8–11, trim quantile 0–0.10, with and
+> without pre-filtering. The cube's χ was 4, 6, 8, 10, 12, 22 or 30 — never 2.
+
+And the answer is not stable: across those 48 configurations the reported limb
+volume ranged **972 to 1174 cm³, a 21% spread**, against alpha's 2.5%.
+
+**A mixed configuration was tried** — alpha shape for the cube, Poisson for the
+limb, which the pipeline already supports via `--box-recon-method` and
+`--obj-recon-method`. On `small_leg` both objects reached χ = 2 and the volume
+moved −1.0%. On `short_leg` the limb closed at **χ = −4** and the volume moved
+−16%. The deciding measurement:
+
+| | Stage 4 → Stage 5 volume change |
+|---|---|
+| alpha shape, both captures | **+0.00%** — already closed, repair is a no-op |
+| Poisson, `small_leg` | −4.22% |
+| Poisson, `short_leg` | **+158.08%** |
+
+Poisson's mesh is not closed when Stage 4 hands it over, so **the repair is part
+of the answer**. A method whose reported volume is between 4% and 158% the work
+of a hole-filling heuristic is not a measurement instrument. Alpha shape never
+enters that regime because Stage 4 does not emit anything open.
+
+**One thing Poisson genuinely wins, recorded because it is a real cost of the
+current choice**: p95 point-to-surface of 1.30 mm against alpha's 2.39 mm on
+`small_leg`, and 1.70 mm against **11.84 mm** on `short_leg`. Alpha buys its
+guarantee with a coarse α, and coarse means loose.
+
+---
+
+## 4. The ghost is two groups of cameras, not two copies of a surface
+
+VGGT emits a duplicated surface about 2.7 mm thick. Tagging every point with the
+view that produced it — `world_points` is `(S,518,518,3)`, so the source camera is
+known by construction — and splitting each 5° wedge at its largest radial gap:
+
+| view | inner sheet | outer sheet |
+|---|---|---|
+| 0, 1, 3, 5 | **0** | 107 / 45 / 15 / 142 |
+| **2, 4** | **264 / 167** | **0** |
+
+**The split is perfect. No wedge mixes them.** Views 2 and 4 place the surface
+2.70 mm inside where views 0, 1, 3 and 5 place it, on the reference cube as well
+as on the limb. This is not per-pixel noise and not a model artifact in the usual
+sense: it is a **systematic registration disagreement between two groups of
+cameras**.
+
+**Why it might matter, as arithmetic.** The offset is additive, not
+multiplicative, so it does not divide out under calibration. A surface offset δ
+inflates a diameter by 2δ. On the cube's ~230 mm edge that is a relative error of
+`2δ/230`; on the limb's ~108 mm diameter it is `2δ/108` — **the limb is hit
+about twice as hard**. With δ = 1.35 mm (half the sheet separation, which is
+where MLS lands):
+
+```
+cube:  2 × 1.35 / 230  =  1.17%
+limb:  2 × 1.35 / 108  =  2.50%
+net on the limb after calibrating on the cube  ≈  1.3% of diameter  ≈  4% of volume
+```
+
+**Which sheet is true is unresolved**, and the obvious tests do not settle it:
+the sheets are evenly populated (limb 51.9%/48.1%, cube 48.0%/52.0%), the vote is
+four views against two but the two contribute more points, and comparing the
+groups directly is confounded because they see different faces.
+
+**What would settle it**: the ArUco markers are printed at a known size, so
+recovering their 3D corners per view group and comparing against that printed
+size says which group has the correct scale. That needs `REFERENCE_MARKER_CM`
+measured with a ruler first.
+
+---
+
+## 5. What the ghost chain's three steps actually do
+
+Measured function by function, because the mechanism had been mis-attributed
+twice:
+
+| function | in → out | what it really does |
+|---|---|---|
+| `ghost_voxel_downsample` | 114,282 → 17,979 | **does not remove the ghost.** Two sheets 2.7 mm apart fall in different voxels and both survive. It sets the *point spacing* |
+| `normal_aware_filter` | 17,979 → 17,443 | drops points whose normal disagrees with their neighbourhood. −0.08% on the volume: not load-bearing |
+| `mls_project` | 17,443 → 17,443 | **this collapses the sheets.** Moves points, deletes none. Shell 1.44 mm → 0.42 mm |
+
+**Why the downsample is load-bearing anyway.** `MLS_RADIUS_MULT` is measured in
+multiples of point spacing, so decimating is what converts it into millimetres:
+
+```
+spacing 0.94 mm  →  MLS radius 3.75 mm   (barely spans a 2.7 mm ghost)
+spacing 2.10 mm  →  MLS radius 8.38 mm   (comfortably spans it)
+```
+
+Without the downsample, MLS's neighbourhood is too narrow to hold both sheets at
+once and cannot merge them. Removing the step costs **+2.59%** on the reported
+volume — measured by setting `GHOST_VOXEL_FACTOR = 0` and re-running from the
+same cached Stage 1.
+
+**The 30 lines were replaced by a library call.** `voxel_dedup` and
+`open3d.voxel_down_sample` differ only in where the grid is anchored
+(`points.min(axis=0)` against Open3D's own origin), which moves a few points
+across cell boundaries. Re-measured on the current tree: **0.15% apart** on the
+reported volume, 1083.54 against 1081.94. The hand-rolled version is deleted;
+`ghost_voxel_downsample` is a thin wrapper that preserves the three contracts a
+bare call would lose — the `voxel_size <= 0` escape hatch, uint8 colours, and an
+empty cloud returning rather than raising.
+
+**Why the fit is quadratic and not planar.** Both flatten the shell equally
+(0.49 mm against 0.42 mm). The difference is curvature: a plane fitted to a
+curved surface sits inside it and pulls the outline inward. Over 40 cross-sections
+the quadratic preserves **+1.10 pp** more area than the plane — IQR +0.86 to
++1.47, positive in **100%** of them, and stable at +1.0 to +1.2 pp under every
+outline statistic tried.
+
+---
+
+## 6. Three claims withdrawn
+
+Recorded in place because a proposal has to survive someone checking it.
+
+**"The cut was 20.8° off perpendicular and is now 1.3°."** The *tilt* column
+reproduces — main's detector at 19.73° against 19.7° recorded. The derived
+"off perpendicular" figure does not: it comes out 9.4°–12.5° depending on how the
+limb's axis is fitted, and swings 10° between two reasonable axis estimates.
+**Not quotable.** What does reproduce, and is what the band-colour fix is worth:
+
+| | band points | normal's tilt from vertical |
+|---|---|---|
+| main's hardcoded khaki window | 193 | 19.73° |
+| traced, `dilate=0` — the bug | **45** | **27.06°** |
+| traced, `dilate=±3` — ships | **296** | **19.04°** |
+
+The limb's own axis leans 19.01°. The shipping detector matches it to 0.03°; the
+bug fits a plane through 45 points and lands 8° out.
+
+**"Plane MLS costs 7.64% of cross-sectional area, the quadratic 6.67%."** The
+outline in that figure took the **maximum** radius in each angular wedge, so
+every vertex was a single extreme point — which is also why it drew corners a leg
+does not have. With a 1.76 mm shell, a max-radius outline traces the *outer* face
+of the doubled surface, and MLS collapsing the shell reads as a large area loss
+the limb never had. Same points, only the statistic changed:
+
+| per-wedge statistic | area | plane vs no MLS | quadratic vs no MLS |
+|---|---|---|---|
+| max | 65.3 cm² | **−7.57%** | **−6.41%** |
+| mean | 60.9 cm² | −1.41% | −0.50% |
+| **median** | 60.7 cm² | **−0.59%** | **+0.42%** |
+
+The max row reproduces the recorded pair to a tenth of a point, which is how the
+cause was identified rather than guessed. **The two percentages are withdrawn;
+the +1 pp gap between plane and quadratic survives every statistic.**
+
+**"`short_leg` is a badly framed capture."** It is not. Stage 0 rejected 5 of its
+8 frames because of a hallucinated marker band, and with that fixed all 8 pass.
+Any conclusion that leaned on `short_leg` being a poor capture — including the
+excuse offered for Poisson's failure on it — does not hold.
+
+---
+
+## 7. Stage 0's detector was wrong in three ways, and could not read HEIC
+
+**It found a band where there was none.** `_band_bbox` checked only that the
+detected box *overlapped* the limb. An open-vocabulary detector always returns
+its best candidate for "cord"; with no cord present that candidate is the leg,
+which is entirely on the leg, so the test passed trivially. Band area as a
+fraction of the limb's mask:
+
+| capture | ratio |
+|---|---|
+| `small_leg` — a real band | **0.04 – 0.07** |
+| `est_325` — no band | 1.23 |
+| `short_leg` — no band | 2.19 – 4.02 |
+
+`BAND_MAX_LIMB_FRAC = 0.35`: five times the largest real band, a third of the
+smallest false one.
+
+**One detection was enough to set the marker colour.** A single 74 × 60 px false
+positive on 1 of 8 `short_leg` frames — small enough to pass the size guard —
+taught the pipeline that the marker is RGB(217, 207, 198), which is the floor
+tile. Consequence, measured by running Stage 3's detector both ways on the same
+cloud:
+
+| marker colour | Stage 3 |
+|---|---|
+| the spurious floor colour | **198 points, cut at 61% of the limb's height** |
+| none at all | **no plane** — the correct answer |
+
+`BAND_MIN_FRAME_FRAC = 0.6`, rounded up: 4 frames of 6, 5 of 8. A fixed count
+does not scale — two of six is corroboration, two of twenty is noise.
+
+**A missing band disabled cropping entirely.** `can_crop` required
+`band is not None`, making a band a precondition for cropping *at all*. On any
+capture without a marker, `can_crop` was always False and Stage 0 silently fell
+back to VGGT's own centre crop — the exact failure the stage exists to prevent.
+
+**It could not read HEIC.** `cv2.imread` returns None for HEIC and only
+`vggt/utils/load_fn.py` registers the opener, which is Stage 1's loader. Every
+frame of a HEIC capture reached Stage 0 as None and was recorded `file
+unreadable` — **all 8 of 8 on `est_325`**, a dataset the gate had therefore never
+examined.
+
+### The redesign: three verdicts
+
+Two outcomes could not express the situation, because a capture with no marker
+band is perfectly measurable — it simply cannot be cut automatically.
+
+| condition | verdict |
+|---|---|
+| everything found and framed | **pass** |
+| band missing, band clipped, or **cube clipped** | **warning** — used, with a caveat |
+| cube not detected, nothing detected, unreadable | **reject** — not used |
+
+A clipped cube is a warning because the cube *was* found, so the frame is a real
+viewpoint; only this stage's crop fails, and VGGT's centre crop takes over. Only
+a genuine absence is unrecoverable.
+
+| capture | before | after |
+|---|---|---|
+| `small_leg` | 5 of 6 usable | **unchanged**, same learned colour |
+| `short_leg` | 1 of 8, run refused | **8 of 8**, spurious colour discarded |
+| `est_325` | 0 of 8, all unreadable | **8 of 8**, correctly finds no band |
+
+---
+
+## 8. What is still not known
+
+The honest limits, which a proposal should state before someone else does.
+
+- **No independent ground truth for any measured object.** Every accuracy figure
+  in this project is the system checking itself or one method against another.
+  Water displacement on a held-out object is the missing experiment.
+- **`REFERENCE_REAL_SIZE_CM = 14.0` has never been measured.** The cube is
+  handmade cardboard; a 2 mm build error is 1.4% linear and **4.3% of volume** on
+  every result — larger than most of the improvements above.
+- **Which ghost sheet is the true surface** (§4), worth about 4% of limb volume.
+- **Stage 6's calibration** is unresolved by design, pending review by that
+  stage's author.
+- **The marker-colour work is validated on one capture.** That a *learned* colour
+  generalises to a red or blue band is argued from the mechanism, not shown.
+- **Three silent failure paths remain**, listed as open items 3, 4 and 5 in
+  [`repo_review.md`](repo_review.md).

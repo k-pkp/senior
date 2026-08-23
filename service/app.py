@@ -189,18 +189,34 @@ def run_job(job_id: str, req: RunRequest):
     report = job.framing()
     if report is None:
         raise HTTPException(409, "stage 0 has not produced a framing report")
-    if req.strict and not report.get("all_passed"):
+    # `usable`, not `all_passed`. Stage 0 has three verdicts: a WARNING frame is
+    # one the pipeline uses — a capture with no marker band is measurable, it
+    # just cannot be cut without a person placing the plane. Gating on
+    # `all_passed` here would refuse a whole class of perfectly good captures,
+    # which is what it did before Stage 0 grew the third verdict.
+    if req.strict and not report.get("usable", report.get("all_passed")):
         raise HTTPException(
             409,
             f"{report.get('accepted')} of {report.get('submitted')} frames "
-            f"passed framing. Re-take the rejected photos, or continue anyway "
+            f"are usable. Re-take the rejected photos, or continue anyway "
             f"— VGGT will centre-crop the ones we could not frame.")
 
-    # --no-cut is the whole point of this pass. Stage 3 detects the cutting
-    # planes and publishes them, but does not apply them: the uncut limb is
-    # what gets measured. Applying the detected cut here would produce a volume
-    # from a cut nobody has approved, and the review that follows would then be
-    # asking the user to confirm a number already on screen.
+    # This is the REFERENCE CALIBRATION pass, and the name matters because the
+    # stage range makes it look like a full measurement. It is not.
+    #
+    # --no-cut tells Stage 3 to detect the cutting planes and publish them
+    # without applying them, and to write no leg_cut.ply at all. Stages 4-6
+    # therefore run on the reference cube alone: they exist here only to produce
+    # the cm-per-unit scale that the Review screen needs to draw the cutting
+    # plane in real units. The subject is not reconstructed and not measured
+    # until a person has agreed where it ends — a volume from a cut nobody
+    # approved is the one output this pipeline must never produce, and showing a
+    # number on screen before the review would make the review a formality.
+    #
+    # Deriving that scale more cheaply was tried and rejected: an oriented
+    # bounding box on Stage 3's own cube cloud gives 40.6 cm/unit against Stage
+    # 6's 60.86 — 33% out, because that cloud carries the floor-extension wall
+    # points. See docs/experiments.md, E-preconfirm-scale.
     REGISTRY.submit(job, "1-6",
                     ["-i", os.path.join(job.dir, "00_prep", "images"), "--no-cut"],
                     running_state="running", done_state="awaiting-cut")

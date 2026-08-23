@@ -66,9 +66,12 @@ Examples:
     p.add_argument("--segment-height-axis", type=str, default="z", choices=["x", "y", "z"],
                    help="Height axis for leg cut (default: z, vertical after leveling)")
     recon_choices = ["alpha_shape", "poisson", "poisson_omp1", "box_primitive"]
-    p.add_argument("--recon-method", type=str, default="alpha_shape",
+    p.add_argument("--recon-method", type=str, default="poisson",
                    choices=recon_choices,
-                   help="Reconstruction method for non-box objects (default: poisson)")
+                   help="Reconstruction method for non-box objects (default: "
+                        "poisson). alpha_shape is the fallback whose ladder "
+                        "GUARANTEES a chi=2 solid; use it when Stage 5 warns "
+                        "that the mesh is closed but not a simple solid.")
     p.add_argument("--box-recon-method", type=str, default=None,
                    choices=recon_choices,
                    help="Override recon method for box (ArUco); default box_primitive")

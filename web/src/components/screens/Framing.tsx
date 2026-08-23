@@ -171,7 +171,13 @@ export function Framing({
   }
   if (!report) return <div className="fadein" style={{ color: "var(--muted)" }}>Loading…</div>;
 
-  const rejected = report.frames.filter((f) => !f.accepted);
+  // A warning is a frame the pipeline USES. Only rejects need re-taking, so
+  // only rejects go in the "Re-take" line — listing warnings there would send
+  // someone back out to re-shoot photos that are already fine.
+  const rejected = report.frames.filter(
+    (f) => (f.verdict ? f.verdict === "reject" : !f.accepted),
+  );
+  const warned = report.frames.filter((f) => f.verdict === "warning");
   const shortfall = report.accepted < report.required;
   // A sample has no job to be ready; a live one must have finished stage 0.
   const ready = !jobId || state === "awaiting-framing";
@@ -198,11 +204,24 @@ export function Framing({
       </div>
 
       <Panel>
-        <Label>{report.all_passed ? "Accepted" : "Not accepted"}</Label>
+        <Label>
+          {rejected.length > 0
+            ? "Not accepted"
+            : warned.length > 0
+              ? "Usable, with warnings"
+              : "Accepted"}
+        </Label>
         <div style={{ font: "400 13px/1.7 var(--sans)", marginTop: 8 }}>
           {report.accepted} of {report.submitted} photos usable;{" "}
-          {report.required} required, and every submitted photo must pass.
+          {report.required} required. Warnings are used; only rejects are not.
         </div>
+        {warned.length > 0 && rejected.length === 0 && (
+          <div style={{ font: "400 13px/1.7 var(--sans)", color: "var(--warn, #b8860b)" }}>
+            {warned.length} photo(s) carry a warning and are still measured —
+            most often no marker band, which means you place the cut yourself in
+            the next step.
+          </div>
+        )}
         {rejected.length > 0 && (
           <div style={{ font: "500 13px/1.7 var(--sans)", color: "var(--bad, #c0392b)" }}>
             Re-take:{" "}
@@ -216,14 +235,16 @@ export function Framing({
           </div>
         )}
         <Caveat>
-          Yellow is the window stage 0 chose, magenta the reference cube, green
-          the marker band. A photo passes on either of two routes: the window
-          holds the cube and the band together, or — where the cube&apos;s bounds
-          cannot be recovered, usually because the limb occludes it — the
-          model&apos;s own centre crop would keep what is visible of the
-          reference anyway, and the photo goes through untouched. It is rejected
-          only when neither holds, because a clipped cube changes the scale of
-          every measurement without any visible sign.
+          Four boxes: yellow is the window stage 0 chose, magenta the
+          reference cube, orange the limb, green the marker band. Every photo
+          gets one of three verdicts. It <b>passes</b> when the window holds
+          everything. It carries a <b>warning</b> when something is missing or
+          clipped but the photo is still measurable — no marker band means you
+          place the cut yourself in the next step, and a clipped cube falls back
+          to the model&apos;s own centre crop. It is <b>rejected</b> only when the
+          reference cube was not found at all, or the file could not be read,
+          because the cube sets the scale of every number and nothing downstream
+          can recover it. Only rejects need re-taking.
         </Caveat>
       </Panel>
 

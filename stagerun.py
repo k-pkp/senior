@@ -339,7 +339,13 @@ def run_stage0(args, name):
     lines.append("")
     for r in frames:
         w = r["window"]
-        state = "ok" if (r["cube_ok"] and r["band_ok"]) else "REJECTED"
+        # Take the verdict Stage 0 recorded rather than re-deriving one. This
+        # line used to say REJECTED for anything that was not perfect, which
+        # after the three-verdict change meant a frame the pipeline was happily
+        # using was reported as refused.
+        state = {"pass": "PASS", "warning": "WARNING",
+                 "reject": "REJECT"}.get(r.get("verdict"),
+                     "PASS" if (r["cube_ok"] and r["band_ok"]) else "REJECT")
         # The reasons come from the stage that decided them. This used to
         # re-derive its own, which drifted: the summary still said "cube not
         # contained" after Stage 0 had started distinguishing a cube that was
@@ -350,8 +356,15 @@ def run_stage0(args, name):
         sev = f"  [{sev}]" if sev else ""
         lines.append(f"  {r['source']:<16} {state:<9} {r['mode']:<13} "
                      f"{w[2] - w[0]}px  offset {r['offset_px']:.0f} px{sev}{note}")
+    counts = {}
+    for r in frames:
+        counts[r.get("verdict", "?")] = counts.get(r.get("verdict", "?"), 0) + 1
+    lines.append("")
+    lines.append(f"  verdict: {counts.get('pass', 0)} pass, "
+                 f"{counts.get('warning', 0)} warning, {counts.get('reject', 0)} reject")
+    if manifest.get("warned"):
+        lines.append(f"  warned  : {', '.join(manifest['warned'])}")
     if manifest.get("rejected"):
-        lines.append("")
         lines.append(f"  rejected: {', '.join(manifest['rejected'])}")
     lines.append("")
     lines.append(f"  next: stagerun.py 1 -i {images} --name {name}")
@@ -780,7 +793,7 @@ def main():
                    help="JSON of cutting planes in levelled space to use instead "
                         "of the detected ones (stage 3) — the shape stage 3 "
                         "writes as cutting_line_levelled.json")
-    p.add_argument("--recon-method", dest="recon_method", default="alpha_shape")
+    p.add_argument("--recon-method", dest="recon_method", default="poisson")
     p.add_argument("--box-recon-method", dest="box_recon_method", default=None)
     p.add_argument("--obj-recon-method", dest="obj_recon_method", default=None)
     p.add_argument("--voxel-res", dest="voxel_res", type=int, default=150)

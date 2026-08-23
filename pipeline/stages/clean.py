@@ -170,7 +170,7 @@ def _clean_cluster(cluster, label, voxel_size, normal_filter_scale):
     Runs per cluster so no MLS neighbourhood ever spans two objects.
     """
     from pipeline.config import MLS_RADIUS_MULT, MLS_BOX_POLYNOMIAL
-    from pipeline.ghost import voxel_dedup, normal_aware_filter
+    from pipeline.ghost import ghost_voxel_downsample, normal_aware_filter
 
     if cluster is None or len(cluster.points) == 0:
         return (np.zeros((0, 3), dtype=np.float32),
@@ -179,12 +179,12 @@ def _clean_cluster(cluster, label, voxel_size, normal_filter_scale):
     colours = (np.clip(np.asarray(cluster.colors, dtype=np.float32), 0, 1)
                * 255).astype(np.uint8)
     before = len(points)
-    points, colours = voxel_dedup(points, colours, voxel_size)
+    points, colours = ghost_voxel_downsample(points, colours, voxel_size)
     points, colours = normal_aware_filter(points, colours, normal_filter_scale)
     print(f"  Ghost filter [{label}]: {before:,} → {len(points):,} pts")
 
     if MLS_RADIUS_MULT and MLS_RADIUS_MULT > 0 and len(points) > 50:
-        from pipeline.mls import mls_project
+        from pipeline.ghost import mls_project
         # The reference is known to be planar; the limb is not.
         use_quadratic = MLS_BOX_POLYNOMIAL if label == "box" else True
         print(f"  MLS [{label}]:", end=" ")
@@ -310,7 +310,7 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     detection found, and everything downstream — the cut, the cross-section
     caps, the volume — follows the person rather than the colour threshold.
     """
-    from pipeline.ghost import voxel_dedup, normal_aware_filter, compute_voxel_size
+    from pipeline.ghost import ghost_voxel_downsample, normal_aware_filter, compute_voxel_size
 
     objects_dir = os.path.join(output_dir, "objects")
     debug_dir_out = os.path.join(output_dir, "debug")

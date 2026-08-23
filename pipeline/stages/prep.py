@@ -37,6 +37,7 @@ by default, and merely tightened around the subject.
 """
 import glob
 import json
+import math
 import os
 
 import cv2
@@ -49,6 +50,31 @@ from pipeline.core import vlm_detect as vlm
 # their ratio is used here, to recover a face's corners from the marker on it.
 FACE_CM = 14.0
 MARKER_CM = 6.3
+
+# Largest a detected marker band may be, as a fraction of the limb's mask area.
+# An open-vocabulary detector always returns its best candidate for "cord", and
+# on a capture with no cord its best candidate is the leg. Measured band/limb
+# area ratios: real bands on inputs/small_leg 0.04-0.07; false positives on
+# inputs/est_325 1.23 and inputs/short_leg 2.19-2.91. 0.35 is five times the
+# largest real band and a third of the smallest false one. See _band_bbox.
+BAND_MAX_LIMB_FRAC = 0.35
+
+# What fraction of the submitted frames must independently show the band before
+# its colour is trusted, rounded up.
+#
+# A fixed count does not scale: two detections out of six is corroboration, two
+# out of twenty is noise. A fraction asks the right question -- does most of the
+# capture agree that there is a band?
+#
+# What it is guarding against, measured on inputs/short_leg, a capture with no
+# marker at all: a single 74x60 px false positive on 1 of 8 frames taught the
+# pipeline that the marker is RGB(217,207,198), which is the floor tile. Stage 3
+# then found 198 "band" points and cut the limb at 61% of its height. With no
+# colour at all Stage 3 correctly finds no plane.
+#
+# At 0.6 the bar is 4 of 6 frames, or 5 of 8. The real band on inputs/small_leg
+# is found on 6 of 6; the false positive on short_leg on 1 of 8.
+BAND_MIN_FRAME_FRAC = 0.6
 
 # Fallback height of the marker band above the floor, in cube heights, used only
 # when the band cannot be found by colour. The cube stands on the floor, so its
@@ -112,48 +138,65 @@ CROP_ENABLED = True
 CENTRE_ON_SUBJECT = True
 
 
-def _reject_reasons(cube_seen, band_seen, cube_ok, band_ok):
-    """Why a frame failed, and how much it matters.
+# Stage 0's three possible verdicts on a frame. They are ordered by severity so
+# the worst finding on a frame wins, and so a run's overall state is just the
+# maximum over its frames.
+PASS, WARNING, REJECT = "pass", "warning", "reject"
+_VERDICT_RANK = {PASS: 0, WARNING: 1, REJECT: 2}
 
-    Two questions, separated because a person acts on them differently: was the
-    object SEEN at all, and did it SURVIVE the window.
 
-    The severities are not decoration. A missing band costs the cut but not the
-    scale, and the cut only needs the band on some frames -- so a frame without
-    one is still worth reconstructing, and is not rejected. A missing or clipped
-    cube costs the scale of every number the run reports, and does so with no
-    visible sign, which is the whole reason this stage refuses rather than warns.
+def _frame_verdict(cube_seen, band_seen, cube_ok, band_ok):
+    """What to do about a frame: use it, use it with a caveat, or refuse it.
 
-    Returns (notes, severity). An empty note list means nothing was wrong.
+    The distinction that matters is **what a defect costs**, not how visible it
+    is:
+
+      - **Nothing detected, or no reference cube detected.** There is nothing
+        to measure against and no way to recover downstream. REJECT — the run
+        does not start.
+      - **Detected but clipped by the window.** The object is there and the
+        frame is real; what is lost is crop quality, because VGGT falls back to
+        its own centre crop. Degraded, not unusable. WARNING.
+      - The **band only decides where the limb is cut.** A capture with no band
+        is a perfectly good capture that will not be cut automatically — the
+        person places the plane in the review step instead. That is a WARNING:
+        the frame goes through, and the run is told why it might not be able to
+        cut.
+
+    A clipped band is likewise a WARNING, not a rejection: the cut it informs is
+    confirmed by a person before it is applied, so a bad band costs a worse
+    starting suggestion, not a wrong answer.
+
+    Returns (verdict, notes, severity).
     """
-    notes, severity = [], None
-    if not cube_seen and not band_seen:
-        notes.append("marker and cube missing, very crucial")
-        severity = "very crucial"
-    elif not cube_seen:
-        notes.append("cube missing, crucial")
-        severity = "crucial"
-    elif not band_seen:
-        notes.append("marker missing, not crucial")
-        severity = "not crucial"
+    notes, severity, verdict = [], None, PASS
 
-    # Fit is only a meaningful complaint about something we actually found.
-    #
-    # Which object was clipped is deliberately not reported. The window is not
-    # something a person can adjust -- it is the largest square the photo
-    # allows, placed by this stage -- so the remedy is the same either way: step
-    # back and re-take. Naming the object would be detail nobody can act on.
-    # `cube_ok` and `band_ok` are still recorded in the manifest for debugging.
-    clipped_objs = [name for name, seen, good in
-                    (("cube", cube_seen, cube_ok), ("band", band_seen, band_ok))
-                    if seen and not good]
-    if clipped_objs:
-        notes.append("objects out of window")
-        # Severity still tracks the consequence even though the message does
-        # not: a clipped cube corrupts the scale of every reported number, a
-        # clipped band only costs the cut.
-        severity = "very crucial" if "cube" in clipped_objs else "crucial"
-    return notes, severity
+    def escalate(level, note, sev):
+        nonlocal verdict, severity
+        notes.append(note)
+        if _VERDICT_RANK[level] > _VERDICT_RANK[verdict]:
+            verdict = level
+        severity = sev
+
+    if not cube_seen and not band_seen:
+        escalate(REJECT, "nothing detected — no cube and no marker", "very crucial")
+    elif not cube_seen:
+        escalate(REJECT, "cube missing — the scale cannot be recovered", "very crucial")
+    elif not band_seen:
+        escalate(WARNING, "marker missing — the cut must be placed by hand", "not crucial")
+
+    # Fit is only a meaningful complaint about something actually found.
+    if cube_seen and not cube_ok:
+        # A WARNING and not a REJECT: the cube was found, so the frame is a real
+        # viewpoint. What fails is only this stage's crop, and VGGT's own centre
+        # crop takes over. That is worth saying loudly — a clipped reference
+        # costs scale — but it is not grounds for refusing a frame that exists.
+        escalate(WARNING, "cube out of window — VGGT will centre-crop instead; "
+                          "re-take from further back if you can", "crucial")
+    if band_seen and not band_ok:
+        escalate(WARNING, "marker out of window — the suggested cut may be off", "crucial")
+
+    return verdict, notes, severity
 
 
 def _face_corners(quad, face_cm=FACE_CM, marker_cm=MARKER_CM):
@@ -221,8 +264,17 @@ def _cube_bbox(gray, image_pil=None, dict_name=REFERENCE_MARKER_DICT):
     return box
 
 
+def _mask_bbox(mask):
+    """Tight box around a boolean mask, or None if it is empty."""
+    if mask is None or not mask.any():
+        return None
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    return np.array([cols[0], rows[0], cols[-1], rows[-1]], dtype=float)
+
+
 def _debug_overlay(img, window, cube, band, ok, mode, notes, max_side=1200,
-                   effective=None):
+                   effective=None, limb=None, verdict=None):
     """Annotated copy of the source frame, for inspection only.
 
     Kept strictly separate from what the pipeline consumes: VGGT is handed the
@@ -254,6 +306,12 @@ def _debug_overlay(img, window, cube, band, ok, mode, notes, max_side=1200,
         rect(effective, (0, 255, 255), 10)   # what the verdict was reached on
     else:
         rect(window, (0, 255, 255), 10)
+    # Four boxes, so a person can see every decision the stage made:
+    #   magenta  the reference cube      yellow  the window that was used
+    #   orange   the limb being measured green   the marker band
+    # The limb is drawn because without it a missing band is unreadable —
+    # you cannot tell whether the detector found the wrong thing or nothing.
+    rect(limb, (0, 140, 255), 6)         # limb
     rect(cube, (255, 0, 255), 8)         # reference cube
     rect(band, (0, 255, 0), 8)           # marker band
 
@@ -261,19 +319,24 @@ def _debug_overlay(img, window, cube, band, ok, mode, notes, max_side=1200,
     if scale < 1.0:
         out = cv2.resize(out, None, fx=scale, fy=scale,
                          interpolation=cv2.INTER_AREA)
-    out = cv2.copyMakeBorder(out, 74, 0, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-    cv2.putText(out, ("ACCEPTED" if ok else "REJECTED") + f"   [{mode}]",
-                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0, 255, 0) if ok else (0, 0, 255), 2)
+    out = cv2.copyMakeBorder(out, 96, 0, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    banner = {"pass": ("PASS", (0, 255, 0)),
+              "warning": ("WARNING", (0, 200, 255)),
+              "reject": ("REJECT", (0, 0, 255))}.get(
+                  verdict, ("ACCEPTED", (0, 255, 0)) if ok else ("REJECTED", (0, 0, 255)))
+    cv2.putText(out, f"{banner[0]}   [{mode}]",
+                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, banner[1], 2)
+
     cv2.putText(out, "; ".join(notes) if notes else
                 "cube ok, band ok, both with margin",
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
     cv2.putText(out,
                 ("yellow=window VGGT will crop to   grey=our window (unused)   "
-                 "magenta=cube   green=band") if differs else
-                "yellow=crop window   magenta=cube   green=band",
+                 "magenta=cube   orange=limb   green=band") if differs else
+                "yellow=crop window   magenta=cube   orange=limb   green=band",
                 (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
     return out
+
 
 
 def _vggt_window(shape, target=518, patch=14):
@@ -319,7 +382,7 @@ def _leg_mask(image_pil, cube):
     return mask, box
 
 
-def _band_bbox(image_pil, bgr, leg_box):
+def _band_bbox(image_pil, bgr, leg_box, limb_mask=None):
     """The marker band, located by description rather than by colour.
 
     The previous rule was 2G - R - B > 10, which encodes one khaki band: its own
@@ -328,8 +391,32 @@ def _band_bbox(image_pil, bgr, leg_box):
     band works whatever colour it is -- measured on inputs/small_leg it is found
     on 6 of 6 frames at 0.81-0.84, including both frames the colour rule missed.
 
-    Restricted to the limb's own box, so a band-like object elsewhere in the
-    scene cannot win.
+    Two guards, and the second was added after it went wrong:
+
+    1. The box must overlap the limb, so a band-like object elsewhere in the
+       scene cannot win.
+    2. **The box must be small relative to the limb.** An open-vocabulary
+       detector always returns its best candidate for "cord", and on a capture
+       with no cord at all its best candidate is the leg itself -- which passes
+       guard 1 trivially, because the leg is entirely on the leg.
+
+    Guard 2 is measured, not guessed. Band area as a fraction of the limb's mask
+    area, over three datasets:
+
+        inputs/small_leg (a real band)   0.04 - 0.07
+        inputs/est_325   (no band)       1.23
+        inputs/short_leg (no band)       2.19 - 2.91
+
+    A cord tied around a limb cannot be larger than the limb. BAND_MAX_LIMB_FRAC
+    sits at 0.35 -- five times the largest real band seen, and a third of the
+    smallest false positive.
+
+    What this cost before it was fixed: on inputs/short_leg the hallucinated band
+    inflated the crop window until nothing fit, and Stage 0 rejected 5 of 8
+    frames as `objects out of window`. With the guard, all 8 pass. It also fed
+    `trace_band_colour` a box that is mostly skin, so the "band" colour handed to
+    Stage 3 was the limb's own colour -- leaving the discriminant with no
+    contrast to separate them by.
     """
     box, score = vlm.detect(image_pil, vlm.BAND_PROMPT)
     if box is None:
@@ -341,6 +428,14 @@ def _band_bbox(image_pil, bgr, leg_box):
         inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
         area = max(1e-6, (box[2] - box[0]) * (box[3] - box[1]))
         if inter / area < 0.5:
+            return None
+    if limb_mask is not None and limb_mask.any():
+        band_area = (box[2] - box[0]) * (box[3] - box[1])
+        ratio = band_area / float(limb_mask.sum())
+        if ratio > BAND_MAX_LIMB_FRAC:
+            print(f"  band rejected: {ratio:.2f}x the limb's area "
+                  f"(max {BAND_MAX_LIMB_FRAC}) — the detector returned the limb, "
+                  f"not a cord on it")
             return None
     return np.array(box, dtype=float)
 
@@ -409,16 +504,32 @@ def _box_fits_inside(window, box, margin_frac):
                 and box[3] <= window[3] - margin + tolerance)
 
 
-def _average_band_colour(per_frame_colours):
+def _average_band_colour(per_frame_colours, total_frames=None, min_frac=None):
     """One marker colour for the capture, from the per-frame traces.
 
     Median rather than mean across frames: a frame where the trace wandered off
     the cord reports a wildly different colour, and one such frame would drag a
     mean far enough to matter. Stage 3 receives this instead of the fixed khaki
     thresholds in config, which is what lets a band of any colour work.
+
+    Unless most of the capture agrees there is a band -- BAND_MIN_FRAME_FRAC of
+    the submitted frames, rounded up -- the colour is discarded and None is
+    returned, so Stage 3 falls back to finding no band at all. For a capture
+    with no band that is the right answer, and it is safe besides: the cut is
+    placed by a person in the review step either way.
     """
     if not per_frame_colours:
         return None
+    if total_frames:
+        frac = BAND_MIN_FRAME_FRAC if min_frac is None else min_frac
+        needed = int(math.ceil(frac * total_frames))
+        if len(per_frame_colours) < needed:
+            print(f"  marker colour DISCARDED: the band was found on "
+                  f"{len(per_frame_colours)} of {total_frames} frames, and "
+                  f"{needed} are needed ({frac:.0%}) to corroborate it. A "
+                  f"minority detection is not evidence — Stage 3 will look for "
+                  f"no band, and the cut is placed by hand.")
+            return None
 
     median_bgr = np.median(
         np.array([c["bgr"] for c in per_frame_colours], dtype=float), axis=0)
@@ -466,6 +577,40 @@ def _write_frame_for_vggt(image, window, should_crop, output_size, out_path):
     cv2.imwrite(out_path, cropped)
 
 
+def _read_image_bgr(path):
+    """Decode a photograph to BGR, HEIC included.
+
+    `cv2.imread` cannot open HEIC at all, and a phone shooting in its default
+    format produces nothing else. Stage 1 registers the HEIC opener inside
+    `vggt/utils/load_fn.py`, but Stage 0 never imported it — so every frame of a
+    HEIC capture arrived here as None and was recorded `file unreadable`. On
+    inputs/est_325 that was all 8 of 8 frames: the framing gate had never
+    actually looked at that dataset.
+
+    Returns None only when the file genuinely cannot be decoded.
+    """
+    img = cv2.imread(path)
+    if img is not None:
+        return img
+
+    from PIL import Image as _Image
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        print(f"  {os.path.basename(path)}: OpenCV cannot decode it and "
+              f"pillow-heif is not installed")
+        return None
+    try:
+        with _Image.open(path) as handle:
+            return cv2.cvtColor(np.array(handle.convert("RGB")), cv2.COLOR_RGB2BGR)
+    except Exception as exc:
+        # Say why. A bare `return None` here is how a whole HEIC dataset came to
+        # be reported as unreadable without anyone learning the reason.
+        print(f"  {os.path.basename(path)}: {type(exc).__name__}: {exc}")
+        return None
+
+
 def _locate_subject(image_bgr, image_pil):
     """Everything this stage needs to find in one photograph.
 
@@ -481,7 +626,7 @@ def _locate_subject(image_bgr, image_pil):
     cube_box = _cube_bbox(grey, image_pil)
 
     limb_mask, limb_box = _leg_mask(image_pil, cube_box)
-    band_box = _band_bbox(image_pil, image_bgr, limb_box)
+    band_box = _band_bbox(image_pil, image_bgr, limb_box, limb_mask)
 
     band_colour = None
     if band_box is not None:
@@ -557,7 +702,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
     print("=" * 60)
 
     for frame_index, path in enumerate(paths):
-        img = cv2.imread(path)
+        img = _read_image_bgr(path)
         if img is None:
             # Record it, do not drop it. Skipping silently removed the frame from
             # the report altogether: `submitted` under-counted the photos the user
@@ -567,13 +712,13 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             print(f"  {os.path.basename(path):<16} UNREADABLE — cannot be decoded")
             records.append({
                 "index": frame_index + 1, "source": os.path.basename(path),
-                "overlay": None, "reasons": ["file unreadable, very crucial"],
+                "overlay": None, "reasons": ["file unreadable — cannot be decoded"],
                 "output": None, "frame_size": None, "window": [0, 0, 0, 0],
                 "cube_bbox": None, "band_bbox": None, "clipped": False,
                 "offset_px": 0.0, "mode": "unreadable",
                 "cube_ok": False, "band_ok": False,
                 "cube_seen": False, "band_seen": False,
-                "severity": "very crucial",
+                "severity": "very crucial", "verdict": REJECT,
             })
             continue
         frame_height, frame_width = img.shape[:2]
@@ -614,9 +759,16 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
                         np.array([visible_face_corners[:, 0].min(), visible_face_corners[:, 1].min(),
                                   visible_face_corners[:, 0].max(), visible_face_corners[:, 1].max()]))
 
+        # The band is OPTIONAL and must not block cropping. It used to read
+        # `band is not None and _fits(window, band)`, which made a band a
+        # precondition for cropping at all -- so on any capture without a marker
+        # (inputs/est_325 has none by design) `can_crop` was always False and the
+        # stage silently degraded to VGGT's own centre crop, which is the exact
+        # failure Stage 0 exists to prevent. The stage's own rejection table has
+        # always said a missing band "costs the cut, not the scale".
         can_crop = (crop and cube is not None and len(faces) >= 1
                     and _fits(window, cube)
-                    and band is not None and _fits(window, band))
+                    and (band is None or _fits(window, band)))
 
         vggt_win = _vggt_window(img.shape)
         # Uncropped is acceptable when whatever IS visible of the reference
@@ -645,12 +797,14 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
 
         cube_seen = cube is not None
         band_seen = band is not None
-        notes, severity = _reject_reasons(cube_seen, band_seen, cube_ok, band_ok)
+        verdict, notes, severity = _frame_verdict(cube_seen, band_seen,
+                                                  cube_ok, band_ok)
         cv2.imwrite(
             os.path.join(debug_dir,
                          f"{frame_index:02d}_{os.path.splitext(os.path.basename(path))[0]}.png"),
             _debug_overlay(img, window, cube, band, usable, mode, notes,
-                           effective=(window if can_crop else vggt_win)))
+                           effective=(window if can_crop else vggt_win),
+                           limb=_mask_bbox(leg), verdict=verdict))
 
         offset_from_centre_px = np.hypot((left + right) / 2 - frame_width / 2,
                                          (top + bottom) / 2 - frame_height / 2)
@@ -667,23 +821,43 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             "offset_px": float(offset_from_centre_px), "mode": mode,
             "cube_ok": cube_ok, "band_ok": band_ok,
             "cube_seen": cube_seen, "band_seen": band_seen,
-            "severity": severity,
+            "severity": severity, "verdict": verdict,
         })
-        verdict = "ok" if (cube_ok and band_ok) else "REJECTED"
+        label = {PASS: "PASS", WARNING: "WARN", REJECT: "REJECT"}[verdict]
         print(f"  {os.path.basename(path):<16} -> {os.path.basename(out_path)}  "
-              f"{mode:<13} {right-left}px ({(right-left)/min(frame_width,frame_height):.0%} of frame)  {verdict}"
+              f"{mode:<13} {right-left}px ({(right-left)/min(frame_width,frame_height):.0%} of frame)  {label}"
               f"{('  [' + severity + ']') if severity else ''}"
               f"{('  ' + '; '.join(notes)) if notes else ''}")
 
-    marker_colour = _average_band_colour(band_colours)
+    marker_colour = _average_band_colour(band_colours, total_frames=len(records))
+
+    # If the capture-level colour was discarded for want of corroboration, then
+    # as far as the pipeline is concerned this capture has no band — and the one
+    # or two frames that thought they saw one must not still be reported as
+    # clean. Leaving them PASS tells a reviewer the band was fine on that frame,
+    # which is the opposite of what was just decided.
+    if marker_colour is None:
+        for record in records:
+            if record.get("band_seen"):
+                record["band_seen"] = False
+                record["band_bbox"] = None
+                record["verdict"], record["reasons"], record["severity"] = (
+                    _frame_verdict(record["cube_seen"], False,
+                                   record["cube_ok"], True))
+
     if marker_colour:
         print(f"\n  Marker colour learned from {len(band_colours)} frames: "
               f"RGB {[int(v) for v in marker_colour['rgb']]}, "
               f"excess-green {marker_colour['exg']:+.0f} "
               f"— handed to Stage 3 instead of a fixed threshold")
 
-    bad = [r for r in records if not (r["cube_ok"] and r["band_ok"])]
-    good = [r for r in records if r["cube_ok"] and r["band_ok"]]
+    # A warning is a usable frame. Only a reject is withheld, which is the whole
+    # point of having three verdicts rather than two: a capture with no marker
+    # band is measurable, it simply cannot be cut without a person placing the
+    # plane, and refusing it outright was costing captures that were fine.
+    bad = [r for r in records if r["verdict"] == REJECT]
+    warned = [r for r in records if r["verdict"] == WARNING]
+    good = [r for r in records if r["verdict"] != REJECT]
 
     manifest = {
         "source": os.path.abspath(image_folder),
@@ -706,12 +880,19 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
         "required": min_frames,
         "accepted": len(good),
         "submitted": len(records),
-        "all_passed": not bad and len(good) >= min_frames,
+        "all_passed": not bad and not warned and len(good) >= min_frames,
+        "usable": not bad and len(good) >= min_frames,
+        "warned": [r["source"] for r in warned],
+        "rejected": [r["source"] for r in bad],
         "marker_colour": marker_colour,
         "frames": [{
             "index": r["index"],
             "source": r["source"],
-            "accepted": bool(r["cube_ok"] and r["band_ok"]),
+            # `verdict` is the real answer; `accepted` is kept as the boolean
+            # older consumers read, and now means "used by the pipeline" —
+            # which includes WARNING frames.
+            "verdict": r["verdict"],
+            "accepted": r["verdict"] != REJECT,
             "reasons": r["reasons"],
             "severity": r["severity"],
             "cube_seen": r["cube_seen"],
@@ -741,13 +922,31 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
               "which describe one particular khaki\n  band — if your marker is "
               "another colour the cut will not find it.")
 
+    passed = [r for r in records if r["verdict"] == PASS]
+    print()
+    print("=" * 60)
+    print(f"STAGE 0 VERDICT: {len(passed)} pass, {len(warned)} warning, "
+          f"{len(bad)} reject  (of {len(records)} submitted)")
+    print("=" * 60)
+    if warned:
+        print("  Warnings — these frames are used, with a caveat:")
+        for r in warned:
+            print(f"    img{r['index']:<3} {r['source']:<18} {'; '.join(r['reasons'])}")
+    if bad:
+        print("  Rejected — these frames are not used:")
+        for r in bad:
+            print(f"    img{r['index']:<3} {r['source']:<18} {'; '.join(r['reasons'])}")
+    if not warned and not bad:
+        print("  Every frame framed cleanly.")
+
     if strict and (bad or len(good) < min_frames):
         print()
         print("=" * 60)
         print("STAGE 0: INPUT NOT ACCEPTED — please re-take and re-submit")
         print("=" * 60)
         print(f"  {len(good)} of {len(records)} frames usable; "
-              f"{min_frames} are required, and every submitted frame must pass.")
+              f"{min_frames} are required. Warnings are allowed through — only "
+              f"rejects are not.")
         if bad:
             print(f"  Re-take: "
                   + ", ".join(f"img{r['index']} ({r['source']})" for r in bad))

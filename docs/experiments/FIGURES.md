@@ -1,0 +1,101 @@
+# Figure verification register
+
+Every figure in this directory, and whether it has been **reproduced from a
+verified run** on the current tree. Written after one figure
+(`mls_ghost_limb_section.png`) was found to be measuring the wrong thing, which
+made the general question worth answering explicitly rather than assuming.
+
+The reference run throughout is `work/verify_full` — a cold `stagerun.py 0-6` on
+`inputs/small_leg` whose `volumes.csv` is bit-identical to `run.py`'s on the same
+photographs.
+
+| figure | status | notes |
+|---|---|---|
+| `alpha_ladder.png` | **regenerated 2026-08-23** | structure was right (10 rungs → 55×, 7 → 25×), χ values were stale. Worst χ is −2876, not the ~−2050 shown. Now drawn directly from the Stage 4 log. |
+| `ghost_removal_chain.png` | **regenerated 2026-08-23** | every count was pre-Stage-0-fix, and its caption disagreed with its own panels (1.61→1.96 against 1.57→1.92). Also: panels 1-4 contained the floor and the cube, so their "shell" number was measuring the gap between two objects. Every panel is now cropped to the limb, and the slice is chosen by angular completeness rather than width — the old choice gave a broken C-shape. |
+| `mls_ghost_limb_section.png` | **regenerated 2026-08-23** | its outline traced the **maximum** radius per wedge, which drew corners a leg does not have and inflated the area loss to −7.64%. Now the median radius at 5°. See E-outline-statistic. |
+| `outline_statistic.png` | **built 2026-08-23** | the investigation that found the above. |
+| `cut_plane_band_colour.png` | **built 2026-08-23** | measured on `work/verify_full`; building it showed the recorded "20.8° → 1.3°" does not reproduce. |
+| `recon_method_comparison.png` | **built 2026-08-23** | alpha vs Poisson vs ball pivoting on the same Stage 3 clouds. |
+| `slice_outlier_removal.png` | **built 2026-08-23** | per-z-slice outlier removal A/B. |
+| `dedup_vs_open3d.png` | **superseded by a decision** | the A/B was re-run and came out **0.15% apart**, not 0.29%. On the strength of that the hand-rolled grid was **deleted** on 2026-08-23 and `ghost_voxel_downsample` now calls Open3D, so this figure compares the shipped implementation against one that no longer exists. Kept as the record of the decision. |
+| `voxel_steps_explained.png` | **NOT reproduced** | pre-Stage-0-fix counts. Its *conclusion* — that the two grid steps run the same arithmetic and differ only in cell size and origin — was re-verified independently, but the panel numbers are stale. |
+| `dedup_vs_downsample.png` | **NOT reproduced** | same. |
+| `mls_box_quad_vs_plane_overview.png` | **NOT reproduced** | cube MLS, plane against quadratic. |
+| `mls_box_quad_vs_plane_face_profile.png` | **NOT reproduced** | same experiment. |
+| `stage0_bypass_bug.png` | **NOT reproduced** | illustrates a bug that is now fixed, so it is a historical record rather than a current measurement. The fix itself is verified: both entry points now emit a bit-identical `volumes.csv`. |
+| `stage0_vggt_input.png` | **NOT reproduced** | the crop-coverage percentages in `rework_main_vs_current.md` (69% / 84% / 100%) have not been re-derived. |
+
+> ### Note — the 2026-08-23 Open3D swap
+>
+> After these figures were regenerated, `voxel_dedup` was replaced by
+> `ghost_voxel_downsample` (an Open3D call). That moves the reported limb volume
+> from 1083.54 to **1081.94 cm³**, −0.15%, and shifts point counts by about 0.1%.
+> `recon_method_comparison.png` and `slice_outlier_removal.png` were re-run on the
+> post-swap clouds and are current. `alpha_ladder.png`,
+> `ghost_removal_chain.png` and `mls_ghost_limb_section.png` were drawn from
+> `work/verify_full`, which is pre-swap — their point counts are therefore high
+> by ~0.1% and their shell figures unchanged in substance. Not redrawn, because
+> nothing they show turns on a tenth of a percent; recorded here so it is known.
+
+## How the cross-section slice is chosen
+
+Every figure that draws a cross-section — `ghost_removal_chain.png`,
+`mls_ghost_limb_section.png`, `recon_method_comparison.png` — now uses **the same
+slice**, picked by one rule: **all 36 of 36 ten-degree sectors occupied**, in the
+raw cloud, the MLS cloud and the measured cloud alike. On `inputs/small_leg` that
+is 15.9 cm above the floor.
+
+The rule exists because the obvious alternative is actively wrong. Selecting "the
+widest point in the upper 60%" picks the *top* of the limb, and a partially
+observed ring measures **wider** by a p95-radius metric than a whole one — so
+that selection is biased straight towards the broken region, which is how a
+C-shaped section reached an earlier version of `ghost_removal_chain.png`.
+
+The limb itself is fine. Measured sector coverage against height:
+
+| height | sectors |
+|---|---|
+| 5% – 80% of the uncut limb | **36/36 — closed ring** |
+| 85% | 34/36 |
+| 90% | 31/36 |
+| 95% | 27/36 — open |
+
+The cameras saw all the way round: the raw per-view cloud is 36/36 at every
+height, each of the six views covering 12–17 sectors. The ring only opens in the
+top 15%, where the limb leaves the frame — and **the cut removes everything above
+69%**, so that region never reaches the measurement. Worst coverage anywhere in
+`leg_cut.ply` is 29/36, at the very bottom, which is the sole of the foot and is
+not a circle to begin with.
+
+> The chain figure is drawn from an independent replay of Stage 2→3 rather than
+> from the stage's own output, so its counts can differ from the pipeline log by
+> a point or two (17,444 against 17,443 after `normal_aware_filter`). The replay
+> exists so every step's intermediate cloud can be captured; the pipeline does
+> not persist them.
+
+## What the failures had in common
+
+Three of the four figures that turned out wrong failed the same way: **a summary
+statistic chosen without asking what it was sensitive to.**
+
+- `mls_ghost_limb_section` used a per-wedge **maximum**, so one point set each
+  vertex and a shell 1.76 mm thick read as 7.6% of lost area.
+- `ghost_removal_chain` measured a "shell thickness" over a slab that contained
+  two different objects.
+- `alpha_ladder` was fine in method and simply stale in data.
+
+The lesson worth keeping: for anything measured on a point cloud, prefer a
+**robust** statistic (median, RMS about a median) over an extremum, and state
+which was used in the figure itself.
+
+## Reproducing
+
+The scripts that build the 2026-08-23 figures live in the session scratchpad and
+are not committed. Each is reconstructible from its `experiments.md` entry, which
+states the method in enough detail to rewrite it. The data they read is
+`work/verify_full`, regenerable with:
+
+```bash
+python stagerun.py 0-6 -i inputs/small_leg --name verify_full --continue-on-rejected
+```

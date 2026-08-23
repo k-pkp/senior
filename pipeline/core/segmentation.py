@@ -42,6 +42,58 @@ def rgb_to_hsv(r, g, b):
     return h, s, v
 
 
+def marker_mask_by_contrast(colors_uint8, band_rgb, limb_rgb,
+                            threshold=0.5, val_floor=None):
+    """Separate the band from the limb by what actually distinguishes them.
+
+    Centring a colour window on the measured band was wrong, and measurably so:
+    this khaki band sits at hue 26 while skin sits at 11-20, so a window around
+    the band admitted the entire limb -- 102,988 points selected where the real
+    band is 210. The config's hand-tuned window works not because it describes
+    the band but because it EXCLUDES skin, and leaves excess green to do the
+    separating (+14 against -54).
+
+    Generalising that means learning the contrast rather than the colour. Band
+    and limb are two measured points in RGB; the line between them is the
+    direction along which they differ, and everything else is irrelevant. Each
+    pixel is projected onto that line, 0 at the limb and 1 at the band, so the
+    test is "closer to the band than to the limb" and carries no assumption
+    about which colour either one is.
+    """
+    def _chroma(x):
+        """Colour with brightness divided out.
+
+        Working in raw RGB fails on this data for a reason worth stating: the
+        band is darker than skin as well as differently coloured, so the axis
+        between them points partly along brightness -- and shadowed skin then
+        scores as band. Selecting 3,244 points where the band is ~210 is that
+        error. Normalising by intensity keeps only the chromatic difference,
+        which is what actually distinguishes a marker from the limb under it,
+        and is why the hand-tuned rule leans on excess green rather than value.
+        """
+        x = np.asarray(x, dtype=np.float64)
+        total = x.sum(axis=-1, keepdims=True)
+        return x / np.maximum(total, 1e-6)
+
+    band = _chroma(band_rgb)
+    limb = _chroma(limb_rgb)
+    axis = band - limb
+    denom = float(axis @ axis)
+    if denom < 1e-9:
+        return np.zeros(len(colors_uint8), dtype=bool), {"n_markers": 0,
+                                                         "degenerate": True}
+    rgb = np.asarray(colors_uint8, dtype=np.float64)
+    score = ((_chroma(rgb) - limb) @ axis) / denom
+    mask = score > threshold
+    if val_floor is not None:
+        mask &= rgb.max(axis=1) > val_floor
+    return mask, {
+        "n_markers": int(mask.sum()),
+        "separation": round(float(np.sqrt(denom)), 4),
+        "threshold": threshold,
+    }
+
+
 def detect_markers(colors_uint8, hue_min=None, hue_max=None, sat_min=None,
                    val_min=None, exg_min=None):
     """Detect green marker points by hue window and Excess Green Index.
@@ -270,7 +322,8 @@ def cut_surface_plane(coords, planes, axis_idx, axis_name="Z"):
     return keep, info
 
 
-def segment_point_cloud(pcd, height_axis="z", verbose=True):
+def segment_point_cloud(pcd, height_axis="z", verbose=True,
+                        marker_colour=None):
     """Run full marker-based leg segmentation on an Open3D point cloud.
 
     Marker planes are fitted via SVD so that slanted/tilted markers
@@ -314,10 +367,32 @@ def segment_point_cloud(pcd, height_axis="z", verbose=True):
               f"BBox Z[{coords[:,2].min():.3f},{coords[:,2].max():.3f}]")
         print("  Detecting markers (HSV S>15 & H>60, ExG>10)...")
 
-    marker_mask, stats = detect_markers(colors)
+    # Stage 0 measures the marker's colour when it locates the band, so prefer
+    # that over the config defaults, which describe one particular khaki band.
+    # Stage 0 measures both the band and the limb it sits on when it locates
+    # the band, so prefer the contrast between them over the config defaults,
+    # which describe one particular khaki band against one particular skin.
+    marker_mask = stats = None
+    if marker_colour and marker_colour.get("rgb") and marker_colour.get("limb_rgb"):
+        from pipeline import config as _cfg
+        marker_mask, stats = marker_mask_by_contrast(
+            colors, marker_colour["rgb"], marker_colour["limb_rgb"],
+            val_floor=_cfg.MARKER_VAL_MIN * 255.0 / 100.0)
+        if verbose:
+            print(f"    marker by contrast: band RGB "
+                  f"{[int(v) for v in marker_colour['rgb']]} vs limb "
+                  f"{[int(v) for v in marker_colour['limb_rgb']]}, "
+                  f"separation {stats.get('separation')} -> "
+                  f"{stats['n_markers']:,} points")
+    if marker_mask is None:
+        marker_mask, stats = detect_markers(colors)
 
     if verbose:
-        print(f"    HSV-only: {stats['n_hsv']:,}  ExG-only: {stats['exg_only']:,}  "
+        if "n_hsv" not in stats:
+            print(f"    markers: {stats['n_markers']:,} "
+                  f"({stats['n_markers']/n_total*100:.2f}%)")
+        else:
+            print(f"    HSV-only: {stats['n_hsv']:,}  ExG-only: {stats['exg_only']:,}  "
               f"both: {stats['both']:,}  total: {stats['n_markers']:,} "
               f"({stats['n_markers']/n_total*100:.1f}%)")
 

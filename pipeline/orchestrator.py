@@ -25,6 +25,7 @@ from pipeline.stages.volume import compute_volumes
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 STAGE_DIRS = {
+    0: "00_prep",
     1: "01_inference",
     2: "02_pointcloud",
     3: "03_clean",
@@ -185,36 +186,37 @@ def main():
         target_dir = os.path.join(stage_dirs[1], "target")
         target_images_dir = os.path.join(target_dir, "images")
         os.makedirs(target_images_dir, exist_ok=True)
-        _copy_images_to_target(args.image_folder, target_images_dir)
+
+        # ── Stage 0: Framing ──
+        #
+        # Runs before anything else and refuses to continue on a capture that
+        # cannot be framed. A frame that clips the reference cube corrupts the
+        # scale for every number the pipeline goes on to report, and does so
+        # invisibly, so the only safe response is to stop and say which images
+        # to re-take.
+        inference_input = args.image_folder
+        marker_colour = None
+        if getattr(args, "prep", True):
+            from pipeline.stages.prep import prepare_frames
+            prep_images = os.path.join(stage_dirs[0], "images")
+            manifest = prepare_frames(args.image_folder, prep_images,
+                           band_heights=args.prep_band, pad=args.prep_pad,
+                           centre_on_subject=args.prep_recentre,
+                           strict=args.prep_strict,
+                           min_frames=args.prep_min_frames)
+            inference_input = prep_images
+            # Stage 3 uses the colour Stage 0 measured, so a marker of any
+            # colour works without editing the config's khaki defaults.
+            marker_colour = manifest.get("marker_colour")
+
+        # Record what VGGT was actually shown. This used to copy the submitted
+        # folder, which stopped being the same thing once Stage 0 could rewrite
+        # the frames -- the record then quietly disagreed with the run.
+        _copy_images_to_target(inference_input, target_images_dir)
 
         # ── Stage 1: Inference ──
-        predictions, inference_time = run_inference(args.image_folder, device, args.max_frames)
+        predictions, inference_time = run_inference(inference_input, device, args.max_frames)
         print(f"[DBG-stage] stage1 inference: {inference_time:.2f}s")
-
-        # ── Stage 1b: Detection (after VGGT, uses freed GPU) ──
-        detection_seeds = None
-        if getattr(args, "use_detection", False):
-            _dbg_t = time.time()
-            try:
-                from pipeline.detection import detect_objects, seeds_to_xyz_labels
-                print()
-                print("=" * 60)
-                print("STAGE 1b: Object detection (Grounding DINO + SAM)")
-                print("=" * 60)
-                images_for_det = predictions["images"]
-                detection_seeds = detect_objects(images_for_det)
-                if detection_seeds:
-                    mode = getattr(args, "prediction_mode", "pointmap")
-                    wp = predictions.get("world_points" if mode == "pointmap" else "world_points_from_depth")
-                    if wp is not None:
-                        _, _ = seeds_to_xyz_labels(detection_seeds, wp)
-                        args._detection_seeds = detection_seeds
-                print(f"[DBG-stage] stage1b detection: {time.time() - _dbg_t:.2f}s")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f"  WARNING: Detection failed ({e}), falling back to heuristic")
-                detection_seeds = None
 
         # Save predictions (compatible with demo_gradio)
         npz_path = os.path.join(target_dir, "predictions.npz")
@@ -242,7 +244,8 @@ def main():
                 ply_path, stage_dirs[3], args.num_objects, seed=args.seed,
                 segment_leg=args.segment_leg,
                 segment_height_axis=args.segment_height_axis,
-                fill_enabled=not args.no_fill)
+                fill_enabled=not args.no_fill,
+                marker_colour=marker_colour)
             print(f"[DBG-stage] stage3 clean_and_extract: {time.time() - _dbg_t:.2f}s")
             if object_paths:
                 _dbg_t = time.time()
@@ -265,6 +268,9 @@ def main():
         vol_objects = wt_mesh_paths or recon_mesh_paths
         if vol_objects:
             _dbg_t = time.time()
+            # PARKED — inference_dir=stage_dirs[1] fed Stage 6's marker
+            # cross-check, reverted with Stage 6. See the PARKED block in
+            # pipeline/stages/volume.py.
             vol_df = compute_volumes(vol_objects,
                                      voxel_res=args.voxel_res,
                                      auto_res=args.auto_res)

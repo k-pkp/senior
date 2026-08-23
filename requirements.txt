@@ -23,8 +23,9 @@ tqdm
 pymeshfix
 pyvista
 pandas
-warp-lang>=1.3.0    # optional: GPU voxelization for Stage 7 (~40x faster than trimesh)
+warp-lang>=1.3.0    # optional: GPU voxelization for Stage 6 (~40x faster than trimesh)
 scikit-learn>=1.3.0
 psutil>=5.9.0
 alphashape>=1.3.1
 shapely>=2.0.0
+

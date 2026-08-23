@@ -3,9 +3,15 @@
 Measure an object's real-world volume from a handful of phone photos, using an
 ArUco-marked cube of known size as the scale reference.
 
-Six stages: **VGGT inference → point cloud → segment & cut → surface
-reconstruction → watertight check → real-world volume.** Only the first runs a
-neural network; the rest is geometry.
+Seven stages: **framing gate → VGGT inference → point cloud → segment & detect →
+surface reconstruction → watertight check → real-world volume**, with the marker
+cut applied once a person has confirmed where it falls. Stages 0 and 1 run neural
+networks; the rest is geometry. A cold run is ~80 s on an RTX 4060.
+
+Two stages stop for a decision. **Stage 0** refuses a capture it cannot frame — a
+photo that clips the reference cube corrupts the scale of every number the run
+reports, with no visible sign. **Stage 3** detects the cutting plane but does not
+apply it, so no volume is ever produced from a cut nobody approved.
 
 Full technical detail in [`pipeline.md`](pipeline.md).
 
@@ -19,7 +25,8 @@ pip install -r requirements.txt
 ```
 
 Backends are auto-detected: **CUDA → MPS → CPU**. Developed on an RTX 4060
-(8 GB); a full run is ~40 s there.
+(8 GB); a full run is ~80 s there, of which Stage 1 inference is ~19 s and the
+detectors in Stage 0 most of the rest.
 
 ### Model weights
 
@@ -54,14 +61,22 @@ otherwise marker detection has nothing to find.
 What you should see at the end:
 
 ```
-       name  height_cm  width_cm  depth_cm  real_vol_cm3     method
-    box.ply      13.97     14.33     14.54       2694.24 watertight
-leg_cut.ply      32.83      8.13     16.55       1075.04 watertight
+       name  size_x_cm  size_y_cm  size_z_cm  real_vol_cm3  real_vol_L     method
+leg_cut.ply      22.54      19.06      22.81       1081.94        1.08 watertight
+    box.ply      19.18      19.55      14.07       2744.00        2.74 watertight
 ```
 
 Both meshes should report `watertight` with `euler 2`. If either says
 `warp+floodfill` or `convex_hull (UNRELIABLE)`, the reconstruction failed and
 the number is not a measurement.
+
+Two things in that table are artefacts of **Stage 6 currently being reverted to
+`main`'s version** (see the full write-up (not on this branch)):
+the reference prints exactly `2744.00` because that method derives scale from the
+cube's own volume, and the 14 cm cube reads 19.18 × 19.47 × 14.09 because the
+dimensions are an axis-aligned box around a tilted cube, which measures its
+diagonal. Neither is a measurement error; both are the method reporting itself.
+The parked method reads 13.97 × 14.33 × 14.54 and 2694.24 cm³ on the same capture.
 
 ---
 
@@ -114,7 +129,7 @@ so you can see what VGGT actually produced rather than infer it.
 | `--conf_thres` | 45.0 | confidence percentile; 45 filters floor and object evenly |
 | `--prediction_mode` | `pointmap` | `depth` measured worse on both datasets |
 | `--preprocess-mode` | `crop` | `pad` keeps the full frame; `crop` discards ~44% of a 9:16 photo |
-| `--recon-method` | `alpha_shape` | also `poisson`, `poisson_omp1`, `box_primitive` |
+| `--recon-method` | `poisson` | also `alpha_shape`, `poisson_omp1`, `box_primitive`. **Does not affect the reference cube** — use `--box-recon-method` for that |
 | `--box-recon-method` / `--obj-recon-method` | — | per-object override |
 | `--no-segment-leg` | off | **required** for objects with no marker band |
 | `--no-fill` | off | skip bottom cap and floor extend |
@@ -161,10 +176,12 @@ python viewer.py output/scene_mesh.ply --info
 - **`REFERENCE_REAL_SIZE_CM = 14.0` has never been measured.** The cube is
   handmade cardboard; a 2 mm build error is 1.4% linear = **4.3% volume** on
   every result — which is now *larger than the error the pipeline still has*.
-- **Scale cannot be validated with one reference.** The cube's *volume* is free
-  to disagree with nominal — currently **2694 vs 2744 cm³, −1.8%** (leg scene)
-  and **2644 vs 2744, −3.7%** (can scene) — but turning that into an accuracy
-  figure needs a **second object of known size**.
+- **Scale cannot be validated with one reference.** Under the *parked* Stage 6
+  the cube's volume is free to disagree with nominal — **2694 vs 2744 cm³, −1.8%**
+  (leg scene) and **2644 vs 2744, −3.7%** (can scene). Under the Stage 6 that
+  currently ships it is not free at all: it is the denominator, so it prints
+  2744.00 by construction and carries no information. Either way, turning this
+  into an accuracy figure needs a **second object of known size**.
 - **The noise floor is ~1–2% volume**, measured as local surface thickness on
   the current pipeline (0.29 mm shell on a 3.94 cm radius limb). An earlier
   ±16% figure quoted here came from a pre-rework measurement using a metric that
@@ -177,7 +194,7 @@ python viewer.py output/scene_mesh.ply --info
 ## Layout
 
 ```
-run.py            full pipeline, stages 1-6
+run.py            full pipeline, stages 0-6
 stagerun.py       per-stage runner with caching and metrics
 viewer.py         PLY/STL viewer
 volume.py         standalone volume CLI
@@ -186,12 +203,14 @@ pipeline/
   orchestrator.py   stage sequencing, final output publishing
   cli.py            argparse
   config.py         every tunable constant, with its justification
-  ghost.py          voxel dedup + normal-aware ghost filter
-  mls.py            moving-least-squares surface projection
-  multiview.py      multi-view consistency (disabled — documented failure)
-  detection.py      Grounding DINO + SAM seed detection
-  core/             plane, cluster, faces, fill, filters, mesh, segmentation
-  stages/           inference, pointcloud, clean, reconstruct, watertight, volume
+  ghost.py          the whole ghost chain: voxel dedup, normal-aware
+                    filter, and MLS surface projection
+  multiview.py      multi-view consistency (written, not wired into Stage 2)
+  core/             cluster, faces, fill, filters, markers3d, mesh, plane,
+                    segmentation, vlm_detect
+  stages/           prep, inference, pointcloud, clean, reconstruct,
+                    watertight, volume
+  utils/            seeding, runlog
 
 workers/          recons_methods_worker.py, meshfix_worker.py
 tools/            com_vol.py

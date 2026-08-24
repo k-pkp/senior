@@ -24,7 +24,7 @@ until a person has confirmed where the subject ends.
 | marker colour | hardcoded khaki window | measured per capture |
 | reconstruction | Poisson, never closed | Poisson, **validated at χ = 2**, alpha shape as an automatic fallback |
 | reference mesh watertight | **no**, even after repair | **yes**, χ = 2 |
-| volume method | voxel flood fill | exact signed volume |
+| volume method | `warp+floodfill`, because the mesh never closed | `watertight` — the same Stage 6 code, now reachable |
 | where the cut happens | automatic, unreviewable | detected, then confirmed by a person |
 | wall clock | 136.7 s | **80 s** |
 | front end | none | browser app + GPU service |
@@ -39,8 +39,11 @@ reference cube is. Nothing checked what survived.
 
 **Now** Stage 0 (`pipeline/stages/prep.py`) locates the cube, the limb and the
 marker band in every frame, chooses a crop window that holds all of them, and
-**rejects the frame if no such window exists** — naming the photograph to re-take
-and why.
+returns one of three verdicts. **Pass** is a frame whose window exists and holds
+everything. **Warning** is a frame that could not be cropped that way but is
+still measurable through VGGT's own crop — it is used, and the report names it.
+**Reject** is a frame with no cube in it at all, or nothing recognisable; only a
+reject stops the run.
 
 ![what VGGT actually receives](experiments/stage0_vggt_input.png)
 
@@ -49,13 +52,14 @@ off the cube in `IMG_4462`. That is invisible: a truncated cube still
 reconstructs, it just reconstructs *smaller* — and the cube sets the scale for
 every number the run reports. A scale error from a clipped reference cannot be
 detected downstream, cannot be corrected, and looks exactly like a correct
-result. Stage 0's window keeps 100% of the cube on all five usable frames.
+result. Stage 0's window keeps 100% of the cube on all five frames it could crop,
+and on the sixth it says so instead of measuring it silently.
 
-| frame | cube height (px) | VGGT's own crop keeps | Stage 0 keeps |
-|---|---|---|---|
-| IMG_4458 | 1487 | 69% | 69% — *rejected; no crop can hold it* |
-| **IMG_4462** | 1150 | **84%** | **100%** |
-| the other four | — | 100% | 100% |
+| frame | cube height (px) | VGGT's own crop keeps | verdict and route | cube kept |
+|---|---|---|---|---|
+| IMG_4458 | 1487 | 69% | **warning** — a window holding the cube exists, but it leaves the marker band out, so the frame goes to VGGT uncropped | 69% |
+| **IMG_4462** | 1150 | **84%** | pass — Stage 0's own window | **100%** |
+| the other four | — | 100% | pass — Stage 0's own window | 100% |
 
 `IMG_4458` is the case worth showing: the cube and the band are too far apart for
 any square the photo can provide. `main` had no way to notice, and would have
@@ -194,7 +198,7 @@ contradict one of the first two.
 
 ---
 
-## 5. The reconstructed surface closes, and the volume is exact
+## 5. The reconstructed surface closes, which is what makes the volume exact
 
 **`main`** used Poisson. Its reference mesh was **not watertight**, and PyMeshFix
 adding 30,739 faces did not close it. An open mesh has no signed volume, so
@@ -205,6 +209,11 @@ no error signal when it does.
 takes the **smallest α that is both watertight and has Euler characteristic 2** —
 the tightest surface that is still a single closed solid.
 
+Note what did **not** change: Stage 6 is `main`'s code, byte for byte. Its first
+tier has always been the exact signed volume, and `main` never reached it because
+its meshes were open. The improvement is upstream — the mesh closes, so `main`'s
+own best branch is the one that now runs.
+
 ![alpha ladder](experiments/alpha_ladder.png)
 
 | | `main` | now |
@@ -213,7 +222,7 @@ the tightest surface that is still a single closed solid.
 | reference mesh | 311,821 faces | 16,106 faces |
 | watertight | **no** | **yes** |
 | after repair | 342,560 faces, **still not watertight** | unchanged, already closed |
-| volume | `warp + floodfill` | exact signed volume |
+| volume | `warp + floodfill` | `watertight`, exact signed volume |
 
 > **Updated 2026-08-23.** This section originally argued for alpha shape over
 > Poisson outright. The Poisson column below was measured against a Stage 5 that
@@ -385,7 +394,6 @@ Some properties worth knowing:
 | change | why it is an improvement |
 |---|---|
 | **Watertightness verified with `trimesh.load(process=False)`** | the default merge welds PyMeshFix's intentional seam duplicates and reports an *open* mesh as watertight. The check was passing on meshes that were not closed |
-| **Volume falls through four tiers, and tiers 2-4 warn loudly** | a non-watertight mesh once returned 0.000825 instead of 0.0119 because the flood fill escaped through a hole. Now the output says which method produced it |
 | **Marker detection restricted to the upper 60% of the limb's span** | the foot is wider than the calf; searching the whole span let the widest cross-section pull the plane down the leg |
 | **The alpha ladder reports its fallback** | when no rung is both closed and χ = 2 it ranks candidates and says so, instead of silently returning something open |
 | **`--seed` seeds `random`, NumPy, PyTorch and Open3D** | Stage 3 is reproducible bit-for-bit, which is what makes an A/B of one constant meaningful |

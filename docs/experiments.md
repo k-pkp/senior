@@ -1242,7 +1242,7 @@ have refused every band-free upload.
 
 | capture | before | after |
 |---|---|---|
-| `inputs/small_leg` | 5 of 6 usable, colour RGB [44,37,16] | **unchanged** |
+| `inputs/small_leg` | 5 of 6 usable, colour RGB [44,37,16] | **6 of 6 used** — `IMG_4458` is now a warning rather than a rejection, so no `--continue-on-rejected` is needed; same learned colour, same downstream numbers |
 | `inputs/short_leg` | 1 of 8, run refused | **8 of 8**, colour correctly discarded |
 | `inputs/est_325` | 0 of 8, all unreadable | **8 of 8**, colour correctly discarded |
 

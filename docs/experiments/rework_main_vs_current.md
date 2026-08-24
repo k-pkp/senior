@@ -33,11 +33,11 @@ cd -            && python stagerun.py 0-6 -i inputs/small_leg --name verify --co
 |---|---|---|
 | stages | 6 | 7, two of which stop for a human decision |
 | wall clock | **136.7 s** | **80 s** |
-| capture validation | none | Stage 0 gate — 5 of 6 frames accepted, 1 named for re-take |
+| capture validation | none | Stage 0 gate — 5 pass, 1 warning, 0 reject; all six measured, the weak one named |
 | marker colour | hardcoded khaki window | measured per capture |
 | reconstruction | Poisson | alpha shape, α chosen by watertightness |
 | **box mesh watertight** | **no** — after Stage 5 as well | **yes**, χ = 2 |
-| volume method | `warp + floodfill` approximation | exact signed volume |
+| volume method | `warp + floodfill` — the mesh was open | `watertight` — Stage 6 unchanged, its first tier now reachable |
 | limb volume | 1073.98 cm³ | 1081.94 cm³ |
 
 The headline is the watertight row, and it is not a detail. `main`'s reference
@@ -57,45 +57,57 @@ was. On this capture that clipped the cube's base in two frames of six.
 Current run:
 
 ```
-IMG_4458.jpg   REJECTED   [very crucial]  objects out of window
-IMG_4459..4463 ok         crop 2160px
-5 of 6 frames usable; marker colour learned RGB [44, 37, 16], ExG +14
+IMG_4458.jpg   WARN   [crucial]  cube out of window — VGGT will centre-crop instead
+IMG_4459..4463 PASS   crop 2160px
+STAGE 0 VERDICT: 5 pass, 1 warning, 0 reject  (of 6 submitted)
+marker colour learned RGB [44, 36, 15], excess-green +13
 ```
 
-The rejected frame is still written, uncropped, so it can be inspected — and
-`--continue-on-rejected` lets the run proceed with VGGT cropping that one itself.
+The stage answers with one of three verdicts rather than a yes or a no. **Pass**
+is a frame whose window holds the cube and the band together. **Warning** is a
+frame that window cannot serve — it is still written, uncropped, so VGGT crops it
+and the run proceeds, but the report names the photograph and says what it lost.
+**Reject** is kept for the cases nothing can be done with: no cube in the frame,
+or nothing recognisable at all. Only a reject stops the run.
 
 ### What VGGT actually receives
 
 ![stage 0 input comparison](stage0_vggt_input.png)
 
-Top row is the photograph with the reference cube in magenta, the marker band in
-green, VGGT's own centre crop as a red dashed band, and Stage 0's chosen window in
-yellow. Middle row is what VGGT gets **without** Stage 0 — produced by calling
-`load_and_preprocess_images(..., mode="crop")` directly, so it is the real input,
-not a mock-up. Bottom row is what it gets **with** Stage 0.
+Top row is the photograph carrying all four boxes the stage draws — the reference
+cube in magenta, the limb in orange, the marker band in green and Stage 0's chosen
+window in yellow — with VGGT's own centre crop added as a red dashed band for
+comparison. Middle row is what VGGT gets **without** Stage 0, produced by calling
+`load_and_preprocess_images(..., mode="crop")` directly, so it is the real input
+and not a mock-up. Bottom row is what it gets **with** Stage 0.
 
 How much of the reference cube survives each route:
 
-| frame | cube height (px) | VGGT's own crop keeps | Stage 0 keeps |
-|---|---|---|---|
-| IMG_4458 | 1487 | 69% | 69% — *rejected, no crop can hold it* |
-| IMG_4459 | 906 | 100% | 100% |
-| IMG_4460 | 787 | 100% | 100% |
-| IMG_4461 | 767 | 100% | 100% |
-| **IMG_4462** | 1150 | **84%** | **100%** |
-| IMG_4463 | 729 | 100% | 100% |
+| frame | cube height (px) | VGGT's own crop keeps | verdict | cube kept on the route taken |
+|---|---|---|---|---|
+| IMG_4458 | 1487 | 69% | **warning** | 69% — passed through uncropped |
+| IMG_4459 | 906 | 100% | pass | 100% |
+| IMG_4460 | 787 | 100% | pass | 100% |
+| IMG_4461 | 767 | 100% | pass | 100% |
+| **IMG_4462** | 1150 | **84%** | pass | **100%** |
+| IMG_4463 | 729 | 100% | pass | 100% |
 
 Two frames of six are where this matters. On **IMG_4462** VGGT's centre crop cuts
 16% off the cube — silently, since a truncated cube still reconstructs, it just
 reconstructs smaller, and the cube sets the scale for every number the run
 reports. Stage 0's window keeps all of it.
 
-On **IMG_4458** neither can help: the cube and the band are too far apart for any
-square the photo can provide. That is the case worth showing to a supervisor,
-because the old pipeline had no way to notice — it would have measured the capture
-and produced a confident number. The current one names the photograph and says
-why.
+**IMG_4458** is the warning case, and it is more specific than "no window fits".
+A full-width square *can* be placed to hold the whole cube — the cube is 1487 px
+tall in a 2160 px-wide frame, so it fits with room to spare. What does not fit is
+the cube and the marker band *together*: the band sits at y≈1171–1287 and the
+cube's base reaches y≈3453, 2.3 k pixels apart in a square only 2160 px on a
+side. Since `can_crop` requires the window to hold both, the frame falls through
+to VGGT's own crop, which keeps 69% of the cube. It is still measured, because a
+partly-visible cube in one frame of six is a weakness rather than a fatal flaw —
+but the run says so. That is the case worth showing to a supervisor: the old
+pipeline had no way to notice, and would have produced the same confident number
+with nothing written down.
 
 The middle row also shows the second, quieter benefit: Stage 0's crops fill the
 frame with the subject, where VGGT's centre crop wastes a third of the 518 pixels
@@ -183,7 +195,7 @@ Stages 0–5 fed it.
 
 | | `main` | current (Stage 6 = main's) |
 |---|---|---|
-| volume method | `warp + floodfill`, auto res 200/300 | exact signed volume |
+| volume method | `warp + floodfill`, auto res 200/300 | `watertight`, exact signed volume |
 | box reported | 18.98 × 19.49 × 13.64 cm | 19.18 × 19.47 × 14.09 cm |
 | box volume | 2744.00 cm³ | 2744.00 cm³ |
 | limb | 22.84 × 19.65 × 22.69 cm, 1073.98 cm³ | 22.34 × 19.09 × 22.82 cm, 1081.94 cm³ |

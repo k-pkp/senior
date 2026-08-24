@@ -2194,7 +2194,7 @@ a genuine absence is unrecoverable.
 
 | capture | before | after |
 |---|---|---|
-| `small_leg` | 5 of 6 usable | **unchanged**, same learned colour |
+| `small_leg` | 5 of 6 usable, 1 rejected | **6 of 6 used, 1 warning** — `IMG_4458` no longer needs `--continue-on-rejected`; same learned colour, same downstream numbers |
 | `short_leg` | 1 of 8, run refused | **8 of 8**, spurious colour discarded |
 | `est_325` | 0 of 8, all unreadable | **8 of 8**, correctly finds no band |
 

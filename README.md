@@ -25,6 +25,7 @@ service together.
 | Stage 6 — under review | [`docs/stage06_experiments.md`](docs/stage06_experiments.md) |
 | **What changed against `main`, and why it is better** | [`docs/updates.md`](docs/updates.md) |
 | Every stage and sub-process in one chart | [`docs/full_flowchart.md`](docs/full_flowchart.md) |
+| Moving Least Squares, derived in full | [`docs/mls_explained.md`](docs/mls_explained.md) |
 
 ---
 

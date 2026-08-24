@@ -6,10 +6,10 @@ import { STAGES } from "@/lib/data";
 const DETAIL: Record<number, string> = {
   1: "One forward pass of VGGT-1B produces a 3D point and a confidence value for every pixel of every photo, plus camera poses. This is the only neural step and where all the uncertainty originates.",
   2: "Points are filtered by confidence — about 55% survive — and statistical outliers removed. The result is one coloured cloud of the whole scene: floor, object, cube.",
-  3: "The floor plane is removed (without it everything is connected through the ground and cannot be separated), the rest is clustered into objects, and the reference cube is identified by how cube-like and how black-and-white it is. The coloured marker band is found by colour thresholding and a plane fitted through it.",
-  4: "The point cloud becomes a triangle mesh using alpha shapes, choosing the tightest alpha that still produces a closed surface. Smooth surface fitting was tried and rounds sharp rims inward, losing real volume.",
-  5: "The mesh is checked for closure and repaired if needed. With alpha shapes it is always already closed, so this is insurance rather than a processing step.",
-  6: "Volume is computed by integrating the closed surface exactly — no voxel approximation — then converted to centimetres using the reference cube's measured edge length. A voxel occupancy count runs alongside as an independent cross-check.",
+  3: "The floor plane is removed (without it everything is connected through the ground and cannot be separated), the rest is clustered into objects, and the reference cube is identified by how cube-like and how black-and-white it is. The duplicated surface VGGT emits is collapsed and the survivors projected onto a locally fitted quadratic surface. The marker band is found using the colour Stage 0 measured from your own photographs rather than a fixed threshold, and a plane is fitted through it — which you confirm before anything is cut.",
+  4: "The point cloud becomes a triangle mesh by Poisson reconstruction, which follows the points closely. Poisson carries no guarantee that the result is a single solid, so if the repair stage cannot bring the mesh to Euler characteristic 2, this stage runs again with an alpha shape — whose search selects on that property and therefore cannot fail it.",
+  5: "PyMeshFix closes the boundary and removes self-intersections and non-manifold edges, then the mesh is checked: closed, and Euler characteristic 2. This is not insurance — it is what makes a Poisson mesh usable, and a mesh that still fails sends Stage 4 back to the alpha shape.",
+  6: "A closed mesh has an exact volume: sum the signed tetrahedron volumes over its triangles, no voxel approximation. Real-world size comes from the reference cube — the ratio of its true 2744 cm³ to its measured mesh volume. If a mesh is not closed the stage falls back to flooding a voxel grid, which over-reads and can leak.",
 };
 
 export function How() {
@@ -25,8 +25,8 @@ export function How() {
           margin: 0,
         }}
       >
-        Six stages. Only the first runs a neural network; everything after is
-        geometry.
+        A framing gate reads your photographs first, then six stages run. Only
+        the first of them uses a neural network; everything after is geometry.
       </p>
 
       {STAGES.map((s) => (

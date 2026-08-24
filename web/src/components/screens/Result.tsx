@@ -175,7 +175,9 @@ export function Result({
                   </span>
                 </div>
 
-                <Label>Height × width × depth (oriented)</Label>
+                <Label>
+                  Height × width × depth ({obj.aabb ? "axis-aligned" : "oriented"})
+                </Label>
                 <div
                   style={{
                     font: "500 15px/1.5 var(--mono)",
@@ -201,8 +203,9 @@ export function Result({
                     marginTop: 6,
                   }}
                 >
-                  Oriented bounding box, not axis-aligned — an AABB around a
-                  tilted object reports its diagonal.
+                  {obj.aabb
+                    ? "Axis-aligned bounding box — on a tilted object an AABB reports the diagonal, not the true width/depth."
+                    : "Oriented bounding box, not axis-aligned — an AABB around a tilted object reports its diagonal."}
                 </div>
               </>
             )}

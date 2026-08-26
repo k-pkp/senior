@@ -231,10 +231,78 @@ def _load_mesh_info(path: str, voxel_res: int, auto_res: bool = False) -> dict |
 # Main stage entry-point
 # ---------------------------------------------------------------------------
 
+# Fraction of its own oriented bounding box a well-reconstructed reference cube
+# fills. A perfect cube fills 1.000; the shortfall is corner and edge rounding,
+# which for this reconstruction is stable at about 0.87-0.89.
+#
+# This is the pipeline's only check on RECONSTRUCTION quality, and it exists
+# because inputs/blue_shirt produced a confident 5280 cm3 with every other gate
+# passing. The framing gate checks the capture, the marker gates check the cut,
+# the Euler check tests topology -- none of them looks at whether the geometry
+# is right. The cube can, because it is the one object in the scene whose true
+# shape is known, and it goes through the identical pipeline as the subject.
+#
+# Measured across the Aug 2026 captures:
+#
+#     orange shirt  0.874     sunshine    0.891
+#     keng          0.873     champ       0.876
+#     black shirt   0.873     blue shirt  0.787   <- the bad reconstruction
+#
+# The five sound captures span 1.8 percentage points; the bad one sits 8.6
+# points below all of them. 0.83 is roughly halfway into that gap.
+#
+# Note what does NOT separate them: the cube's edge lengths. blue shirt's read
+# 9.67 / 10.23 / 10.30 cm, a 6.3% spread, which is squarely mid-pack. A dented
+# or eroded surface keeps its bounding box and loses volume, so the fill ratio
+# sees it and the edges do not.
+REFERENCE_FILL_MIN = 0.83
+
+
+def _check_reference_reconstruction(ref, object_mesh_paths):
+    """Warn when the reference cube did not reconstruct like a cube.
+
+    Reports rather than aborts, in keeping with the rest of the stage: the
+    number is still produced, and the run says plainly that it should not be
+    trusted. Never raises -- a diagnostic that can break a run is worse than
+    the gap it fills.
+    """
+    try:
+        import trimesh
+
+        path = next((p for p in object_mesh_paths
+                     if _is_ref_mesh(p)), None)
+        if path is None:
+            return
+        mesh = trimesh.load(path, process=False)
+        obb = float(np.prod(mesh.bounding_box_oriented.primitive.extents))
+        if obb <= 0:
+            return
+        fill = float(mesh.volume) / obb
+        print(f"\n  Reference reconstruction check:")
+        print(f"    cube fills {fill:.3f} of its oriented box "
+              f"(sound captures measure 0.87-0.89)")
+        if fill < REFERENCE_FILL_MIN:
+            print(f"    ** WARNING: {fill:.3f} is below {REFERENCE_FILL_MIN} — the "
+                  f"reference did not reconstruct as a cube.")
+            print(f"    The subject went through the same reconstruction, so its "
+                  f"volume below is suspect for the same reason. Nothing")
+            print(f"    downstream can correct this: check the capture (is the "
+                  f"cube occluded, or seen from too few angles?) rather than")
+            print(f"    the cut or the calibration.")
+    except Exception as exc:
+        print(f"  reference reconstruction check skipped "
+              f"({type(exc).__name__}: {exc})")
+
+
 def compute_volumes(object_mesh_paths: list[str],
                     voxel_res: int = DEFAULT_VOXEL_RES,
                     auto_res: bool = True):
-    """Compute real-world volume of each object using ArUco box for scale."""
+    """Compute real-world volume of each object using ArUco box for scale.
+
+    Runs `_check_reference_reconstruction` first: the reference cube is the
+    only object in the scene whose true shape is known, so it is the pipeline's
+    one free check on whether the RECONSTRUCTION is sound.
+    """
     res_label = "auto" if auto_res else str(voxel_res)
     print()
     print("=" * 60)
@@ -263,6 +331,8 @@ def compute_volumes(object_mesh_paths: list[str],
     if ref["volume"] <= 0:
         print(f"\n  Reference mesh '{ref['name']}' has zero volume. Aborting.")
         return
+
+    _check_reference_reconstruction(ref, object_mesh_paths)
 
     real_ref_vol = REFERENCE_REAL_SIZE_CM ** 3
     k            = real_ref_vol / ref["volume"]

@@ -88,6 +88,21 @@ def fit_box_faces(vertices, triangles,
     unclaimed = np.ones(len(triangle_normals), dtype=bool)
     faces = []
     while unclaimed.any():
+        # Stop once what is left cannot form a qualifying face.
+        #
+        # Without this the loop runs until every last sliver is claimed, and a
+        # sliver whose normal matches nothing claims only itself -- one
+        # iteration per triangle, each rebuilding a (4000 x unclaimed)
+        # similarity matrix. On the Aug 2026 cubes (12-23k triangles) that did
+        # not finish in 90 s on four of five captures, so this function, and
+        # with it the whole fitted-face calibration, was unrunnable on them.
+        #
+        # A face has to clear min_area_frac to be recorded at all, so once the
+        # remaining area is below that fraction no further iteration can
+        # produce one. Breaking there is not an approximation: it cannot skip a
+        # face the loop would otherwise have found.
+        if float(triangle_areas[unclaimed].sum()) / total_area < min_area_frac:
+            break
         # Seed on the direction carrying the most unclaimed area. Summing the
         # area of every candidate's neighbourhood is what makes this pick a
         # real face rather than one arbitrary large triangle.

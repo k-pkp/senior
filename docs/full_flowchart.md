@@ -153,7 +153,7 @@ flowchart TB
             A_BOXC[/"<b>box cluster</b><br/>106,832 pts, extent (0.319,0.347,0.377)"/]:::file
             A_OBJC[/"<b>object cluster</b><br/>114,282 pts, extent (0.404,0.626,0.265)"/]:::file
             A_MARK["<b>_detect_marker_planes(cluster, height_axis, marker_colour)</b><br/>in ▸ dense limb cluster + learned colour<br/>out ▸ [{centroid (3,), normal (3,), npts}]<br/>chromaticity discriminant: band vs limb CONTRAST"]
-            A_UP["<b>restrict to the upper 60% of the span</b><br/>in ▸ candidate band points<br/>out ▸ subset — the foot is wider than the calf"]
+            A_UP["<b>gate the candidate planes</b><br/>in ▸ candidate planes<br/>out ▸ the valid ones<br/>≥1 cube height above the floor · ≤35° off the limb axis"]
             A_FIT["<b>RANSAC plane fit</b><br/>in ▸ 296 selected band points<br/>out ▸ centroid + unit normal"]
             A_SCALE["<b>_ghost_filter_scales(dense_cloud)</b> · ghost.compute_voxel_size<br/>in ▸ cloud<br/>out ▸ voxel_size 0.0050 = 0.65 × mean NN spacing<br/>shared by both clusters so they decimate identically"]
             A_DEDUP["<b>ghost_voxel_downsample(points, colors, voxel_size)</b> · pipeline/ghost.py<br/>in ▸ 114,282 × 3 + 114,282 × 3 uint8<br/>out ▸ 17,979 × 3 — about 6.4 points per voxel<br/>DOES NOT remove the ghost. It sets the SPACING<br/>removing it costs +2.59% on the reported volume"]
@@ -456,7 +456,7 @@ detection both degrade if run on a thinned or rotated cloud, so they run first.
 |---|---|---|---|
 | `remove_dominant_plane` (`core/plane.py`) | thinned cloud | cloud without the floor | RANSAC removes 219,846 pts (49.3%), leaving 225,808. Without this the floor connects cube to limb and DBSCAN sees one blob |
 | `detect_top_k_objects` (`core/cluster.py`) | floorless cloud | k clusters + which is the reference | DBSCAN, then cubeness `min_extent / max_extent`. box 106,832 · limb 114,282 |
-| `_detect_marker_planes(cluster, axis, marker_colour)` | limb cluster + learned colour | `[{centroid, normal, npts}]` | chromaticity-space linear discriminant; restricted to the **upper 60% of the span** because the foot is wider than the calf; RANSAC plane through the selected points |
+| `_detect_marker_planes(cluster, axis, marker_colour)` | limb cluster + learned colour | `[{centroid, normal, npts}]` | chromaticity-space linear discriminant, **refused when the band/limb axis is shorter than `MARKER_MIN_AXIS`** (all Aug 2026 captures are, so they fall back to the config colour window); RANSAC plane through the selected points. Candidates are then gated in `clean.py` — at least one cube height above the floor, and within `MARKER_MAX_AXIS_ANGLE_DEG` of perpendicular to the limb — before the cut selects among them. **Corrected 2026-08-27:** this table previously described a restriction to "the upper 60% of the span". No such restriction was ever implemented; the only height rule was `MARKER_MIN_HEIGHT_FRAC`, a floor. |
 | `_ghost_filter_scales(dense_cloud)` | cloud | `(voxel_size, normal_scale)` | `0.65 × mean NN spacing` = 0.0050, shared across clusters so both are decimated identically |
 | `_clean_cluster(cluster, label, voxel, scale)` | one cluster | filtered points + colours | calls the three ghost functions in order — see below |
 | `_save_cluster_debug(...)` | clusters + markers | debug PLYs | inspection only |

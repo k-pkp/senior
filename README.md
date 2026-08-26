@@ -13,6 +13,11 @@ photo that clips the reference cube corrupts the scale of every number the run
 reports, with no visible sign. **Stage 3** detects the cutting plane but does not
 apply it, so no volume is ever produced from a cut nobody approved.
 
+**It reads 1.7% against water displacement** on four limb captures — see
+[Accuracy](#accuracy--measured-2026-08-27). Two of the five have residuals under
+2%, one is unresolved at +19.4%, and a sixth capture is excluded because its
+reconstruction failed.
+
 There is also a browser front end: `./serve.sh` starts the viewer and the compute
 service together.
 
@@ -22,7 +27,8 @@ service together.
 | Running the web app | [`docs/running_the_web_app.md`](docs/running_the_web_app.md) |
 | **Full progress log — findings, derivations, maths** | [`docs/progress.md`](docs/progress.md) |
 | Experiment log and verdicts | [`docs/experiments.md`](docs/experiments.md) |
-| Stage 6 — under review | [`docs/stage06_experiments.md`](docs/stage06_experiments.md) |
+| Stage 6 — **resolved: keep M1** | [`docs/stage06_experiments.md`](docs/stage06_experiments.md) |
+| Contract and silent-failure sweep | [`docs/repo_review.md`](docs/repo_review.md) |
 | **What changed against `main`, and why it is better** | [`docs/updates.md`](docs/updates.md) |
 | Every stage and sub-process in one chart | [`docs/full_flowchart.md`](docs/full_flowchart.md) |
 | Moving Least Squares, derived in full | [`docs/mls_explained.md`](docs/mls_explained.md) |
@@ -71,6 +77,18 @@ python run.py -i inputs/est_325 --skip_mesh        # point cloud only
 `--no-segment-leg` is required for anything **without** a coloured marker band,
 otherwise marker detection has nothing to find.
 
+### The reference cube — two of them
+
+`REFERENCE_REAL_SIZE_CM` defaults to **10.0**, the 3D-printed cube used from
+August 2026. The original fixtures (`small_leg`, `short_leg`, `est_325`) were
+shot with a 14 cm handmade cardboard cube and need the override, because
+measuring one against the other rescales every volume by `(14/10)³ = 2.74`
+with no visible sign:
+
+```bash
+REFERENCE_REAL_SIZE_CM=14 python run.py -i inputs/small_leg
+```
+
 What you should see at the end:
 
 ```
@@ -82,6 +100,14 @@ leg_cut.ply      22.54      19.06      22.81       1081.94        1.08 watertigh
 Both meshes should report `watertight` with `euler 2`. If either says
 `warp+floodfill` or `convex_hull (UNRELIABLE)`, the reconstruction failed and
 the number is not a measurement.
+
+> That example is `inputs/small_leg`, which uses the **14 cm** cube — run it with
+> `REFERENCE_REAL_SIZE_CM=14` or every number is 2.74× too large. **The limb
+> figure is also stale:** the current tree reads **1067.57 cm³**, reproducible to
+> seven significant figures across cold runs. The difference is upstream of the
+> cut — Stage 0 now accepts 6 of 6 frames where the run that produced this table
+> accepted 5, which is the verdict redesign recorded in `experiments.md` under
+> E-stage0-verdicts. Every `1081.94` in these documents is from the older tree.
 
 Two things in that table are artefacts of **Stage 6 currently being reverted to
 `main`'s version** (see [`docs/stage06_experiments.md`](docs/stage06_experiments.md)):
@@ -171,6 +197,7 @@ so you can see what VGGT actually produced rather than infer it.
 | `--no-watertight` | off | publish the Stage 4 recon as the final meshes |
 | `--voxel-res` | 150 | voxel cross-check resolution |
 | `--seed` | 42 | seeds random, NumPy, PyTorch, Open3D |
+| `--no-prep-crop` | off | hand VGGT the raw frames. **Fixed 2026-08-27** — `run.py` parsed this flag and ignored it; only `stagerun.py` honoured it |
 
 Tunable constants live in [`pipeline/config.py`](pipeline/config.py), each with
 the measurement that set it.
@@ -192,9 +219,18 @@ python viewer.py output/scene_mesh.ply --info
 - **The reference cube must be visible in every shot**, resting on the same
   surface as the object.
 - **A coloured band** on the limb where the measurement should stop. Use
-  **saturated green tape**. The detector separates the band from skin by excess
-  green (`2G − R − B`); a beige or khaki band gives a margin of ~24 units, which
-  works but is not robust.
+  **saturated green tape**, and treat this as the single most load-bearing item
+  in this list. The detector separates band from limb by their distance in
+  chromaticity, and below `MARKER_MIN_AXIS = 0.05` it stops discriminating:
+  every Aug 2026 capture measured 0.021–0.043 with an olive cord on tan skin,
+  so the learned-colour detector was refused on all of them and the pipeline
+  fell back to its hardcoded colour window. `small_leg`'s khaki measures 0.094.
+  A saturated band roughly triples the separation.
+- **Keep the reference cube close and unobstructed.** It fills 15–18% of the
+  frame width on the Aug 2026 captures against 42% on `small_leg`, which is
+  2 100–3 900 surviving points instead of 19 600. On `inputs/blue shirt` the
+  cube sits behind the foot in most frames and the reconstruction failed
+  outright — see `inputs/blue shirt/UNUSABLE.md`.
 - **Even lighting.** Avoid hard shadows under the object — dark pixels have
   numerically meaningless hue and used to be detected as markers.
 - **A matte floor if possible.** Gloss produces reflections that VGGT
@@ -202,27 +238,50 @@ python viewer.py output/scene_mesh.ply --info
 
 ---
 
-## Accuracy — read before quoting numbers
+## Accuracy — measured, 2026-08-27
 
-- **The reported cube dimensions are partly circular.** Scale is derived as
-  `14.0 / mean(two horizontal cube edges)`, so the **mean of the two reported
-  horizontal dimensions is exactly 14.00 by construction**. Only their *spread*,
-  the *vertical* edge, and the *volume* carry information.
-- **`REFERENCE_REAL_SIZE_CM = 14.0` has never been measured.** The cube is
-  handmade cardboard; a 2 mm build error is 1.4% linear = **4.3% volume** on
-  every result — which is now *larger than the error the pipeline still has*.
-- **Scale cannot be validated with one reference.** Under the *parked* Stage 6
-  the cube's volume is free to disagree with nominal — **2694 vs 2744 cm³, −1.8%**
-  (leg scene) and **2644 vs 2744, −3.7%** (can scene). Under the Stage 6 that
-  currently ships it is not free at all: it is the denominator, so it prints
-  2744.00 by construction and carries no information. Either way, turning this
-  into an accuracy figure needs a **second object of known size**.
-- **The noise floor is ~1–2% volume**, measured as local surface thickness on
-  the current pipeline (0.29 mm shell on a 3.94 cm radius limb). An earlier
-  ±16% figure quoted here came from a pre-rework measurement using a metric that
-  mixed shape error into the noise; it was wrong and is withdrawn.
-- **No ground truth exists for any measured object.** The can's "325 ml" is its
-  *fill* volume, not external displacement — different quantities.
+**The pipeline reads 1.7% mean absolute error against water displacement**, on
+four limb captures with a 10 cm 3D-printed reference. This is the project's
+first accuracy figure; everything before it was the system checking itself.
+
+| capture | measured | displacement | error |
+|---|---|---|---|
+| `orange shirt` | 4094 cm³ | 4090 | **+0.1%** |
+| `keng` | 2249 cm³ | 2210 | **+1.8%** |
+| `black shirt` | 3648 cm³ | 3510 | **+3.9%** |
+| `sunshine` | 3093 cm³ | 3130 | **−1.2%** |
+| `champ` | 3354 cm³ | 2810 | **+19.4%** — unresolved, below |
+| `blue shirt` | — | 3420 | capture unusable, `inputs/blue shirt/UNUSABLE.md` |
+
+Verified on a full cold run — Stage 0's detectors, a fresh VGGT pass, every
+stage after it — which reproduces the cached-stage-1 numbers to seven
+significant figures. The pipeline is deterministic end to end under a fixed
+seed, which is what makes an error bar worth quoting.
+
+**Read these before quoting the number.**
+
+- **n = 4, one subject class, one floor, one cord colour.** This is
+  repeatability, not generality.
+- **±1.7% sits on the ~1–2% surface-noise floor** measured independently as
+  local shell thickness. The two agreeing is corroboration, not coincidence,
+  but it also means the pipeline cannot currently resolve better than its own
+  noise.
+- **`REFERENCE_REAL_SIZE_CM = 10.0` is a design dimension, not a caliper
+  reading.** Printed parts shrink 0.3–0.8%; at 10 cm a 2 mm error is 2.0%
+  linear and **6.1% of volume**, which would dominate the residual above.
+  Measuring the cube once is still the cheapest accuracy work available.
+- **`champ` is unresolved at +19.4%.** Its cut is the best-aligned of the five
+  (2.4° off the limb's own axis) and its cube the second most cubic, and
+  2.81 L matches neither segment its two bands bound — below the upper band is
+  3379 cm³, between the two is 2377 cm³. Its limb reconstructs about 9% wider
+  in circumference than 2.81 L over that length implies, which is the whole
+  discrepancy. A tape measure round the calf at a marked height separates
+  "reconstructs wide" from "truth is wrong" without more water.
+- **The cube's own dimensions are still partly circular.** Stage 6 derives
+  scale from the reference's volume, so the cube reports exactly 1000 cm³ every
+  run. Only its *edge lengths* carry information; they read 9.96–10.92 cm.
+- **The 325 ml can is not ground truth.** That is its *fill* volume; the
+  pipeline measures external displacement.
 
 ---
 

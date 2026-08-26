@@ -1,7 +1,9 @@
 # Repository review — 2026-08-22
 
-> **Status: the High items and all the dead code are fixed.** One new finding
-> (11) was added on 2026-08-22 and is open. What each finding
+> **Status: every finding in this file is now closed.** Items 3, 4, 5 and 11 —
+> the three latent silent failures and the ignored flag — were fixed on
+> 2026-08-27; each entry below records what it became. The High items and all
+> the dead code were already fixed. What each finding
 > turned into is recorded inline below. Two things changed after this review was
 > first written and are worth reading before the list: a much more serious bug
 > was found afterwards (Stage 0's output being discarded by `stagerun.py 0-6`,
@@ -49,7 +51,7 @@ losing it. A path-scoped exception (`!web/public/samples/**`) would.
 
 **Verified.** `git check-ignore` confirms the sample meshes match the rule.
 
-### 3. `_is_closed` falls back to a *different* definition of watertight · OPEN
+### 3. `_is_closed` falls back to a *different* definition of watertight · **FIXED 2026-08-27**
 `workers/recons_methods_worker.py:94` and `pipeline/core/mesh.py:45`. Both build a
 trimesh to test closure and, on any exception, silently fall back to Open3D's
 `is_watertight()` — which the docstring itself says is not the definition the rest
@@ -59,18 +61,20 @@ This is the criterion the alpha ladder selects on. If the trimesh construction e
 throws, α selection quietly changes its meaning and the chosen mesh may not be
 closed by the definition Stage 6 then integrates.
 
-**Latent, not observed.** No run in this session hit the fallback. The risk is that
-if it ever fires, nothing says so.
+**Latent, not observed.** No run in this session hit the fallback.
 
-### 4. Statistical outlier removal can silently do nothing · OPEN
+**Fixed:** both sites now print a warning naming the exception and stating that
+the criterion the alpha ladder selects on has changed definition.
+
+### 4. Statistical outlier removal can silently do nothing · **FIXED 2026-08-27**
 `pipeline/core/filters.py:50`. On any exception the function returns the points,
 colours and confidences unchanged — no message. A failure here means the cloud
 carries its outliers into clustering and reconstruction, and the only symptom is a
 different number.
 
-**Latent, not observed.**
+**Fixed:** the handler names the exception and the point count it kept.
 
-### 5. A detector failure silently shrinks the cube's bounding box, inside the gate · OPEN
+### 5. A detector failure silently shrinks the cube's bounding box, inside the gate · **FIXED 2026-08-27**
 `pipeline/stages/prep.py:220`. `_cube_bbox` unions the ArUco face quads with a
 GroundingDINO box. If `vlm.detect` raises, `det = None` and the box falls back to
 the faces alone — which is *smaller*. A smaller cube box is easier to fit inside
@@ -79,9 +83,11 @@ the crop window, so a frame that should be rejected could pass.
 That inverts the gate's purpose. It is the one place in the pipeline where a
 swallowed exception makes the check more permissive rather than less.
 
-**Latent, not observed.**
+**Fixed:** the handler says so explicitly — that the box has fallen back to the
+faces alone, that this under-covers the cube, and that the frame's framing check
+is therefore more permissive than it should be.
 
-### 11. `--no-prep-crop` is silently ignored by `run.py` · OPEN · *found 2026-08-22*
+### 11. `--no-prep-crop` is silently ignored by `run.py` · **FIXED 2026-08-27**
 `pipeline/cli.py:29` parses the flag into `args.prep_crop`, but the
 `prepare_frames` call at `pipeline/orchestrator.py:202` omits both `crop=` and
 `output_size=`. The value is never read, so Stage 0 crops whatever the user asked
@@ -92,8 +98,13 @@ word. It is the second thing found in `orchestrator.py`'s Stage 0 call — the
 first was `stagerun.py` discarding the stage's output entirely.
 
 **Verified**, not inferred. Stubbing `prepare_frames` and running
-`run.py --no-prep-crop` shows the call arriving with exactly
+`run.py --no-prep-crop` showed the call arriving with exactly
 `band_heights, centre_on_subject, min_frames, pad, strict`.
+
+**Fixed:** `orchestrator.py` now threads `crop=` and `output_size=` through, via
+`getattr` so the two entry points cannot drift apart again if a flag is added to
+only one parser. Re-verified by the same stubbing method: the call now arrives
+with `crop=False` when the flag is passed.
 
 ---
 

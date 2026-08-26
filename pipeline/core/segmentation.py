@@ -43,7 +43,8 @@ def rgb_to_hsv(r, g, b):
 
 
 def marker_mask_by_contrast(colors_uint8, band_rgb, limb_rgb,
-                            threshold=0.5, val_floor=None):
+                            threshold=0.5, threshold_max=None, min_axis=None,
+                            val_floor=None):
     """Separate the band from the limb by what actually distinguishes them.
 
     Centring a colour window on the measured band was wrong, and measurably so:
@@ -80,17 +81,43 @@ def marker_mask_by_contrast(colors_uint8, band_rgb, limb_rgb,
     axis = band - limb
     denom = float(axis @ axis)
     if denom < 1e-9:
-        return np.zeros(len(colors_uint8), dtype=bool), {"n_markers": 0,
-                                                         "degenerate": True}
+        return None, {"n_markers": 0, "degenerate": True,
+                      "reason": "band and limb colours are identical"}
+
+    # Refuse an axis too short to discriminate, rather than measuring through
+    # it. The score divides by |axis|^2, so on a short axis every ordinary
+    # surface in the scene lands inside the window -- on inputs/sunshine
+    # (|axis| 0.031) a neutral grey scores +2.62 and the "marker" came out at
+    # 43,468 points. Returning None here hands detection back to the hand-tuned
+    # config window, which is a worse detector in principle and a better one on
+    # a capture whose learned colours cannot separate anything.
+    separation = float(np.sqrt(denom))
+    if min_axis is not None and separation < min_axis:
+        return None, {"n_markers": 0, "degenerate": True,
+                      "separation": round(separation, 4),
+                      "min_axis": min_axis,
+                      "reason": f"band/limb separation {separation:.4f} < "
+                                f"{min_axis} — the learned colours cannot "
+                                f"separate the band from the limb"}
     rgb = np.asarray(colors_uint8, dtype=np.float64)
     score = ((_chroma(rgb) - limb) @ axis) / denom
     mask = score > threshold
+    # The band scores 1.0 by construction, so a point well above 1.0 is further
+    # from the limb than the band is and cannot be the band. Without this the
+    # rule kept champ's grey shorts at 1.54 and cut the limb on them.
+    n_over = 0
+    if threshold_max is not None:
+        over = mask & (score > threshold_max)
+        n_over = int(over.sum())
+        mask &= score <= threshold_max
     if val_floor is not None:
         mask &= rgb.max(axis=1) > val_floor
     return mask, {
         "n_markers": int(mask.sum()),
-        "separation": round(float(np.sqrt(denom)), 4),
+        "separation": round(separation, 4),
         "threshold": threshold,
+        "threshold_max": threshold_max,
+        "n_over_max": n_over,
     }
 
 
@@ -377,8 +404,17 @@ def segment_point_cloud(pcd, height_axis="z", verbose=True,
         from pipeline import config as _cfg
         marker_mask, stats = marker_mask_by_contrast(
             colors, marker_colour["rgb"], marker_colour["limb_rgb"],
+            threshold_max=_cfg.MARKER_SCORE_MAX,
+            min_axis=_cfg.MARKER_MIN_AXIS,
             val_floor=_cfg.MARKER_VAL_MIN * 255.0 / 100.0)
-        if verbose:
+        if marker_mask is None and verbose:
+            print(f"    marker by contrast REFUSED: {stats.get('reason')} — "
+                  f"falling back to the config colour window")
+        elif verbose:
+            if stats.get("n_over_max"):
+                print(f"    contrast ceiling {stats['threshold_max']} dropped "
+                      f"{stats['n_over_max']:,} points scoring past the band "
+                      f"itself (clothing, floor, background)")
             print(f"    marker by contrast: band RGB "
                   f"{[int(v) for v in marker_colour['rgb']]} vs limb "
                   f"{[int(v) for v in marker_colour['limb_rgb']]}, "

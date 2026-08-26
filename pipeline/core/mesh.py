@@ -42,7 +42,17 @@ def is_closed(mesh):
         t = trimesh.Trimesh(np.asarray(mesh.vertices),
                             np.asarray(mesh.triangles), process=False)
         return bool(t.is_watertight)
-    except Exception:
+    except Exception as exc:
+        # Falling back to Open3D changes the DEFINITION, and this is the
+        # criterion the alpha ladder selects on. Open3D is stricter about
+        # vertex-manifoldness and disagrees with trimesh on meshes Stages 4-6
+        # all treat as closed, so a silent fallback can quietly change which
+        # mesh gets chosen -- and Stage 6 then integrates one that is not
+        # closed by the definition it uses.
+        print(f"  WARNING: trimesh watertight check failed "
+              f"({type(exc).__name__}: {exc}) — falling back to Open3D's "
+              f"is_watertight, which is a DIFFERENT definition from the one "
+              f"Stages 4-6 use")
         return bool(mesh.is_watertight())
 
 

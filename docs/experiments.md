@@ -23,9 +23,36 @@ Two changes failed this rule already:
 
 ## Ground truth available
 
+> ### UPDATED 2026-08-27 — held-out ground truth now exists
+>
+> Water displacement on five limb captures, against a **10 cm 3D-printed**
+> reference (`REFERENCE_REAL_SIZE_CM` now defaults to 10.0; the fixtures below
+> use 14 and need the env override). This is the experiment this file has
+> called for throughout, and it changes what "adopted" can mean: a change can
+> now be scored against a known physical quantity rather than against the
+> pipeline itself.
+>
+> | capture | measured | displacement | error |
+> |---|---|---|---|
+> | `orange shirt` | 4094 cm³ | 4090 | +0.1% |
+> | `keng` | 2249 cm³ | 2210 | +1.8% |
+> | `black shirt` | 3648 cm³ | 3510 | +3.9% |
+> | `sunshine` | 3093 cm³ | 3130 | −1.2% |
+> | `champ` | 3354 cm³ | 2810 | +19.4% — unresolved |
+>
+> **Mean absolute error 1.7% on four captures.** Two decisions this file left
+> open are settled by it: Stage 6 keeps M1 (`stage06_experiments.md`), and the
+> three deferred A/Bs below — E-ghost-steps, E-dedup-impl and the Stage 6 scale
+> question — can now be re-run against something external.
+>
+> The `14.0 cm` row below still describes the cardboard cube used by
+> `small_leg`, `short_leg` and `est_325`.
+
 | object | quantity | value | confidence |
 |---|---|---|---|
-| ArUco cube | edge | 14.0 cm | high — but only enters as an assertion, see below |
+| five limb captures | **water displacement** | 2210–4090 cm³ | **measured — the first held-out truth this project has** |
+| ArUco cube (printed) | edge | 10.0 cm | design dimension, not calipered; printed parts shrink 0.3–0.8% |
+| ArUco cube (cardboard) | edge | 14.0 cm | high — but only enters as an assertion, see below |
 | est_325 can | fill volume | 325 ml | **fill ≠ external displacement**; external likely 340–355 cm³, unmeasured |
 | est_325 can | height × diameter | — | **NOT YET MEASURED — highest-value open item** |
 | legs | — | none | shape plausibility only |
@@ -1349,3 +1376,131 @@ not fire, because Stage 4's ladder never emitted such a mesh.
 **Not tested.** Whether Poisson holds up on a *cut* limb from a second capture —
 both successes here are `small_leg` and both failures are the same uncut foot.
 That is the experiment that would settle whether the default is right.
+
+---
+
+## E-marker-gates — bounding the contrast rule, and gating planes before capping · 2026-08-27
+
+**Ground truth used:** water displacement on five captures. This is the first
+entry in this file scored against a known physical quantity rather than against
+the pipeline.
+
+**The failure.** On the six Aug 2026 captures the cut landed wrong on four. The
+plane fit was not at fault; the colour rule was selecting the wrong points.
+Stage 3 keeps `score > 0.5` along the limb→band chromaticity axis, with no upper
+bound. Measured on `champ` with its own learned colours: skin −0.06, floor +0.94,
+band 1.00, neutral grey +1.14, **grey shorts +1.54**.
+
+**Four changes, and which one mattered.**
+
+| change | constant | effect |
+|---|---|---|
+| refuse a short axis | `MARKER_MIN_AXIS = 0.05` | **the load-bearing one** — fires on all five captures |
+| bound the score above | `MARKER_SCORE_MAX = 1.5` | never fires on this corpus |
+| gate before capping | — | recovers the real band on champ and black shirt |
+| height floor in cube heights | `MARKER_MIN_HEIGHT_CUBES = 1.0` | transfers between captures where a span fraction cannot |
+| perpendicular to the limb | `MARKER_MAX_AXIS_ANGLE_DEG = 35` | separates genuine bands (2.4–27°) from false planes (53–89°) |
+
+The ceiling is worth singling out as a **negative result**: it changes nothing on
+any capture in hand. The axis check refuses first on all five, and on `small_leg`
+— the only capture that uses the learned path — a neutral grey scores −0.30 and
+was never near the window. Disabling the axis check to test it in isolation, the
+ceiling alone cuts champ's marker mask 8,854 → 4,629 points and still leaves
+clusters of 2,556 / 1,242 / 803, i.e. it would **not** have fixed the cut. Kept
+as a guard for a case no capture exercises; it should not be quoted as a fix.
+
+**Result:** mean absolute error 30.6% → **1.7%** on four captures. `sunshine`
+went +27.5% → −1.2%; `orange shirt` and `keng` did not move, which is the other
+half of the result — their cuts were already right and none of the new gates
+disturbed them. `small_leg`'s marker plane is bit-identical with Stage 2 held
+fixed.
+
+**A wrong implementation, caught by the truth table.** The perpendicularity gate
+first fitted the limb's axis as the principal direction of a thin slab of points.
+That returns the limb's *width*: a calf is ~10 cm across and a local slab is
+thinner, so the direction of greatest extent comes out horizontal. It passed a
+synthetic test on a narrow cylinder, then rejected the genuine bands on
+`orange_shirt` (53° "off axis") and `black_shirt` (65°), sending both from +0.1%
+and +4.4% to **+45.9% and +30.9%**. The axis now comes from slice centroids. A
+regression that size is invisible without ground truth, which is the argument for
+having it.
+
+**Not tested.** Whether `MARKER_SCORE_MAX = 1.5` is the right ceiling — no
+capture reaches it. Whether 35° holds for a band on a strongly bent limb.
+
+---
+
+## E-reference-probe — the cube as a reconstruction check · 2026-08-27
+
+**Question.** `inputs/blue shirt` produced a confident 5280 cm³ against a
+measured 3420 with **every gate passing**: Stage 0 rejected its cube-less frame,
+the corroboration rule discarded its marker colour, the deferred cut declined to
+cut. Each of those checks the capture or the cut. Nothing checks whether the
+geometry is right. Can the reference cube supply that, being the one object whose
+true shape is known and going through the identical pipeline?
+
+**Method.** Two candidate statistics on the Stage 5 cube mesh, across six
+captures: the fitted-face edge lengths against 10.00 cm nominal, and the mesh
+volume as a fraction of its own oriented bounding box.
+
+| capture | fitted-face edges (cm) | spread | fill |
+|---|---|---|---|
+| orange shirt | 9.57 / 10.27 / 10.34 | 7.6% | 0.874 |
+| keng | 9.77 / 10.05 / 10.40 | 6.3% | 0.873 |
+| black shirt | 9.88 / 9.90 / 10.31 | 4.3% | 0.873 |
+| sunshine | 9.68 / 10.14 / 10.31 | 6.3% | 0.891 |
+| champ | 9.96 / 9.96 / 10.25 | 2.9% | 0.876 |
+| **blue shirt** | 9.67 / 10.23 / 10.30 | 6.3% | **0.787** |
+
+**The edges do not separate it.** blue shirt's spread is mid-pack and its worst
+edge deviates 3.3% from nominal, less than orange shirt's 4.3%. **The fill ratio
+does**: the five sound captures span 1.8 percentage points and the bad one sits
+8.6 below all of them. The mechanism is straightforward — a dented or eroded
+surface keeps its bounding box and loses volume.
+
+**Adopted.** `REFERENCE_FILL_MIN = 0.83`, roughly halfway into the gap, as a
+loud warning in Stage 6 rather than an abort: the number is still produced and
+the run says plainly that it should not be trusted.
+
+**Honest limits.** n = 6, one of them bad, so the threshold is fitted to a single
+negative example. The statistic is physically motivated — a cube's fill ratio is
+a constant for a given corner rounding — but a second bad capture would be worth
+more than the argument.
+
+---
+
+## E-m10-tested — the parked calibration, finally measured · 2026-08-27
+
+**Why it had never run.** `pipeline/core/faces.py:fit_box_faces` clusters mesh
+triangles into faces greedily: seed on the largest remaining area direction,
+absorb everything within `tol_deg`, repeat. A sliver whose normal matches nothing
+claims only itself, so the loop ran one iteration per triangle, each rebuilding a
+(4000 × unclaimed) similarity matrix. On the Aug 2026 cubes (12–23k triangles) it
+did not finish in 90 s on **four of five**. M10 — the method
+`stage06_experiments.md` recommends adopting — had therefore never been executed
+on them.
+
+**Fix.** Stop once the unclaimed area falls below `min_area_frac`. A face must
+clear that fraction to be recorded at all, so no further iteration can produce
+one; this cannot skip a face the loop would otherwise find. **90 s+ → ~1 s**, and
+all five cubes yield 3 face pairs.
+
+**Result**, every derivation scored against all five truths:
+
+| derivation | orange | keng | black | sunshine | champ | mean abs, 4 |
+|---|---|---|---|---|---|---|
+| **M1 · cube volume (ships)** | +0.1% | +1.8% | +3.9% | −1.2% | +19.4% | **1.7%** |
+| M3b · shortest horizontal OBB | +1.5% | +0.3% | −1.3% | −2.5% | +11.3% | 1.4% |
+| M10b · fitted faces, all pairs | −1.6% | −0.4% | +3.0% | −2.4% | +17.4% | 1.8% |
+| **M10 · fitted faces, horizontals** | +2.6% | +4.7% | +7.4% | +1.6% | +20.8% | **4.1%** |
+| M3 · mean 2 horizontal OBB | −9.7% | −5.3% | −6.5% | −8.1% | +9.1% | 7.4% |
+
+**Verdict: keep M1.** The recommended replacement is more than twice as
+inaccurate. M3b edges M1 by 0.3 pp, which on n = 4 is inside the spread and is
+not a result.
+
+**And no calibration rescues champ.** The cube edge each capture would need to
+come out exact: orange 10.00, sunshine 9.96, keng 10.06, black 10.13, champ
+**10.61**. Four agree to ±1.3%; champ needs 6.1% more, from a cube that is the
+most square of the five. Every method that improves champ ruins the other four in
+proportion, which places the champ discrepancy outside Stage 6 entirely.

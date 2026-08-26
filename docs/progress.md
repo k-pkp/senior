@@ -2217,3 +2217,264 @@ The honest limits, which a proposal should state before someone else does.
   generalises to a red or blue band is argued from the mechanism, not shown.
 - **Three silent failure paths remain**, listed as open items 3, 4 and 5 in
   [`repo_review.md`](repo_review.md).
+
+---
+
+# Session log — 27 August 2026
+
+The first accuracy measurement this project has ever had, the defects it
+exposed, and what it settles.
+
+## 1. The reference changed, and that is what unblocked everything
+
+Captures from August 2026 use a **10 cm 3D-printed cube**, not the 14 cm
+handmade cardboard one. `REFERENCE_REAL_SIZE_CM` had been 14.0, so every volume
+from a 10 cm capture was inflated by `(14/10)³ = 2.74` with no visible sign —
+Stage 6 derives scale from the reference's own volume, so the cube reports its
+nominal whatever that nominal is.
+
+It now defaults to 10.0 and is overridable per run, because the older fixtures
+(`small_leg`, `short_leg`, `est_325`) still need 14:
+
+```python
+REFERENCE_REAL_SIZE_CM = float(os.environ.get("REFERENCE_REAL_SIZE_CM", 10.0))
+```
+
+The upgrade matters more than the number. This file has listed
+*"`REFERENCE_REAL_SIZE_CM` has never been measured"* as the item that **blocks
+everything**, because a taped cardboard cube carries a build error nobody can
+bound. A printed part does not, which is what makes an accuracy figure quotable
+at all.
+
+## 2. Ground truth exists: five water-displacement volumes
+
+| capture | measured | displacement | error |
+|---|---|---|---|
+| `orange shirt` | 4094 cm³ | 4090 | **+0.1%** |
+| `keng` | 2249 cm³ | 2210 | **+1.8%** |
+| `black shirt` | 3648 cm³ | 3510 | **+3.9%** |
+| `sunshine` | 3093 cm³ | 3130 | **−1.2%** |
+| `champ` | 3354 cm³ | 2810 | +19.4% — unresolved, §5 |
+| `blue shirt` | — | 3420 | capture unusable, §6 |
+
+**Mean absolute error 1.7% on four captures**, worst case 3.9%. Verified on a
+full cold run — Stage 0's detectors, a fresh VGGT pass, every stage after it —
+which reproduces the cached-Stage-1 numbers to seven significant figures.
+
+That ±1.7% sits on the ~1–2% surface-noise floor measured independently as local
+shell thickness. The two agreeing is corroboration; it also means the pipeline
+cannot currently resolve better than its own noise. n = 4, one subject class,
+one floor, one cord colour — repeatability, not generality.
+
+## 3. Four defects in marker detection, and what each was worth
+
+The first run of the new captures cut in the wrong place on four of six. Root
+cause was not the plane fit.
+
+**The contrast rule had a floor and no ceiling.** Stage 3 projects each point's
+chromaticity onto the line from the limb's colour to the band's and keeps
+`score > 0.5`. A score of 1.0 *is* the band, so anything well above it is
+further from the limb than the band is — which nothing on that limb can be.
+Measured on champ with its own learned colours: skin −0.06, floor tile +0.94,
+band 1.00, neutral grey +1.14, **the subject's grey shorts +1.54**. The shorts
+won the cut. `MARKER_SCORE_MAX = 1.5`.
+
+**A short axis was measured through rather than refused.** The score divides by
+`|axis|²`, so when band and limb sit close together every ordinary surface lands
+inside the window:
+
+```
+small_leg     0.0941   neutral grey scores −0.30   works
+black shirt   0.0433                       +1.12   grey selected
+champ         0.0323                       +1.14   grey selected
+sunshine      0.0308                       +2.62   the whole limb selected
+keng          0.0213                       +0.04   marginal
+```
+
+`MARKER_MIN_AXIS = 0.05` refuses that case and hands detection back to the
+config colour window. **This is the change that fixed the cuts**, and it fires
+on all five: the learned-colour path is switched off across the board on these
+captures, and the hardcoded window does the detecting. On champ it selects 262
+points of 81,859 — 0.3% of the limb — which DBSCAN splits into exactly the two
+bands, 194 and 68 points.
+
+> Stated plainly because it is uncomfortable: **the ±1.7% comes from the
+> hardcoded khaki window, not from the learned-colour work.** Before the
+> refusal existed the learned path was active and was the direct cause of four
+> bad cuts. See the note added to `updates.md` §3.
+
+**Candidate planes were capped by point count before being validated.**
+`clean.py` trimmed to the two best-supported by `npts`, then gated. That ranking
+prefers exactly the wrong thing — a real band is small because only its
+camera-facing arc reconstructs. On champ the genuine 964-point band was dropped
+in favour of the 5,265-point shorts. Gating now runs first.
+
+**The height floor could not transfer between captures.**
+`MARKER_MIN_HEIGHT_FRAC = 0.20` is a fraction of the limb's own span, and the
+span is not a property of the subject — it is however much leg was in shot. The
+same physical ankle band sits at 44% of the span on `small_leg` and 18% on
+these. `MARKER_MIN_HEIGHT_CUBES = 1.0` measures it in reference-cube heights
+instead, which is one physical length.
+
+## 4. A new gate: is the plane perpendicular to the limb?
+
+A cord tied round a limb lies across it, so the plane's normal points along the
+limb. A plane fitted to a blob of skin or clothing takes the blob's own
+orientation. This is the only test that catches such a plane — it can be large,
+well clustered and at a plausible height:
+
+```
+GENUINE BANDS                    FALSE PLANES
+  keng        208 pts   5.8°       champ shorts   5 265 pts  70.5°
+  champ knee  964 pts   9.2°       champ floor    2 597 pts  53.2°
+  black ankle 299 pts   9.2°       black arch       360 pts  55.1°
+  black knee 1 094 pts 27.0°       keng blob      1 501 pts  88.6°
+                                   sunshine      43 468 pts  86.8°
+```
+
+`MARKER_MAX_AXIS_ANGLE_DEG = 35`, with 8° of margin below and 18° above.
+
+**The first implementation was wrong, and the ground-truth table is what caught
+it.** Fitting the limb's axis as the principal direction of a thin slab of
+points returns the limb's *width*: a calf is ~10 cm across, and a slab thin
+enough to be local is thinner than that, so its greatest-extent direction comes
+out horizontal. It passed a synthetic test on a narrow cylinder and then
+rejected the genuine bands on `orange_shirt` (53° "off axis") and `black_shirt`
+(65°), sending both from +0.1% and +4.4% to +45.9% and +30.9%. A regression that
+size is invisible without a scoreboard. The axis now comes from **slice
+centroids** — divide a window of the limb into slices, take each centroid, fit a
+line through them — which sits on the centre line whatever the cross-section
+looks like.
+
+## 5. Which planes cut is now stated, not inferred
+
+`MARKER_CUT_MODE = "upper"`. The displacement volumes were taken
+foot-to-upper-band, so the cut has to be foot-to-upper-band or the pipeline is
+answering a different question from the ruler. That was previously emergent: a
+two-band capture became a "keep between" cut purely because two bands were
+found. Both bands are still detected, published and drawn for review; only the
+upper one cuts.
+
+## 6. champ, unresolved
+
+Its cut is the best-aligned of the five — 194 points, 42.6 cm above the floor,
+**2.4°** off the limb's own axis — and its cube the second most cubic. Yet it
+reads +19.4%.
+
+2.81 L matches no segment its markers define. Reconstructing the uncut limb and
+measuring every one:
+
+```
+below the UPPER band (what ships)   3379 cm³   +20.2%
+BETWEEN the two bands               2377 cm³   −15.4%
+foot alone, below the lower band    1002 cm³
+```
+
+A continuous sweep puts 2810 cm³ at a boundary **35.6 cm** above the floor —
+mid-shin, 7 cm below the knee band, where there is no marker. The other four
+corroborate their band positions to 1–2 cm.
+
+Three explanations tested and rejected: not the cut (best-aligned of the five),
+not the reference (fitted faces read 9.96 / 9.96 / 10.25 cm, the most square in
+the set), not surface noise (shell 0.57 mm against 0.42–0.68 mm across the set).
+What the numbers do say is that champ's limb reconstructs about **9% wider in
+circumference** than 2.81 L over that length implies — 30.3 cm against 27.8 —
+and 9% on a diameter is 19% on a volume, which is the whole discrepancy.
+
+A tape measure round the calf at a marked height separates "reconstructs wide"
+from "truth is wrong", costs a minute, and is independent of both the water and
+the cube.
+
+## 7. blue shirt: the failure no gate catches
+
+Excluded at its owner's instruction —
+[`inputs/blue shirt/UNUSABLE.md`](../inputs/blue%20shirt/UNUSABLE.md). VGGT's
+reconstruction is wrong, so nothing downstream can correct it.
+
+What is worth keeping is that **the run still produced a confident 5280 cm³ with
+every gate passing.** Stage 0 rejected the frame with no cube, the corroboration
+rule discarded a marker colour found on 4 of 7 frames, the deferred cut declined
+to cut. Every one of those checks the *capture* or the *cut*. None checks the
+*reconstruction*.
+
+So Stage 6 now runs one that does. The cube is the only object whose true shape
+is known and it goes through the identical pipeline as the subject:
+
+```
+orange shirt  0.874     sunshine    0.891
+keng          0.873     champ       0.876
+black shirt   0.873     blue shirt  0.787   <- flagged
+```
+
+`REFERENCE_FILL_MIN = 0.83` — mesh volume over its own oriented box. The five
+sound captures span 1.8 percentage points; the bad one sits 8.6 below all of
+them. Note what does *not* separate them: the cube's edge lengths. blue shirt's
+read 9.67 / 10.23 / 10.30 cm, squarely mid-pack. A dented surface keeps its
+bounding box and loses volume.
+
+## 8. Stage 6 is settled: keep M1
+
+`stage06_experiments.md` says the deciding experiment cannot be run. It can now.
+Every derivation scored against all five truths at once:
+
+| derivation | mean abs error, 4 captures |
+|---|---|
+| **M1 · calibrate on the cube's volume — ships** | **1.7%** |
+| M3b · shortest horizontal OBB edge | 1.4% |
+| M10b · fitted faces, all three pairs | 1.8% |
+| M3 · mean of two horizontal OBB edges | 7.4% |
+| **M10 · fitted faces, horizontals — the recommendation** | **4.1%** |
+
+M10 is more than twice as inaccurate as the method it was written to replace.
+The epistemic objection to M1 stands untouched — it forces the reference to
+report its own nominal — but the error bar now comes from held-out objects,
+which exist, rather than from a calibration that measures worse.
+
+**No calibration can rescue champ.** The cube edge each capture would need to
+come out exact: orange 10.00, sunshine 9.96, keng 10.06, black 10.13, **champ
+10.61**. Four agree to ±1.3%; champ needs 6.1% more, and its cube is not
+anomalous. Every method that improves champ ruins the other four in proportion.
+
+`fit_box_faces` had to be fixed before M10 could be tested at all: its greedy
+loop peeled one sliver at a time, rebuilding a 4000×N similarity matrix per
+iteration, and did not finish in 90 s on four of five cubes. It now stops once
+the unclaimed area cannot reach `min_area_frac`, which cannot skip a face it
+would otherwise find. 90 s+ → ~1 s.
+
+## 9. Every open item in `repo_review.md` is closed
+
+Items 3, 4 and 5 — the three latent silent failures — and item 11, the ignored
+flag. Each now names its exception and what the fallback costs; `orchestrator.py`
+threads `crop=` and `output_size=` through so `run.py --no-prep-crop` works.
+
+## 10. Corrections to this record
+
+**`small_leg` no longer reads 1081.94 cm³.** Two cold runs on the current tree
+give **1067.57**, reproducible to seven significant figures with the same 284
+marker points. The difference is upstream of Stage 3: the archived
+`work/verify_full` accepted 5 of 6 frames where the current Stage 0 accepts 6,
+which is the verdict redesign this file records under E-stage0-verdicts. The
+archive predates it. With Stage 2 held fixed the marker plane is bit-identical,
+so none of the 2026-08-27 changes moved it. **Every 1081.94 in these documents
+is a figure from the older tree.**
+
+**The two entry points agree to 7 significant figures, not bit-for-bit.**
+`run.py` reads 2249.0995 on `keng` where `stagerun.py` reads 2249.0992, a
+relative difference of 1.3 × 10⁻⁷. Two runs of the *same* entry point differ by
+2–3 × 10⁻⁷, so the entry points agree as closely as a run agrees with itself.
+The standing regression test passes in substance; "bit-identical" is no longer
+literally true, and the likely source is thread scheduling inside Open3D's
+Poisson solve.
+
+## 11. Still open
+
+- **champ**, above. One tape measure settles which side is wrong.
+- **`REFERENCE_REAL_SIZE_CM = 10.0` is a design dimension**, not a caliper
+  reading. Printed parts shrink 0.3–0.8%; at 10 cm a 2 mm error is 6.1% of
+  volume, which would dominate the 1.7% residual.
+- **`dilate` is still specified in pixels.** Deriving it from the cord's own
+  measured width is the right fix, but it changes the learned colour on every
+  capture including the ones now reading +0.1%, so it wants doing separately
+  against the truth table.
+- **n = 4.** A fifth and sixth capture would tell you whether 1.7% is the
+  pipeline or this subject.

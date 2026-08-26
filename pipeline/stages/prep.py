@@ -262,8 +262,19 @@ def _cube_bbox(gray, image_pil=None, dict_name=REFERENCE_MARKER_DICT):
     if image_pil is not None:
         try:
             det, _score = vlm.detect(image_pil, vlm.BOX_PROMPT)
-        except Exception:
+        except Exception as exc:
+            # Say so. This is the one swallowed exception in the pipeline that
+            # makes a GATE MORE PERMISSIVE: without the detector the union is
+            # the face quads alone, which is SMALLER than the true silhouette
+            # (by 22-90 px per frame on inputs/small_leg). A smaller cube box
+            # fits inside the crop window more easily, so a frame that should
+            # be warned about can pass instead -- and the whole purpose of
+            # Stage 0 is to refuse a clipped reference.
             det = None
+            print(f"    WARNING: cube detector failed ({type(exc).__name__}: "
+                  f"{exc}) — the cube box falls back to the ArUco faces alone, "
+                  f"which UNDER-covers the cube, so this frame's framing check "
+                  f"is more permissive than it should be")
         if det is not None:
             box = np.array([min(box[0], det[0]), min(box[1], det[1]),
                             max(box[2], det[2]), max(box[3], det[3])])

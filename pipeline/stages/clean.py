@@ -17,7 +17,9 @@ from pipeline.core.plane import (
 from pipeline.core.cluster import detect_top_k_objects
 from pipeline.core.segmentation import (segment_point_cloud, apply_marker_cut,
                                         MAX_MARKERS)
-from pipeline.config import MARKER_MIN_HEIGHT_FRAC
+from pipeline.config import (MARKER_MIN_HEIGHT_FRAC, MARKER_MIN_HEIGHT_CUBES,
+                             MARKER_CUT_MODE,
+                             MARKER_MAX_AXIS_ANGLE_DEG)
 from pipeline.core.fill import (
     cap_point_cloud_bottom,
     cap_points_on_plane,
@@ -116,6 +118,74 @@ def _detect_marker_planes(object_cluster, height_axis, marker_colour):
     except Exception as e:
         print(f"  Marker detection skipped: {e}")
     return markers
+
+
+def _limb_axis_near(leg_pts_rot, z, window_frac=0.25, n_slices=10, min_pts=8):
+    """The limb's own direction near height `z`, from slice centroids.
+
+    Fitting the principal direction of a slab of limb points does NOT give the
+    limb's axis, and getting that wrong rejects real bands. A calf is roughly
+    10 cm across; a slab thin enough to be local is thinner than that, so its
+    direction of greatest extent is the limb's WIDTH and comes out horizontal.
+    Measured consequence: genuine bands on inputs/orange_shirt and black_shirt
+    scored 53 and 65 degrees "off the limb axis" and were thrown out.
+
+    Slice centroids do not have that failure. Each centroid sits on the limb's
+    centre line whatever the cross-section looks like, so a line through them
+    follows the limb however wide it is. This is the same construction the
+    band-colour experiment used to fit a limb axis.
+
+    Returns a unit vector, or None when there are too few usable slices.
+    """
+    pts = np.asarray(leg_pts_rot, dtype=np.float64)
+    lo, hi = float(pts[:, 2].min()), float(pts[:, 2].max())
+    span = hi - lo
+    if span <= 0:
+        return None
+
+    for widen in (1.0, 1.6, 2.4):
+        half = window_frac * widen * span
+        z0, z1 = max(lo, z - half), min(hi, z + half)
+        if z1 - z0 <= 0:
+            continue
+        edges = np.linspace(z0, z1, n_slices + 1)
+        centroids = []
+        for a, b in zip(edges[:-1], edges[1:]):
+            sel = pts[(pts[:, 2] >= a) & (pts[:, 2] < b)]
+            if len(sel) >= min_pts:
+                centroids.append(sel.mean(axis=0))
+        if len(centroids) >= 4:
+            c = np.asarray(centroids)
+            _, _, Vt = np.linalg.svd(c - c.mean(axis=0), full_matrices=False)
+            axis = Vt[0, :]
+            return axis / (np.linalg.norm(axis) + 1e-12)
+    return None
+
+
+def _plane_vs_limb_angle(leg_pts_rot, marker):
+    """Angle in degrees between a marker plane's normal and the limb's axis.
+
+    A cord tied round a limb lies across it, so its plane's normal points along
+    the limb and this angle is small. A plane fitted to a blob of skin or
+    clothing takes that blob's own orientation instead, and this is the only
+    test that sees the difference — the blob can be large, well clustered and
+    at a perfectly plausible height.
+
+    The axis is fitted locally, near the plane's own height, because a limb is
+    not straight: a global axis would score a band on the shin against the mean
+    of shin and thigh and reject it for the bend rather than for being wrong.
+
+    Returns None when the limb is too sparse there to fit an axis, which means
+    "do not judge" rather than pass or fail.
+    """
+    axis = _limb_axis_near(leg_pts_rot, float(marker["centroid"][2]))
+    if axis is None:
+        return None
+    n = np.asarray(marker["normal"], dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    # Both directions are sign-free, so compare with |dot|.
+    cos = abs(float(np.dot(n, axis)))
+    return float(np.degrees(np.arccos(min(1.0, cos))))
 
 
 def _save_cluster_debug(debug_dir, object_cluster, box_cluster, markers):
@@ -384,13 +454,17 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     leg_no_cut_path = os.path.join(objects_dir, "leg_no_cut.ply")
     markers_rotated = []
     if len(markers) > 0:
-        # A limb segment is bounded by at most two cuts, so only the two
-        # best-supported markers can matter; a third can only contradict one of
-        # them. Trim here rather than in the cut so the published planes, the
-        # cross-section caps and the cut all see the same set.
-        if len(markers) > MAX_MARKERS:
-            markers = sorted(markers, key=lambda m: -m.get("npts", 0))[:MAX_MARKERS]
-            print(f"Markers: keeping the {MAX_MARKERS} best-supported")
+        # Rotate EVERY candidate first, gate them, and only then cap the count.
+        #
+        # The cap used to run first, keeping the two with the most points. That
+        # ranking prefers exactly the wrong thing: a real band is small because
+        # only its camera-facing arc reconstructs -- 964 points on inputs/champ,
+        # 299 on black_shirt, 208 on keng -- while a false plane fitted to
+        # clothing or floor is thousands. On champ the genuine band (964 pts)
+        # was dropped in favour of the shorts (5,265) and a floor-junction blob
+        # (2,597); the height gate then removed the blob and the cut ran on the
+        # shorts alone. Nothing had looked at either survivor before the real
+        # one was discarded.
         for m in markers:
             cen = np.array(m["centroid"])
             norm = np.array(m["normal"])
@@ -408,19 +482,77 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
         # runs in original VGGT space, where the vertical axis is whatever the
         # camera happened to give (on small_leg the limb's long axis is Y, not
         # Z). Only after R_total does "height" mean height.
-        frac = MARKER_MIN_HEIGHT_FRAC
-        if frac > 0 and len(leg_pts_rot) > 0 and len(markers_rotated) > 0:
+        if len(leg_pts_rot) > 0 and len(markers_rotated) > 0:
             lo = float(leg_pts_rot[:, 2].min())
             span = float(leg_pts_rot[:, 2].max()) - lo
-            if span > 0:
+            # Prefer a floor measured in reference-cube heights: the cube is a
+            # known physical length standing on the same ground, where the
+            # limb's span is only however much leg was in shot.
+            cube_h = (float(box_pts_rot[:, 2].max() - box_pts_rot[:, 2].min())
+                      if len(box_pts_rot) > 10 else 0.0)
+            if cube_h > 0 and MARKER_MIN_HEIGHT_CUBES > 0:
+                min_z = lo + MARKER_MIN_HEIGHT_CUBES * cube_h
+                rule = (f"< {MARKER_MIN_HEIGHT_CUBES:g} cube height"
+                        f"{'s' if MARKER_MIN_HEIGHT_CUBES != 1 else ''} "
+                        f"({cube_h:.3f}) above the floor")
+            elif span > 0 and MARKER_MIN_HEIGHT_FRAC > 0:
+                min_z = lo + MARKER_MIN_HEIGHT_FRAC * span
+                rule = (f"< {MARKER_MIN_HEIGHT_FRAC*100:.0f}% of the limb's "
+                        f"span — no cube to measure against")
+            else:
+                min_z = None
+            if min_z is not None:
                 keep_m, drop_m = [], []
                 for mr in markers_rotated:
-                    h = (mr["centroid"][2] - lo) / span
-                    (keep_m if h >= frac else drop_m).append((mr, h))
-                for mr, h in drop_m:
-                    print(f"  Marker rejected: {h*100:.0f}% of height "
-                          f"(< {frac*100:.0f}%), {mr['npts']} pts")
-                markers_rotated = [mr for mr, _ in keep_m]
+                    (keep_m if mr["centroid"][2] >= min_z else drop_m).append(mr)
+                for mr in drop_m:
+                    h = (mr["centroid"][2] - lo) / span if span > 0 else 0.0
+                    print(f"  Marker rejected: {h*100:.0f}% of height, "
+                          f"{rule}, {mr['npts']} pts")
+                markers_rotated = keep_m
+
+        # Drop planes that are not perpendicular to the limb.
+        #
+        # A cord tied round a limb lies across it, so the plane's normal points
+        # along the limb. A plane fitted to a blob of skin or clothing instead
+        # takes that blob's own principal direction, which is unrelated -- and
+        # this is the only test that sees the difference, because the blob can
+        # be large, well-clustered and at a perfectly plausible height. Measured
+        # false planes: 87.4 deg on sunshine (43,468 pts), 83.1 on keng,
+        # 41.5 on champ's shorts, against 15.7-19.5 deg for every genuine band.
+        if len(markers_rotated) > 0 and len(leg_pts_rot) > 20:
+            keep_m, drop_m = [], []
+            for mr in markers_rotated:
+                ang = _plane_vs_limb_angle(leg_pts_rot, mr)
+                (drop_m if (ang is not None and ang > MARKER_MAX_AXIS_ANGLE_DEG)
+                 else keep_m).append((mr, ang))
+            for mr, ang in drop_m:
+                print(f"  Marker rejected: {ang:.0f}° off the limb's own axis "
+                      f"(> {MARKER_MAX_AXIS_ANGLE_DEG:.0f}°), {mr['npts']} pts")
+            markers_rotated = [mr for mr, _ in keep_m]
+
+        # Select which validated planes actually cut. Done LAST, once every
+        # survivor has passed the gates above, and here rather than inside the
+        # cut so the published planes, the cross-section caps and the cut all
+        # see the same set.
+        #
+        # MARKER_CUT_MODE decides, because the number of cuts is a property of
+        # what was measured rather than of how many bands the detector found. A
+        # subject wearing an ankle band and a knee band is one capture whether
+        # the ruler measured the whole leg below the knee or only the segment
+        # between the two, and guessing from the band count answers a different
+        # question from the one the ground truth answers.
+        if len(markers_rotated) > 1:
+            ordered = sorted(markers_rotated, key=lambda m: m["centroid"][2])
+            if MARKER_CUT_MODE == "upper":
+                markers_rotated = [ordered[-1]]
+                dropped = ", ".join(f"{m['npts']} pts" for m in ordered[:-1])
+                print(f"  Markers: {len(ordered)} valid — cutting on the "
+                      f"UPPERMOST only (keep below); not cutting on {dropped}")
+            else:
+                markers_rotated = [ordered[0], ordered[-1]]
+                print(f"  Markers: {len(ordered)} valid — keeping the outermost "
+                      f"{MAX_MARKERS} (keep between)")
 
         # Also publish the planes in LEVELLED space. cutting_line.json is written
         # pre-levelling, but leg_no_cut.ply is post-levelling, so the two do not

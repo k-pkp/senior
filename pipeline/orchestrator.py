@@ -199,10 +199,18 @@ def main():
         if getattr(args, "prep", True):
             from pipeline.stages.prep import prepare_frames
             prep_images = os.path.join(stage_dirs[0], "images")
+            # crop= and output_size= are threaded through deliberately.
+            # They used to be omitted here while stagerun.py passed both, so
+            # `run.py --no-prep-crop` parsed the flag, stored it, and cropped
+            # anyway -- the same flag worked on one entry point and not the
+            # other, silently. getattr keeps this in step if either flag is
+            # added to only one of the two parsers again.
             manifest = prepare_frames(args.image_folder, prep_images,
                            band_heights=args.prep_band, pad=args.prep_pad,
                            centre_on_subject=args.prep_recentre,
                            strict=args.prep_strict,
+                           crop=getattr(args, "prep_crop", True),
+                           output_size=getattr(args, "prep_size", 518),
                            min_frames=args.prep_min_frames)
             inference_input = prep_images
             # Stage 3 uses the colour Stage 0 measured, so a marker of any

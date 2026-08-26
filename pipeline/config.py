@@ -1,9 +1,28 @@
 """Pipeline-wide configuration constants."""
 
+import os
+
 # Stage 6 volume calibration
 # The ArUco marker is identified as the "obj" cluster (non-box).
 # REFERENCE_REAL_SIZE_CM is the real-world linear size of the ArUco marker cube.
-REFERENCE_REAL_SIZE_CM = 14.0     # real linear size of reference in cm
+#
+# There are TWO physical cubes, and using the wrong one rescales every reported
+# volume by (a/b)**3 with no visible sign:
+#
+#     10.0 cm   3D-printed cube      captures from Aug 2026 onward
+#                                    (champ, sunshine, keng, *_shirt)
+#     14.0 cm   handmade cardboard   the original fixtures
+#                                    (small_leg, short_leg, est_325)
+#
+# The default follows the current hardware. Override per run for the older
+# captures rather than editing this line:
+#
+#     REFERENCE_REAL_SIZE_CM=14 python stagerun.py 6 --name small_leg
+#
+# Neither value has been verified with calipers. A 2 mm build error is 2.0%
+# linear on the 10 cm cube = 6.1% of volume on every result, which is larger
+# than it was on the 14 cm one (1.4% linear, 4.3% volume).
+REFERENCE_REAL_SIZE_CM = float(os.environ.get("REFERENCE_REAL_SIZE_CM", 10.0))
 
 # Stage 2 multi-view consistency
 #
@@ -75,10 +94,103 @@ MARKER_VAL_MIN = 15.0     # percent; below this hue is noise
 # Raising this to 15 silently lost the only real marker in the dataset.
 MARKER_EXG_MIN = 10
 
-# Reject marker planes found in the bottom fraction of the object's height.
-# Feet, shadows under the arch and the floor junction all live there, and a cut
-# line placed that low would discard nearly the whole limb. Set to 0 to disable.
+# Reject marker planes found low on the object. Feet, shadows under the arch
+# and the floor junction all live there, and a cut line placed that low would
+# discard nearly the whole limb.
+#
+# The floor is expressed in REFERENCE CUBE HEIGHTS above the ground, not as a
+# fraction of the limb's own span, because the span is not a property of the
+# subject -- it is however much leg happened to be in shot. On inputs/small_leg
+# the cluster is a calf and a foot; on the Aug 2026 captures it runs from the
+# floor to mid-thigh, so the same physical ankle band sits at 44% of the span
+# in one and 18% in the other. A fraction rule cannot hold both. The cube is a
+# known 10 cm standing on the same floor, so one cube height is one physical
+# length that transfers between captures.
+#
+# Measured on the Aug 2026 captures: the cube is 15-17% of the limb span, and
+# the genuine ankle bands sit at 18.2% (champ) and 18.3% (black shirt) -- above
+# one cube height, below the old 20% fraction, and rejected by it. The false
+# planes it exists to catch are the floor junction at 6.8% and the arch at 7%,
+# well under one cube height.
+MARKER_MIN_HEIGHT_CUBES = 1.0
+
+# Which of the validated marker planes the cut actually uses.
+#
+#     "upper"  keep everything BELOW the highest valid plane
+#     "span"   keep what lies BETWEEN the lowest and highest valid planes
+#
+# This is not something to infer from how many bands the detector happens to
+# find. It is a statement about what the operator measured, and it has to match
+# or the pipeline is answering a different question from the ruler. The Aug 2026
+# displacement volumes were taken foot-to-upper-band, so "upper" is what the
+# reported numbers are comparable against; a capture wearing two bands still
+# gets both detected, published and drawn for review, but only the upper one
+# cuts.
+#
+# Switch to "span" when the physical measurement is of a segment bounded at both
+# ends -- and re-measure the ground truth the same way when you do.
+MARKER_CUT_MODE = "upper"
+
+# Fallback for MARKER_MIN_HEIGHT_CUBES when no reference cube was segmented.
+# Set either to 0 to disable the gate.
 MARKER_MIN_HEIGHT_FRAC = 0.20
+
+# Upper bound on the band/limb contrast score. See marker_mask_by_contrast.
+#
+# The score is 0 at the limb's measured colour and 1 at the band's, so a real
+# marker sits near 1. Anything well above 1 is FURTHER from the limb than the
+# band is, along the band's own axis -- which no marker on that limb can be.
+# The rule had a floor and no ceiling, and that is what let it select clothing
+# and floor tile. Measured on inputs/champ, using its own learned colours:
+#
+#     skin           -0.06     correctly rejected
+#     floor tile     +0.94     selected
+#     the band       +1.00     by definition
+#     neutral grey   +1.14     selected
+#     grey shorts    +1.54     selected -- 5,265 points, and it won the cut
+#
+# 1.5 keeps a full half-width of slack above the band for shading and view
+# angle while excluding the shorts. On inputs/small_leg nothing between 0.5
+# and 1.5 changes, because its axis is long enough that neutral surfaces score
+# -0.30 and never approached the window.
+MARKER_SCORE_MAX = 1.5
+
+# Shortest usable band-vs-limb separation, in chromaticity.
+#
+# The score divides by |axis|^2, so a short axis magnifies every score and the
+# window above stops separating anything. Measured |axis|, with what a neutral
+# grey then scores:
+#
+#     small_leg     0.0941   -0.30   works
+#     black shirt   0.0433   +1.12   grey selected
+#     champ         0.0323   +1.14   grey selected
+#     sunshine      0.0308   +2.62   the whole limb selected
+#     keng          0.0213   +0.04   marginal
+#
+# Below this the learned colour is refused and detection falls back to the
+# hand-tuned config window, which is what inputs/orange_shirt already does --
+# and orange_shirt is the most accurate capture in the set. Refusing loudly
+# beats measuring through a discriminant that cannot discriminate.
+MARKER_MIN_AXIS = 0.05
+
+# Maximum angle, in degrees, between a marker plane's normal and the limb's own
+# axis at that height.
+#
+# A cord tied round a limb lies perpendicular to it, so the plane's normal
+# should point along the limb. This is a shape test rather than a colour one,
+# and it is the only gate that catches a plane fitted to a large blob of skin:
+# such a plane takes the blob's own principal direction, which has nothing to
+# do with the limb. Measured, against each capture's own limb axis:
+#
+#     black shirt band   17.3 deg from vertical   -> valid, and +4.4% vs truth
+#     keng band          15.7 deg                 -> valid, and +1.9% vs truth
+#     keng false plane   83.1 deg                 -> rejected
+#     sunshine, only     87.4 deg, 43,468 pts     -> rejected
+#     champ shorts       41.5 deg,  5,265 pts     -> rejected
+#
+# 35 deg is generous: it admits every genuine band measured so far with at
+# least 12 degrees to spare, and excludes every false one by at least 6.
+MARKER_MAX_AXIS_ANGLE_DEG = 35.0
 
 # Minimum points in a marker cluster before a plane is fitted to it.
 #

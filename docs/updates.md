@@ -28,6 +28,7 @@ until a person has confirmed where the subject ends.
 | where the cut happens | automatic, unreviewable | detected, then confirmed by a person |
 | wall clock | 136.7 s | **80 s** |
 | front end | none | browser app + GPU service |
+| **accuracy against water displacement** | **never measured** | **1.7% mean absolute error, 4 captures** |
 
 ---
 
@@ -136,6 +137,27 @@ the limb's colour from the same columns. Stage 3 builds a discriminant from the
 
 **Why this is an improvement.** Two reasons, and only the second is about
 accuracy.
+
+> ### Measured against ground truth, 2026-08-27 — this section overstates what
+> the learned colour delivers
+>
+> On the six Aug 2026 captures the learned path is **refused on every one of
+> them** and detection falls back to the hardcoded config window this section
+> argues against. The band-to-limb separation it depends on measures 0.021–0.043
+> in chromaticity where `small_leg` measures 0.094, and below about 0.05 the
+> discriminant selects clothing and floor tile as readily as cord — it put
+> champ's grey shorts at 1.54 against the band's own 1.00.
+>
+> Before that refusal existed the learned path was active, and it was the direct
+> cause of four bad cuts. The pipeline's ±1.7% against measured displacement
+> comes from the hardcoded window, not from this work.
+>
+> The mechanism below is still sound and the failure is understood — an olive
+> cord on tan skin at 1108 px is a genuinely hard case, and a saturated band
+> would roughly triple the separation. But **"a differently coloured cord works
+> without a code change" is not demonstrated by any capture in hand**, and on
+> this evidence the learned detector has not yet earned its place over the one
+> it replaced.
 
 The first is that the detector no longer depends on the marker being khaki. What
 is learned is the direction in colour space that separates *this* band from *this*
@@ -394,7 +416,7 @@ Some properties worth knowing:
 | change | why it is an improvement |
 |---|---|
 | **Watertightness verified with `trimesh.load(process=False)`** | the default merge welds PyMeshFix's intentional seam duplicates and reports an *open* mesh as watertight. The check was passing on meshes that were not closed |
-| **Marker detection restricted to the upper 60% of the limb's span** | the foot is wider than the calf; searching the whole span let the widest cross-section pull the plane down the leg |
+| ~~**Marker detection restricted to the upper 60% of the limb's span**~~ | **WITHDRAWN 2026-08-27 — this was never implemented.** The only height rule in the code was `MARKER_MIN_HEIGHT_FRAC`, a floor at 20% of the span, and a floor cannot do what this row claims. It has since been replaced by a floor measured in reference-cube heights, plus a perpendicular-to-the-limb gate, both in `pipeline/stages/clean.py`. |
 | **The alpha ladder reports its fallback** | when no rung is both closed and χ = 2 it ranks candidates and says so, instead of silently returning something open |
 | **`--seed` seeds `random`, NumPy, PyTorch and Open3D** | Stage 3 is reproducible bit-for-bit, which is what makes an A/B of one constant meaningful |
 | **Licence handling is explicit** | the default checkpoint is gated; without a token the pipeline falls back **loudly** to `facebook/VGGT-1B`, which is CC BY-NC-SA and not licensed for commercial use. `main` had no such notice |
@@ -406,9 +428,26 @@ Some properties worth knowing:
 
 Stated here so this file cannot be read as more than it is.
 
-- **There is still no independent ground truth.** Every accuracy figure in this
-  document is the system checking itself, or one method against another. Water
-  displacement on a held-out object is the missing experiment.
+- ~~**There is still no independent ground truth.**~~ **Closed 2026-08-27.**
+  Water displacement on five limb captures now exists, and the pipeline reads
+  **1.7% mean absolute error** on the four that resolve. See
+  [`progress.md`](progress.md) session log, 27 August. What replaces this
+  caveat is a narrower one: n = 4, one subject class, one floor, one cord
+  colour, and every figure conditional on the printed cube really being
+  10.00 cm.
+- **One capture is unresolved.** `champ` reads +19.4% with a cut 2.4° off the
+  limb's own axis and the most square cube in the set, and its 2.81 L matches
+  neither segment its two bands bound. Not the cut, not the reference, not
+  surface noise.
+- **One capture is unusable.** `inputs/blue shirt` — VGGT's reconstruction is
+  wrong. It produced a confident number with every gate passing, which is what
+  prompted the reference-fill check now in Stage 6.
+- ~~**Stage 6 is reverted to `main`'s version**, pending review.~~ **Resolved
+  2026-08-27: `main`'s version stays**, on measurement — 1.7% mean absolute
+  error against 4.1% for the parked fitted-face method. The epistemic objection
+  below still stands; the error bar now comes from held-out objects instead.
+  Original text follows.
+
 - **Stage 6 is reverted to `main`'s version**, pending review by that stage's
   author. So the scale is still derived from the reference cube's own volume,
   which means **the cube reports exactly 2744.00 cm³ on every run — an identity,

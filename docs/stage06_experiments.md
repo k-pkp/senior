@@ -78,6 +78,36 @@ Plus an independent voxel occupancy cross-check alongside the exact value.
 
 ---
 
+> ## RESOLVED 2026-08-27 — measured against five held-out ground truths
+>
+> This file's central claim is that the deciding experiment cannot be run,
+> because there is no object with independent truth. Five now exist: water
+> displacement on five limb captures. Every derivation in the history below was
+> scored against all five at once, and **the recommendation does not survive.**
+>
+> | derivation | mean abs error, 4 captures |
+> |---|---|
+> | **M1 · calibrate on the cube's volume — what ships** | **1.7%** |
+> | M3b · shortest horizontal OBB edge | 1.4% |
+> | M10b · fitted faces, all three pairs | 1.8% |
+> | M3 · mean of two horizontal OBB edges | 7.4% |
+> | **M10 · fitted faces, horizontals — this file's recommendation** | **4.1%** |
+>
+> M10 is more than twice as inaccurate as the method it was written to replace.
+> M3, the OBB form of the same idea, is four times worse. **Keep M1.**
+>
+> The *epistemic* objection to M1 in this file stands untouched and is still
+> correct: calibrating on the reference's own volume forces it to report its
+> nominal, so the pipeline cannot state an error bar on itself. What has changed
+> is where the error bar should come from — held-out objects, which now exist,
+> rather than a different calibration, which measures worse.
+>
+> Two notes on the testing itself. `fit_box_faces` did not terminate on four of
+> the five cubes until its face-clustering loop was given a stopping condition
+> (2026-08-27), so M10 had never actually run on them. And M3b beating M1 by
+> 0.3 pp on n = 4 is not a result — it is inside the spread and should not be
+> adopted without more captures.
+
 ## Method history
 
 ### M1 — calibrate by volume ratio · `origin/main` · **ACTIVE AGAIN (reverted to; see STATUS)**

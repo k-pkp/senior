@@ -50,6 +50,19 @@ Conventions: blue = a file on disk · amber dashed = **not built yet**.
 >    per-object fallback whenever Poisson's mesh does not repair to χ = 2.
 >    Changed 2026-08-23 after Stage 5 was fixed to call `pymeshfix.repair()`
 >    rather than `fill_holes()` alone — see `experiments.md`, E-psr-adopted.
+> 5. **The reference cube is 10 cm** on captures from August 2026 onward.
+>    `REFERENCE_REAL_SIZE_CM` defaults to 10.0 and is env-overridable; the
+>    fixtures in these figures (`small_leg`, `est_325`) need 14.
+> 6. **Stage 6 is resolved, not open.** Figure 6 below describes the *parked*
+>    derivation and recommends it. Measured against five water-displacement
+>    volumes it is the less accurate of the two — 4.1% against the shipping
+>    method's 1.7% — so `main`'s version stays. See `stage06_experiments.md`.
+> 7. **Stage 3 gates its candidate planes** before selecting among them: at
+>    least one cube height above the floor, within 35° of perpendicular to the
+>    limb's local axis, and the learned band colour refused outright when it
+>    cannot separate band from limb. Figure 3 predates all of it.
+> 8. **Stage 6 checks the reconstruction.** The reference cube fills 0.87–0.89
+>    of its own oriented box on a sound capture; a warning fires below 0.83.
 
 ---
 

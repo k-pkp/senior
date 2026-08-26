@@ -42,8 +42,17 @@ clipped the cube's base in two of six frames. This stage chooses the crop instea
 | window | full frame width, sliding vertically; must hold cube and band with 5% margin |
 | gate | accept if that window fits everything, **or** if VGGT's own centre crop would keep what is visible; reject only when neither holds |
 
-The measured band colour goes to Stage 3 in place of the config's fixed thresholds,
-which is what lets a marker of any colour work.
+The measured band colour goes to Stage 3 in place of the config's fixed
+thresholds — **when it is usable**. Stage 3 refuses it when the band and the limb
+are closer than `MARKER_MIN_AXIS` in chromaticity, which every Aug 2026 capture
+is, so on those the config window does the detecting after all. The claim that
+this "lets a marker of any colour work" is argued from the mechanism and is not
+demonstrated by any capture in hand.
+
+`dilate=3` is measured in **pixels** and was set on 2160 px-wide photographs
+where the cord is 10–15 px across. At 1108 px it reaches into skin: the traced
+band colour drifts from ExG +11.0 at `dilate=0` to +1.5 at 3, against a limb at
+(129, 107, 103). That is what shortens the axis the refusal above then catches.
 
 ### Rejection reasons
 
@@ -152,7 +161,14 @@ nothing checking them.
 3. DBSCAN → box / object, identified by cubeness + black-white ratio
 4. Marker detection on the **dense** limb (`core/segmentation.py`) — HSV +
    Excess Green, DBSCAN, SVD plane fit. Density matters: the dense limb yields
-   ~337 marker points where the filtered one yields ~10
+   ~337 marker points where the filtered one yields ~10.
+   Where Stage 0 measured a band colour, a chromaticity contrast rule replaces
+   those thresholds — but only if the band and limb are far enough apart to
+   discriminate. `MARKER_MIN_AXIS = 0.05`; below it the learned colour is
+   **refused** and detection falls back to the window above, which is what
+   every Aug 2026 capture does. `MARKER_SCORE_MAX = 1.5` bounds the rule from
+   above when it does run: a score of 1.0 *is* the band, so anything well past
+   it cannot be the band
 5. Ghost filter each cluster (`pipeline/ghost.py`) — voxel dedup + normal-aware
    rejection. The pipeline's dominant decimation step, ~97% of points
 
@@ -163,9 +179,25 @@ combined transform `R_total` is applied to the marker planes too; applying only
 
 **Phase C — cuts and closure**
 1. Floor cut (below `floor_z + 8 mm`)
-2. Centroid-side marker cut (`core/segmentation.py:apply_marker_cut`) — keeps
-   points on the same signed-distance side as the limb centroid, so 1-marker,
-   2-marker and n-marker cases use one rule in any coordinate frame
+2. **Gate the candidate planes**, then cut. A plane must sit at least
+   `MARKER_MIN_HEIGHT_CUBES = 1.0` reference-cube heights above the floor — a
+   physical length that transfers between captures, where a fraction of the
+   limb's own span does not — and lie within
+   `MARKER_MAX_AXIS_ANGLE_DEG = 35°` of perpendicular to the limb's local axis,
+   fitted from slice centroids. A cord tied round a limb lies across it; a
+   plane fitted to a blob of skin or clothing takes the blob's orientation, and
+   this is the only test that sees the difference. Genuine bands measure
+   2.4–27° off the axis, false planes 53–89°.
+   Gating happens **before** the two-plane cap, not after: ranking candidates
+   by point count and trimming first discarded the real band on two captures,
+   because a real band is small (194 points) and a false one is not (5 265).
+   `MARKER_CUT_MODE` then selects — `"upper"` keeps what is below the highest
+   valid plane, `"span"` keeps what lies between the outermost two. This is a
+   statement about what was physically measured, not something to infer from
+   how many bands the detector happened to find.
+   The cut itself is `core/segmentation.py:apply_marker_cut`: 0 planes no cut,
+   1 keeps below, 2 keep between, each normal flipped along world up first so
+   the detected sign cannot change the outcome
 3. **Cut-plane cap** (`core/fill.py:cap_points_on_plane`) — fills the exposed
    cross-section with a grid built in the marker plane's own (u,v) basis, so it
    stays coplanar with the cut however the marker is tilted
@@ -255,13 +287,31 @@ open.
 
 **File**: `pipeline/stages/volume.py` → `compute_volumes()`
 
-> **Reverted to main's version**, pending review by the stage's author. What runs
-> is `linear_scale = (2744 / V_ref_mesh)^(1/3)` with axis-aligned extents, so the
-> reference cube reports exactly 2744.00 cm³ on every run — an identity, not a
-> measurement — and the 14 cm cube reads 19.18 × 19.47 × 14.09 cm.
+> ### RESOLVED 2026-08-27 — main's version stays
 >
-> The section below describes the **parked** method, kept as a commented block at
-> the bottom of `volume.py`. See `docs/stage06_experiments.md`.
+> What runs is `linear_scale = (REF³ / V_ref_mesh)^(1/3)` with axis-aligned
+> extents, so the reference cube reports exactly `REF³` on every run — an
+> identity, not a measurement.
+>
+> This was previously "pending review", with the parked method below
+> recommended as its replacement. Scored against five water-displacement
+> volumes, the recommendation loses: **1.7% mean absolute error for what ships,
+> against 4.1% for the parked fitted-face method and 7.4% for its OBB form.**
+> The parked block stays commented at the bottom of `volume.py` as the record.
+> Full table in `docs/stage06_experiments.md`.
+>
+> The *epistemic* objection is untouched and still correct — calibrating on the
+> reference's own volume means it cannot report an error bar on itself. The
+> error bar now comes from held-out objects instead, which is what the five
+> displacement measurements are.
+>
+> Stage 6 also runs a **reference reconstruction check** before scaling: the
+> cube fills 0.87–0.89 of its own oriented box on a sound capture, and a
+> warning fires below `REFERENCE_FILL_MIN = 0.83`. `inputs/blue shirt` measures
+> 0.787. That is the pipeline's only check on whether the *geometry* is right,
+> as opposed to the capture, the cut or the topology.
+>
+> The section below describes the **parked** method, kept for the reasoning.
 >
 > The CSV columns are `ext_x/ext_y/ext_z/size_*_cm` rather than the parked
 > method's `obb_a/obb_b/obb_c/height_cm`. The web viewer reads both and mirrors

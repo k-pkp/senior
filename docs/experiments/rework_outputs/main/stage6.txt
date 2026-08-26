@@ -1,0 +1,9 @@
+    linear_scale  = k^(1/3) = 63.950839 cm/unit
+
+  Real-world dimensions and volumes:
+             name  size_x_cm  size_y_cm  size_z_cm  real_vol_cm3  real_vol_L                        method
+          box.ply      18.98      19.49      13.64       2744.00        2.74 warp+floodfill (auto res=200)
+segmented_obj.ply      22.84      19.65      22.69       1073.98        1.07 warp+floodfill (auto res=300)
+[DBG-stage] stage6 volumes: 1.17s
+
+╔══════════════════════════════════════════════════════════╗

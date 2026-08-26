@@ -7,17 +7,23 @@ __pycache__/
 *.egg-info/
 *.egg
 .eggs/
-build/
-dist/
-develop-eggs/
-downloads/
-eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+# Python build artefacts. These are ROOT-SCOPED on purpose: a bare `lib/`
+# matches at any depth, and it was silently excluding the whole of
+# `web/src/lib/` — api.ts, data.ts, theme.ts and types.ts, without which the web
+# app cannot build from a fresh clone. Nothing had ever been committed from that
+# directory. Same class of mistake as the blanket `*.ply` rule; see
+# docs/repo_review.md finding 2.
+/build/
+/dist/
+/develop-eggs/
+/downloads/
+/eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
 share/python-wheels/
 MANIFEST
 pip-log.txt
@@ -98,8 +104,19 @@ results/
 data/
 datasets/
 
+# Scratch: stagerun experiment runs (gigabytes) and ad-hoc mesh comparisons
+work/
+compare_recon/
+compare_ghost/
+temp_output_compare_recon/
+*.zip
+
 
 # 3D assets (large)
+#
+# The web app ships precomputed sample meshes and they must be committed, or a
+# fresh clone renders an empty viewer with no error. The blanket rule below hid
+# them once already; the negation has to come after the rule to take effect.
 *.ply
 *.obj
 *.glb
@@ -110,6 +127,9 @@ datasets/
 *.usdz
 *.blend
 *.blend1
+
+# ...except the web app's shipped samples, which are the demo.
+!web/public/samples/**
 
 # Media
 *.mp4

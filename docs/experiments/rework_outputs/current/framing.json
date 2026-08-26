@@ -1,0 +1,106 @@
+{
+  "required": 6,
+  "accepted": 5,
+  "submitted": 6,
+  "all_passed": false,
+  "marker_colour": {
+    "limb_rgb": [
+      83.5,
+      54.5,
+      39.5
+    ],
+    "bgr": [
+      16.0,
+      37.0,
+      44.5
+    ],
+    "rgb": [
+      44.5,
+      37.0,
+      16.0
+    ],
+    "exg": 13.5,
+    "hsv": [
+      26,
+      167,
+      32
+    ],
+    "n_frames": 6
+  },
+  "frames": [
+    {
+      "index": 1,
+      "source": "IMG_4458.jpg",
+      "accepted": false,
+      "reasons": [
+        "objects out of window"
+      ],
+      "severity": "very crucial",
+      "cube_seen": true,
+      "band_seen": true,
+      "overlay": "00_IMG_4458.png",
+      "cropped": "frame_00.png",
+      "mode": "crop-clipped->uncropped"
+    },
+    {
+      "index": 2,
+      "source": "IMG_4459.jpg",
+      "accepted": true,
+      "reasons": [],
+      "severity": null,
+      "cube_seen": true,
+      "band_seen": true,
+      "overlay": "01_IMG_4459.png",
+      "cropped": "frame_01.png",
+      "mode": "crop"
+    },
+    {
+      "index": 3,
+      "source": "IMG_4460.jpg",
+      "accepted": true,
+      "reasons": [],
+      "severity": null,
+      "cube_seen": true,
+      "band_seen": true,
+      "overlay": "02_IMG_4460.png",
+      "cropped": "frame_02.png",
+      "mode": "crop"
+    },
+    {
+      "index": 4,
+      "source": "IMG_4461.jpg",
+      "accepted": true,
+      "reasons": [],
+      "severity": null,
+      "cube_seen": true,
+      "band_seen": true,
+      "overlay": "03_IMG_4461.png",
+      "cropped": "frame_03.png",
+      "mode": "crop"
+    },
+    {
+      "index": 5,
+      "source": "IMG_4462.jpg",
+      "accepted": true,
+      "reasons": [],
+      "severity": null,
+      "cube_seen": true,
+      "band_seen": true,
+      "overlay": "04_IMG_4462.png",
+      "cropped": "frame_04.png",
+      "mode": "crop"
+    },
+    {
+      "index": 6,
+      "source": "IMG_4463.jpg",
+      "accepted": true,
+      "reasons": [],
+      "severity": null,
+      "cube_seen": true,
+      "band_seen": true,
+      "overlay": "05_IMG_4463.png",
+      "cropped": "frame_05.png",
+      "mode": "crop"
+    }
+  ]
+}

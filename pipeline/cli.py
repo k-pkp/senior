@@ -17,6 +17,31 @@ Examples:
                    help="Path to folder containing input images (default: ./baam/)")
     p.add_argument("--output_dir", type=str, default=None,
                    help="Directory for output files (default: ./output/)")
+    p.add_argument("--no-prep", dest="prep", action="store_false",
+                   help="skip stage 0 framing and feed the raw images to VGGT")
+    p.add_argument("--prep-band", dest="prep_band", type=float, default=1.6,
+                   help="stage 0: marker-band height above the floor, in cube "
+                        "heights, used only when the band cannot be detected")
+    p.add_argument("--prep-pad", dest="prep_pad", type=float, default=0.05,
+                   help="stage 0: margin around the cube and the band")
+    p.add_argument("--prep-min-frames", dest="prep_min_frames", type=int,
+                   default=6, help="stage 0: frames required to proceed")
+    p.add_argument("--no-prep-crop", dest="prep_crop",
+                   action="store_false",
+                   help="hand VGGT the original frames instead of stage 0's crop.\n"
+                        "VGGT then centre-crops them itself, which discards 44%% of\n"
+                        "a 9:16 photo without regard for where the reference is.")
+    p.add_argument("--continue-on-rejected", dest="prep_strict",
+                   action="store_false",
+                   help="run the pipeline even though stage 0 rejected "
+                        "frames. Off by default: a clipped reference "
+                        "corrupts the scale of every reported volume "
+                        "and leaves no visible sign that it did.")
+    p.add_argument("--prep-lenient", dest="prep_strict", action="store_false",
+                   help=argparse.SUPPRESS)  # old name for --continue-on-rejected
+    p.add_argument("--prep-frame-centred", dest="prep_recentre",
+                   action="store_false",
+                   help="stage 0: keep the window concentric with the frame")
     p.add_argument("--conf_thres", type=float, default=45.0,
                    help="Confidence threshold (percentile): filter bottom N%% of points (default: 45)")
     p.add_argument("--prediction_mode", type=str, default="pointmap",
@@ -40,14 +65,18 @@ Examples:
                    help="Disable marker-based leg surface segmentation (enabled by default)")
     p.add_argument("--segment-height-axis", type=str, default="z", choices=["x", "y", "z"],
                    help="Height axis for leg cut (default: z, vertical after leveling)")
+    recon_choices = ["alpha_shape", "poisson", "poisson_omp1", "box_primitive"]
     p.add_argument("--recon-method", type=str, default="poisson",
-                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
-                   help="Reconstruction method for all objects (default: poisson)")
+                   choices=recon_choices,
+                   help="Reconstruction method for non-box objects (default: "
+                        "poisson). alpha_shape is the fallback whose ladder "
+                        "GUARANTEES a chi=2 solid; use it when Stage 5 warns "
+                        "that the mesh is closed but not a simple solid.")
     p.add_argument("--box-recon-method", type=str, default=None,
-                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
-                   help="Override recon method for box (ArUco) only")
+                   choices=recon_choices,
+                   help="Override recon method for box (ArUco); default box_primitive")
     p.add_argument("--obj-recon-method", type=str, default=None,
-                   choices=["poisson", "ball_pivot", "alpha_shape", "poisson_omp1"],
+                   choices=recon_choices,
                    help="Override recon method for object (limb) only")
     p.add_argument("--voxel-res", type=int, default=150, dest="voxel_res",
                    help="Voxel grid resolution for volume (default: 150; ignored when --auto-res)")

@@ -42,30 +42,129 @@ def rgb_to_hsv(r, g, b):
     return h, s, v
 
 
-def detect_markers(colors_uint8):
-    """Detect marker points using HSV + Excess Green Index.
+def marker_mask_by_contrast(colors_uint8, band_rgb, limb_rgb,
+                            threshold=0.5, threshold_max=None, min_axis=None,
+                            val_floor=None):
+    """Separate the band from the limb by what actually distinguishes them.
+
+    Centring a colour window on the measured band was wrong, and measurably so:
+    this khaki band sits at hue 26 while skin sits at 11-20, so a window around
+    the band admitted the entire limb -- 102,988 points selected where the real
+    band is 210. The config's hand-tuned window works not because it describes
+    the band but because it EXCLUDES skin, and leaves excess green to do the
+    separating (+14 against -54).
+
+    Generalising that means learning the contrast rather than the colour. Band
+    and limb are two measured points in RGB; the line between them is the
+    direction along which they differ, and everything else is irrelevant. Each
+    pixel is projected onto that line, 0 at the limb and 1 at the band, so the
+    test is "closer to the band than to the limb" and carries no assumption
+    about which colour either one is.
+    """
+    def _chroma(x):
+        """Colour with brightness divided out.
+
+        Working in raw RGB fails on this data for a reason worth stating: the
+        band is darker than skin as well as differently coloured, so the axis
+        between them points partly along brightness -- and shadowed skin then
+        scores as band. Selecting 3,244 points where the band is ~210 is that
+        error. Normalising by intensity keeps only the chromatic difference,
+        which is what actually distinguishes a marker from the limb under it,
+        and is why the hand-tuned rule leans on excess green rather than value.
+        """
+        x = np.asarray(x, dtype=np.float64)
+        total = x.sum(axis=-1, keepdims=True)
+        return x / np.maximum(total, 1e-6)
+
+    band = _chroma(band_rgb)
+    limb = _chroma(limb_rgb)
+    axis = band - limb
+    denom = float(axis @ axis)
+    if denom < 1e-9:
+        return None, {"n_markers": 0, "degenerate": True,
+                      "reason": "band and limb colours are identical"}
+
+    # Refuse an axis too short to discriminate, rather than measuring through
+    # it. The score divides by |axis|^2, so on a short axis every ordinary
+    # surface in the scene lands inside the window -- on inputs/sunshine
+    # (|axis| 0.031) a neutral grey scores +2.62 and the "marker" came out at
+    # 43,468 points. Returning None here hands detection back to the hand-tuned
+    # config window, which is a worse detector in principle and a better one on
+    # a capture whose learned colours cannot separate anything.
+    separation = float(np.sqrt(denom))
+    if min_axis is not None and separation < min_axis:
+        return None, {"n_markers": 0, "degenerate": True,
+                      "separation": round(separation, 4),
+                      "min_axis": min_axis,
+                      "reason": f"band/limb separation {separation:.4f} < "
+                                f"{min_axis} — the learned colours cannot "
+                                f"separate the band from the limb"}
+    rgb = np.asarray(colors_uint8, dtype=np.float64)
+    score = ((_chroma(rgb) - limb) @ axis) / denom
+    mask = score > threshold
+    # The band scores 1.0 by construction, so a point well above 1.0 is further
+    # from the limb than the band is and cannot be the band. Without this the
+    # rule kept champ's grey shorts at 1.54 and cut the limb on them.
+    n_over = 0
+    if threshold_max is not None:
+        over = mask & (score > threshold_max)
+        n_over = int(over.sum())
+        mask &= score <= threshold_max
+    if val_floor is not None:
+        mask &= rgb.max(axis=1) > val_floor
+    return mask, {
+        "n_markers": int(mask.sum()),
+        "separation": round(separation, 4),
+        "threshold": threshold,
+        "threshold_max": threshold_max,
+        "n_over_max": n_over,
+    }
+
+
+def detect_markers(colors_uint8, hue_min=None, hue_max=None, sat_min=None,
+                   val_min=None, exg_min=None):
+    """Detect green marker points by hue window and Excess Green Index.
 
     Rules:
-        (Saturation > 15%) AND (Hue > 60)   -- HSV mask
-        (2*G - R - B) > 10                  -- ExG mask
+        val > VAL_MIN AND sat > SAT_MIN AND HUE_MIN < hue < HUE_MAX   -- HSV
+        val > VAL_MIN AND (2*G - R - B) > EXG_MIN                     -- ExG
+
+    Both rules carry the brightness floor. Hue is computed as a ratio of
+    channel differences to the channel maximum, so as a pixel darkens the hue
+    becomes arbitrary — an RGB(8,6,8) shadow reports a confident hue that means
+    nothing. Without the floor those pixels dominate the detection; see
+    config.MARKER_VAL_MIN.
+
+    The previous rule was `sat > 15 AND hue > 60`, an upper-open hue test that
+    admitted everything but red/orange/yellow. Skin at hue 358 passed it.
 
     Args:
         colors_uint8: (N, 3) numpy array of RGB colors [0-255].
+        hue_min/hue_max/sat_min/val_min/exg_min: override the config defaults.
 
     Returns:
         marker_mask: boolean (N,) array, True where markers are detected.
         stats: dict with diagnostic counts and colour statistics.
     """
+    from pipeline import config as _cfg
+
+    hue_min = _cfg.MARKER_HUE_MIN if hue_min is None else hue_min
+    hue_max = _cfg.MARKER_HUE_MAX if hue_max is None else hue_max
+    sat_min = _cfg.MARKER_SAT_MIN if sat_min is None else sat_min
+    val_min = _cfg.MARKER_VAL_MIN if val_min is None else val_min
+    exg_min = _cfg.MARKER_EXG_MIN if exg_min is None else exg_min
+
     r = colors_uint8[:, 0].astype(np.int32)
     g = colors_uint8[:, 1].astype(np.int32)
     b = colors_uint8[:, 2].astype(np.int32)
 
     h, s, v = rgb_to_hsv(r, g, b)
 
-    hsv_mask = (s > 15) & (h > 60)
+    bright = v > val_min
+    hsv_mask = bright & (s > sat_min) & (h > hue_min) & (h < hue_max)
 
     exg = 2 * g - r - b
-    exg_mask = exg > 10
+    exg_mask = bright & (exg > exg_min)
 
     marker_mask = hsv_mask | exg_mask
 
@@ -110,7 +209,8 @@ def cluster_markers(coords, eps=0.03, min_samples=10):
     return labels, n_clusters
 
 
-def compute_cluster_planes(coords, labels, colors_uint8, axis_idx, min_cluster_size=150):
+def compute_cluster_planes(coords, labels, colors_uint8, axis_idx,
+                           min_cluster_size=None):
     """Compute per-cluster centroid and SVD-based plane normal.
 
     For each marker cluster, fits a best-fit plane via Singular Value
@@ -122,6 +222,10 @@ def compute_cluster_planes(coords, labels, colors_uint8, axis_idx, min_cluster_s
     Noise (label == -1) and clusters smaller than min_cluster_size are
     excluded.
     """
+    if min_cluster_size is None:
+        from pipeline import config as _cfg
+        min_cluster_size = _cfg.MARKER_MIN_CLUSTER_PTS
+
     planes = []
     skipped = 0
     for cid in sorted(set(labels)):
@@ -178,7 +282,8 @@ def cut_surface_plane(coords, planes, axis_idx, axis_name="Z"):
     n = len(planes)
 
     if n == 0:
-        return np.ones(len(coords), dtype=bool), {"case": 0}
+        return np.ones(len(coords), dtype=bool), {"case": 0, "kept": len(coords),
+                                                    "total": len(coords)}
 
     if n == 1:
         cid, centroid, normal, npts, clr = planes[0]
@@ -194,6 +299,8 @@ def cut_surface_plane(coords, planes, axis_idx, axis_name="Z"):
                 "reason": "marker_below_30pct",
                 "marker_height": float(centroid[axis_idx]),
                 "threshold": float(threshold),
+                "kept": len(coords),
+                "total": len(coords),
             }
 
         dist = np.dot(coords - centroid, normal)
@@ -242,7 +349,8 @@ def cut_surface_plane(coords, planes, axis_idx, axis_name="Z"):
     return keep, info
 
 
-def segment_point_cloud(pcd, height_axis="z", verbose=True):
+def segment_point_cloud(pcd, height_axis="z", verbose=True,
+                        marker_colour=None):
     """Run full marker-based leg segmentation on an Open3D point cloud.
 
     Marker planes are fitted via SVD so that slanted/tilted markers
@@ -286,10 +394,41 @@ def segment_point_cloud(pcd, height_axis="z", verbose=True):
               f"BBox Z[{coords[:,2].min():.3f},{coords[:,2].max():.3f}]")
         print("  Detecting markers (HSV S>15 & H>60, ExG>10)...")
 
-    marker_mask, stats = detect_markers(colors)
+    # Stage 0 measures the marker's colour when it locates the band, so prefer
+    # that over the config defaults, which describe one particular khaki band.
+    # Stage 0 measures both the band and the limb it sits on when it locates
+    # the band, so prefer the contrast between them over the config defaults,
+    # which describe one particular khaki band against one particular skin.
+    marker_mask = stats = None
+    if marker_colour and marker_colour.get("rgb") and marker_colour.get("limb_rgb"):
+        from pipeline import config as _cfg
+        marker_mask, stats = marker_mask_by_contrast(
+            colors, marker_colour["rgb"], marker_colour["limb_rgb"],
+            threshold_max=_cfg.MARKER_SCORE_MAX,
+            min_axis=_cfg.MARKER_MIN_AXIS,
+            val_floor=_cfg.MARKER_VAL_MIN * 255.0 / 100.0)
+        if marker_mask is None and verbose:
+            print(f"    marker by contrast REFUSED: {stats.get('reason')} — "
+                  f"falling back to the config colour window")
+        elif verbose:
+            if stats.get("n_over_max"):
+                print(f"    contrast ceiling {stats['threshold_max']} dropped "
+                      f"{stats['n_over_max']:,} points scoring past the band "
+                      f"itself (clothing, floor, background)")
+            print(f"    marker by contrast: band RGB "
+                  f"{[int(v) for v in marker_colour['rgb']]} vs limb "
+                  f"{[int(v) for v in marker_colour['limb_rgb']]}, "
+                  f"separation {stats.get('separation')} -> "
+                  f"{stats['n_markers']:,} points")
+    if marker_mask is None:
+        marker_mask, stats = detect_markers(colors)
 
     if verbose:
-        print(f"    HSV-only: {stats['n_hsv']:,}  ExG-only: {stats['exg_only']:,}  "
+        if "n_hsv" not in stats:
+            print(f"    markers: {stats['n_markers']:,} "
+                  f"({stats['n_markers']/n_total*100:.2f}%)")
+        else:
+            print(f"    HSV-only: {stats['n_hsv']:,}  ExG-only: {stats['exg_only']:,}  "
               f"both: {stats['both']:,}  total: {stats['n_markers']:,} "
               f"({stats['n_markers']/n_total*100:.1f}%)")
 
@@ -345,6 +484,7 @@ def segment_point_cloud(pcd, height_axis="z", verbose=True):
 
     keep_mask, cut_info = cut_surface_plane(coords, planes, axis_idx, axis_name)
     summary["cut"] = cut_info
+    summary["planes"] = planes
 
     if verbose:
         kept = cut_info["kept"]
@@ -361,3 +501,82 @@ def segment_point_cloud(pcd, height_axis="z", verbose=True):
     segmented_pcd.colors = o3d.utility.Vector3dVector(filtered_colors.astype(np.float64) / 255.0)
 
     return segmented_pcd, summary
+
+
+MAX_MARKERS = 2
+
+
+def apply_marker_cut(points, markers, up=(0.0, 0.0, 1.0)):
+    """Cut the limb against at most two marker planes, by height.
+
+    Expects `points` in levelled space, where `up` is the vertical axis.
+
+    The rule is stated in terms of above/below rather than sides:
+
+        0 markers -> no cut
+        1 marker  -> keep what is BELOW the plane
+        2 markers -> keep what is BETWEEN the two planes
+
+    This replaces the earlier centroid-side rule, which decided each side from
+    where the cloud's centroid happened to fall. That was fine for a one-shot
+    run but had three defects: dragging a plane past the centroid inverted the
+    whole selection; two planes only meant "keep between" when the centroid
+    already sat between them; and the user could not overrule a centroid that
+    landed on the wrong side of a lopsided cloud. Height is a property of the
+    scene, not of the cloud's mass distribution, so none of that applies here.
+
+    Markers beyond the first two are dropped: a limb segment is bounded by at
+    most two cuts, and a third plane can only contradict one of them.
+
+    Args:
+        points: (N, 3) in levelled space.
+        markers: list of {"centroid": (3,), "normal": (3,)}. Normals may point
+            either way — each is flipped to point along `up` first, so the
+            sign of the detected normal cannot change the outcome.
+        up: unit vertical axis of `points`.
+
+    Returns:
+        (keep_mask, case_label)
+    """
+    if len(markers) == 0:
+        return np.ones(len(points), dtype=bool), "no_markers"
+
+    up = np.asarray(up, dtype=np.float64)
+    up = up / (np.linalg.norm(up) + 1e-8)
+    pts = points.astype(np.float64)
+
+    planes = []
+    for m in markers[:MAX_MARKERS]:
+        cen = np.asarray(m["centroid"], dtype=np.float64)
+        nrm = np.asarray(m["normal"], dtype=np.float64)
+        nrm = nrm / (np.linalg.norm(nrm) + 1e-8)
+        vert = float(np.dot(nrm, up))
+        if abs(vert) < 1e-3:
+            # Plane stands vertical, so it has no above or below and the rule
+            # is undefined. Skipping beats guessing a side.
+            continue
+        if vert < 0:
+            nrm = -nrm
+        # Signed height of every point relative to this plane, along its own
+        # (now upward) normal. Negative is below.
+        planes.append(pts @ nrm - float(np.dot(cen, nrm)))
+
+    if not planes:
+        return np.ones(len(points), dtype=bool), "no_usable_markers"
+
+    if len(planes) == 1:
+        keep = planes[0] <= 0.0
+        case = "case_1_below"
+    else:
+        # Which plane is upper is decided per point by its own signed distance,
+        # so keeping "below one and above the other" needs no ordering: a point
+        # between them is below the upper and above the lower, giving one
+        # negative and one positive distance.
+        a, b = planes
+        keep = (a <= 0.0) != (b <= 0.0)
+        case = "case_2_between"
+
+    if int(keep.sum()) < 50:
+        return np.ones(len(points), dtype=bool), "too_few_after_cut"
+
+    return keep, case

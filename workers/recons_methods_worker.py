@@ -10,6 +10,7 @@ import time
 import traceback
 import numpy as np
 import open3d as o3d
+import trimesh
 
 
 SPARSE_POINT_LIMIT = 5000
@@ -301,8 +302,6 @@ def method_alpha_shape(pcd, output_path, seed=None):
         np.random.seed(seed)
         o3d.utility.random.seed(seed)
 
-    import trimesh
-
     avg_dist = float(np.mean(pcd.compute_nearest_neighbor_distance()))
 
     # Build the Delaunay tetrahedralisation ONCE and reuse it for every alpha.
@@ -529,7 +528,11 @@ def main():
     print(f"[DBG-worker] method {method_name}: {time.time() - _dbg_t:.2f}s")
 
     o3d.io.write_triangle_mesh(output_path, mesh)
-    print(f"Watertight: {mesh.is_watertight()}")
+    # _is_closed, not mesh.is_watertight(): Open3D is stricter about
+    # vertex-manifoldness and calls meshes open that Stages 4-6 treat as
+    # closed, so reporting its answer here contradicts what the pipeline
+    # goes on to do with the mesh.
+    print(f"Watertight: {_is_closed(mesh)}")
     print("OK")
 
 

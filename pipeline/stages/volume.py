@@ -21,6 +21,7 @@ import trimesh
 from scipy import ndimage
 
 from pipeline.config import REFERENCE_REAL_SIZE_CM
+from pipeline.core.crosssection import report_cut_circumference
 
 DEFAULT_VOXEL_RES = 150
 
@@ -296,12 +297,17 @@ def _check_reference_reconstruction(ref, object_mesh_paths):
 
 def compute_volumes(object_mesh_paths: list[str],
                     voxel_res: int = DEFAULT_VOXEL_RES,
-                    auto_res: bool = True):
+                    auto_res: bool = True,
+                    clean_dir: str | None = None):
     """Compute real-world volume of each object using ArUco box for scale.
 
     Runs `_check_reference_reconstruction` first: the reference cube is the
     only object in the scene whose true shape is known, so it is the pipeline's
     one free check on whether the RECONSTRUCTION is sound.
+
+    `clean_dir` is Stage 3's output directory. Given it, the stage also reports
+    the limb's circumference at the cutting plane — the one dimension a tape
+    measure can check without water, on the same scale as everything else here.
     """
     res_label = "auto" if auto_res else str(voxel_res)
     print()
@@ -354,6 +360,9 @@ def compute_volumes(object_mesh_paths: list[str],
                    "real_vol_cm3", "real_vol_L", "method"]
     print("\n  Real-world dimensions and volumes:")
     print(df[result_cols].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+
+    if clean_dir:
+        report_cut_circumference(clean_dir, linear_scale)
 
     return df
 

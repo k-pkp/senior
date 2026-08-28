@@ -701,7 +701,11 @@ def run_stage6(args, name):
     #     if os.path.exists(os.path.join(cand_dir, "predictions.npz")):
     #         inference = cand_dir
     #         break
-    df = compute_volumes(meshes, voxel_res=args.voxel_res, auto_res=args.auto_res)
+    # src_dir, not stage_dir: --src redirects the earlier stages, and the
+    # circumference must come from the same Stage 3 that produced these meshes.
+    df = compute_volumes(meshes, voxel_res=args.voxel_res,
+                         auto_res=args.auto_res,
+                         clean_dir=src_dir(args, name, 3))
     lines = [f"STAGE 6 — volume   (from {prev})", ""]
     if df is not None:
         df.to_csv(os.path.join(d, "volumes.csv"), index=False)

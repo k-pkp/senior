@@ -4,6 +4,7 @@ import { useEffect, useMemo } from "react";
 import * as THREE from "three";
 import { Bounds } from "@react-three/drei";
 import type { CutPlane } from "@/lib/types";
+import { fitSlice, type CrossSectionResult } from "@/lib/crosssection";
 import { dirToScene, pointToScene, usePly } from "./usePly";
 
 /** At most two cuts bound a segment; see segmentation.py:MAX_MARKERS. */
@@ -241,6 +242,7 @@ export function CutReview({
   planes,
   activePlaneId,
   onCounts,
+  onCrossSections,
   onExtent,
 }: {
   url: string;
@@ -248,6 +250,8 @@ export function CutReview({
   planes: CutPlane[];
   activePlaneId: string | null;
   onCounts?: (kept: number, dropped: number) => void;
+  /** Circumference at each plane, keyed by plane id, recomputed as it moves. */
+  onCrossSections?: (sections: Record<string, CrossSectionResult>) => void;
   /** Vertical extent of the loaded cloud in scene cm, the whole translation
    *  the loader applied, and the object's horizontal axis at mid height —
    *  everything a manually added plane needs to land on the object. */
@@ -274,6 +278,20 @@ export function CutReview({
       (geometry.userData.sceneOffset as THREE.Vector3) ?? new THREE.Vector3();
     const r = splitByPlanes(pos, planes, scale, off);
     onCounts?.(r.keep.length / 3, r.drop.length / 3);
+
+    // Circumference at each plane, on the same points and the same pose the
+    // split just used, so the number and the picture cannot disagree. The fit
+    // is `lib/crosssection.ts`, a port of the Stage 6 code, and it runs on the
+    // UNCUT cloud: what is being measured is the limb's girth where the plane
+    // crosses it, which does not depend on which side the cut keeps.
+    const sections: Record<string, CrossSectionResult> = {};
+    const floorY = geometry.boundingBox?.min.y ?? null;
+    for (const p of planes.slice(0, MAX_PLANES)) {
+      const c = pointToScene(p.centroid, scale, off);
+      const n = dirToScene(p.normal);
+      sections[p.id] = fitSlice(pos, [c.x, c.y, c.z], [n.x, n.y, n.z], floorY);
+    }
+    onCrossSections?.(sections);
     return r;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometry, planes, scale]);

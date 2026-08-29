@@ -12,8 +12,10 @@ floor-cut but before the cut and before any capping, so every point in the slab
 is reconstructed surface.
 
 Both cloud and plane must be in LEVELLED space, which is why the plane is read
-from `cutting_line_levelled.json` and never `cutting_line.json` — the planes are
-detected before levelling and the clouds written after.
+from `cutting_line_review.json` or `cutting_line_levelled.json` and never
+`cutting_line.json` — the planes are detected before levelling and the clouds
+written after. The review copy wins when it exists: it holds the planes the
+measured mesh was actually cut at, which is what a circumference has to describe.
 """
 import json
 import math
@@ -207,7 +209,17 @@ def load_cut_geometry(clean_dir):
     """
     import open3d as o3d
 
-    plane_json = os.path.join(clean_dir, "debug", "cutting_line_levelled.json")
+    # The review's planes win when a review happened. Both files are levelled
+    # and carry the same shape, but they can disagree: a reviewer who moved,
+    # added or removed a plane produced the cut the volumes were computed from,
+    # while cutting_line_levelled.json still records what detection proposed.
+    # Reading the wrong one reports a circumference at a plane the measured
+    # mesh was never cut at — the same precedence the service already uses when
+    # it serves cutting_line.json to the review screen.
+    debug_dir = os.path.join(clean_dir, "debug")
+    review_json = os.path.join(debug_dir, "cutting_line_review.json")
+    plane_json = (review_json if os.path.exists(review_json)
+                  else os.path.join(debug_dir, "cutting_line_levelled.json"))
     cloud_path = os.path.join(clean_dir, "objects", "leg_open.ply")
 
     for p in (plane_json, cloud_path):

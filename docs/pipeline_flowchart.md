@@ -179,7 +179,7 @@ flowchart TD
 
 ## Figure 3 — marker detection
 
-The marker band defines where the measurement stops.
+The marker band defines where the measurement stops. Two sources find it: the colour rule below, and `core/bands3d.py`, which projects Stage 0's band boxes through Stage 1's pointmap and supplies any plane the colour rule missed (additive — a colour plane is never moved or dropped).
 
 ```mermaid
 flowchart TD
@@ -518,9 +518,9 @@ and the pipeline agree on which side is kept.
 | sub-process | how |
 |---|---|
 | cube bounds | ArUco `DICT_5X5_250` face quads, recovered to full faces by homography, unioned with a GroundingDINO box |
-| limb + band | GroundingDINO boxes, SAM masks; the band box must sit on the selected limb |
+| limb + bands | GroundingDINO boxes, SAM masks; every band box on the selected limb, up to two — `framing.json` reports the count as `bands` |
 | band colour | per-column max-deviation trace, **dilated ±3 rows** so it reports the cord's body, not its darkest pixel |
-| window | full frame width, sliding vertically; must hold cube + band with 5% padding |
+| window | full frame width, sliding vertically; must hold cube + every band with 5% padding |
 | gate | accept if our window fits everything, **or** if VGGT's own centre crop would keep what is visible; reject only when neither holds |
 
 The learned band colour is handed to Stage 3 in place of the config's fixed
@@ -605,7 +605,7 @@ warning, because doing so silently discards the framing.
 | `objects/box.ply` | reference cube |
 | `objects/merged.ply` | both, for inspection |
 | `debug/cutting_line.json` | marker planes, **original VGGT space** |
-| `debug/cutting_line_levelled.json` | same planes after `R_total` — what the web reads |
+| `debug/cutting_line_levelled.json` | after `R_total`. `markers` = the planes this run cut on, `candidates` = every plane that passed the gates, `cut_mode` = which rule selected the first from the second. The web review seeds from `candidates` |
 
 Phases: A → figure 2, marker sub-flow → figure 3, B and C → figure 4.
 

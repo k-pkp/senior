@@ -16,7 +16,7 @@ from pipeline.core.plane import (
 )
 from pipeline.core.cluster import detect_top_k_objects
 from pipeline.core.segmentation import (segment_point_cloud, apply_marker_cut,
-                                        MAX_MARKERS)
+                                        MAX_MARKERS, AXIS_MAP)
 from pipeline.config import (MARKER_MIN_HEIGHT_FRAC, MARKER_MIN_HEIGHT_CUBES,
                              MARKER_CUT_MODE,
                              MARKER_MAX_AXIS_ANGLE_DEG)
@@ -85,6 +85,115 @@ def _split_into_objects(dense_cloud, num_objects):
         object_cluster = None
         print("  Only 1 cluster on dense — treating as box")
     return box_cluster, object_cluster
+
+
+CUT_MODES = ("upper", "span", "auto")
+
+
+def resolve_cut_mode(cut_mode, n_bands=None, n_planes=None):
+    """Which cut this run makes: the caller's choice, else the config default.
+
+        "upper" — keep what is BELOW the highest valid plane
+        "span"  — keep what lies BETWEEN the outermost two valid planes
+        "auto"  — span when two marker planes survive Stage 3's gates,
+                  upper otherwise
+
+    None means "whatever config says", so an existing call site keeps behaving
+    as configured.
+
+    **What auto reads.** `n_planes` is how many marker planes Stage 3 fitted
+    and then gated — at least one reference-cube height above the floor and
+    within MARKER_MAX_AXIS_ANGLE_DEG of perpendicular to the limb's own axis.
+    Those gates are the measured discriminator (genuine bands 2.4-27 degrees
+    off the axis, false planes fitted to shorts and floor junctions 53-89), and
+    a plane is the only thing that can actually cut, so the plane count decides.
+
+    `n_bands` is Stage 0's count from the photographs, and it is a cross-check
+    rather than a vote. It is not used to veto a span, because it is measured to
+    UNDER-count: on inputs/sunshine2, a capture wearing an ankle cord and a
+    below-knee cord, GroundingDINO returns the upper cord on 1 frame of 8 and
+    below the corroboration bar, so requiring both sources to agree would make a
+    span unreachable on the one capture that needs it. When the two disagree the
+    run says so and keeps going — the disagreement is worth a reviewer's eye,
+    not a silent override.
+
+    The mode is still a claim about what was physically measured, and auto only
+    infers it from what the pipeline can see. A capture compared against a
+    ground truth taken foot-to-band must be run with an explicit --cut-mode
+    upper even when two planes survive.
+    """
+    mode = (MARKER_CUT_MODE if cut_mode is None else cut_mode).lower()
+    if mode not in CUT_MODES:
+        raise ValueError(f"cut_mode must be one of {CUT_MODES}, got {cut_mode!r}")
+    if mode != "auto":
+        return mode
+
+    if n_planes is None:
+        # Called before detection has run — the banner, a summary line. Report
+        # the configured intent rather than pretending to know the answer.
+        return "auto"
+    if n_planes < 2:
+        # A span needs two planes to cut between, whatever Stage 0 saw.
+        if n_bands is not None and n_bands >= 2:
+            print(f"  Cut mode auto → upper: Stage 0 counted {n_bands} bands "
+                  f"but only {n_planes} plane(s) survived Stage 3's gates, and "
+                  f"a span has to be bounded by two")
+        return "upper"
+    if n_bands is not None and n_bands < 2:
+        print(f"  Cut mode auto → span: {n_planes} gated planes. Stage 0 "
+              f"counted {n_bands} band(s) in the photographs — worth a look at "
+              f"the review, since the two disagree")
+    else:
+        print(f"  Cut mode auto → span: {n_planes} gated planes"
+              + (f", and Stage 0 counted {n_bands} bands"
+                 if n_bands is not None else ""))
+    return "span"
+
+
+# How close two planes' centroids may sit, along the height axis, before they
+# are taken to be the same band seen twice. In VGGT world units, where a 10 cm
+# reference cube is about 0.13 across, so 0.02 is roughly 1.5 cm -- wider than
+# the disagreement between a colour fit and a projected fit on one cord, far
+# narrower than the gap between two cords bounding a measured segment.
+SAME_BAND_DISTANCE = 0.02
+
+
+def _merge_projected_planes(colour_planes, band_planes, height_axis):
+    """Add planes projected from Stage 0's boxes that colour detection missed.
+
+    Additive by construction: a colour plane is never dropped or moved, so a
+    capture cannot end up with fewer planes, or different ones, than it has
+    today. What it can gain is a band the colour rule could not see -- which is
+    the common failure, since the rule needs the cord and the limb to be
+    chromatically separable and refuses outright below MARKER_MIN_AXIS.
+
+    Where both sources found the same band, the colour plane wins. It is fitted
+    to the cord's own points; the projected one is fitted to a slab of limb
+    surface centred on the cord, which is the right plane but a blunter
+    instrument for locating it.
+    """
+    if not band_planes:
+        return colour_planes
+
+    axis_idx = AXIS_MAP[height_axis.lower()]
+    merged = list(colour_planes)
+    for candidate in band_planes:
+        height = float(candidate["centroid"][axis_idx])
+        twin = next((m for m in colour_planes
+                     if abs(float(m["centroid"][axis_idx]) - height)
+                     < SAME_BAND_DISTANCE), None)
+        if twin is not None:
+            print(f"  Band projection: {candidate['npts']:,}-pt plane agrees "
+                  f"with a {twin['npts']}-pt colour plane — keeping the colour "
+                  f"fit")
+            continue
+        merged.append({"centroid": np.asarray(candidate["centroid"], dtype=np.float64),
+                       "normal": np.asarray(candidate["normal"], dtype=np.float64),
+                       "npts": int(candidate["npts"]),
+                       "source": "projected"})
+        print(f"  Band projection: adding a plane colour detection missed "
+              f"({candidate['npts']:,} pts, {candidate['frames']} frames)")
+    return merged
 
 
 def _detect_marker_planes(object_cluster, height_axis, marker_colour):
@@ -357,7 +466,8 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
                         marker_colour=None,
                             segment_leg=False, segment_height_axis="z",
                             fill_enabled=True, apply_cut=True,
-                            override_planes=None):
+                            override_planes=None, cut_mode=None, n_bands=None,
+                            band_planes=None):
     """Cluster-first clean pipeline.
 
     Phase A: Segment the dense cloud once (floor removal + DBSCAN), detect
@@ -407,6 +517,7 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     markers = []
     if segment_leg:
         markers = _detect_marker_planes(obj_dense, segment_height_axis, marker_colour)
+        markers = _merge_projected_planes(markers, band_planes, segment_height_axis)
 
     _save_cluster_debug(debug_dir_out, obj_dense, box_dense, markers)
 
@@ -453,6 +564,7 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     # is applied here.
     leg_no_cut_path = os.path.join(objects_dir, "leg_no_cut.ply")
     markers_rotated = []
+    candidates = []
     if len(markers) > 0:
         # Rotate EVERY candidate first, gate them, and only then cap the count.
         #
@@ -472,7 +584,8 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
             norm_r = (R_total @ norm).astype(np.float64)
             norm_r /= np.linalg.norm(norm_r) + 1e-8
             markers_rotated.append({"centroid": cen_r.tolist(), "normal": norm_r.tolist(),
-                                    "npts": m.get("npts", 0)})
+                                    "npts": m.get("npts", 0),
+                                    "source": m.get("source", "colour")})
 
         # Drop planes sitting in the bottom fraction of the object. Feet, arch
         # shadows and the floor junction all live there, and a cut line that low
@@ -504,7 +617,22 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
             if min_z is not None:
                 keep_m, drop_m = [], []
                 for mr in markers_rotated:
-                    (keep_m if mr["centroid"][2] >= min_z else drop_m).append(mr)
+                    # A plane projected from Stage 0's boxes is exempt. This
+                    # gate rejects UNCORROBORATED blobs near the floor — feet,
+                    # arch shadows, the floor junction — and a band the
+                    # detector saw on most of the photographs is precisely the
+                    # corroboration it was standing in for. It is also what
+                    # would throw the low band away: on the capture this was
+                    # built for, the real ankle cord sits at 0.66 cube heights
+                    # against a 1.0 floor.
+                    low = mr["centroid"][2] < min_z
+                    if low and mr.get("source") == "projected":
+                        h = (mr["centroid"][2] - lo) / span if span > 0 else 0.0
+                        print(f"  Marker kept at {h*100:.0f}% of height despite "
+                              f"{rule} — projected from Stage 0's band boxes, "
+                              f"which is the corroboration the gate wants")
+                        low = False
+                    (drop_m if low else keep_m).append(mr)
                 for mr in drop_m:
                     h = (mr["centroid"][2] - lo) / span if span > 0 else 0.0
                     print(f"  Marker rejected: {h*100:.0f}% of height, "
@@ -542,24 +670,59 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
         # the ruler measured the whole leg below the knee or only the segment
         # between the two, and guessing from the band count answers a different
         # question from the one the ground truth answers.
+        #
+        # `cut_mode` is the per-run answer to that question and defaults to
+        # MARKER_CUT_MODE, so one capture set can hold both a single-band
+        # subject and a two-band one without editing config between runs.
+        #
+        # Every survivor of the gates is kept as a CANDIDATE regardless of what
+        # the mode then selects, and published alongside the selection. The two
+        # answer different questions: "which planes did this run cut on" and
+        # "which bands does this capture actually have". The review screen needs
+        # the second — seeded from the selection alone, a two-band capture run
+        # in 'upper' mode showed the reviewer one plane, and re-adding the other
+        # by hand replaced a fitted marker plane with a guess at mid-height.
+        candidates = sorted(markers_rotated, key=lambda m: m["centroid"][2])
+
+        mode = resolve_cut_mode(cut_mode, n_bands=n_bands,
+                                n_planes=len(markers_rotated))
         if len(markers_rotated) > 1:
-            ordered = sorted(markers_rotated, key=lambda m: m["centroid"][2])
-            if MARKER_CUT_MODE == "upper":
+            ordered = candidates
+            if mode == "upper":
                 markers_rotated = [ordered[-1]]
                 dropped = ", ".join(f"{m['npts']} pts" for m in ordered[:-1])
-                print(f"  Markers: {len(ordered)} valid — cutting on the "
-                      f"UPPERMOST only (keep below); not cutting on {dropped}")
+                print(f"  Markers: {len(ordered)} valid — cut mode 'upper', "
+                      f"cutting on the UPPERMOST only (keep below); not "
+                      f"cutting on {dropped}")
             else:
                 markers_rotated = [ordered[0], ordered[-1]]
-                print(f"  Markers: {len(ordered)} valid — keeping the outermost "
-                      f"{MAX_MARKERS} (keep between)")
+                print(f"  Markers: {len(ordered)} valid — cut mode 'span', "
+                      f"keeping the outermost {MAX_MARKERS} (keep between)")
+        elif len(markers_rotated) == 1 and mode == "span":
+            # Saying so matters: 'span' names a segment bounded at both ends,
+            # and one plane cannot bound it. The run still measures something
+            # — everything below the single plane — but that is a different
+            # quantity from the one asked for, and a silent substitution here
+            # would be read as the segment volume.
+            print("  Markers: 1 valid — cut mode 'span' asks for the segment "
+                  "BETWEEN two planes, but only one survived the gates. "
+                  "Cutting on it alone (keep below); this is NOT a span "
+                  "measurement.")
 
         # Also publish the planes in LEVELLED space. cutting_line.json is written
         # pre-levelling, but leg_no_cut.ply is post-levelling, so the two do not
         # share a frame — anything drawing them together (a UI, a debug viewer)
         # needs this version, and "height along Z" only means something here.
+        #
+        # "markers" keeps its meaning byte for byte — the planes this run cut on
+        # — because Stage 6 reads it to report a circumference per cutting
+        # plane, and a candidate that did not cut has no cut face to measure.
+        # "candidates" is additive: every gated survivor, lowest first.
         with open(os.path.join(debug_dir_out, "cutting_line_levelled.json"), "w") as _f:
-            _json.dump({"markers": markers_rotated, "space": "levelled"}, _f, indent=2)
+            _json.dump({"markers": markers_rotated,
+                        "candidates": candidates,
+                        "cut_mode": mode,
+                        "space": "levelled"}, _f, indent=2)
 
     # Publish the levelling rotation itself. Stage 1's pointmap lives in the
     # unlevelled frame while every exported cloud and mesh lives in this one, so
@@ -598,8 +761,14 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
                                     "npts": int(m.get("npts", 0))})
         print(f"Markers: {len(markers_rotated)} supplied by review "
               f"(detection found {len(markers)})")
+        # Detection's candidates travel with the review's choice. The review
+        # copy is what the UI reloads after an edit, so dropping them here would
+        # lose the detected bands the moment the user cut once — the reviewer
+        # could no longer put back a plane they had removed.
         with open(os.path.join(debug_dir_out, "cutting_line_review.json"), "w") as _f:
-            _json.dump({"markers": markers_rotated, "space": "levelled",
+            _json.dump({"markers": markers_rotated,
+                        "candidates": candidates,
+                        "space": "levelled",
                         "source": "review"}, _f, indent=2)
 
     # ── Close whatever the cut actually leaves open ──
@@ -759,7 +928,8 @@ def _array_to_o3d(points, colors_uint8):
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
                       segment_leg=False, segment_height_axis="z",
                       fill_enabled=True, clean_ply_path=None, apply_cut=True,
-                      marker_colour=None, override_planes=None):
+                      marker_colour=None, override_planes=None, cut_mode=None,
+                      n_bands=None, band_planes=None):
     """Pipeline wrapper. clean_ply_path is accepted for call-site compatibility
     and ignored — Stage 3 derives its own ghost-filtered clouds from ply_path."""
     print()
@@ -780,6 +950,9 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
             apply_cut=apply_cut,
             marker_colour=marker_colour,
             override_planes=override_planes,
+            cut_mode=cut_mode,
+            n_bands=n_bands,
+            band_planes=band_planes,
         )
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:
@@ -867,8 +1040,23 @@ def cut_only(stage3_dir, planes, fill_enabled=True):
         print("No cutting planes supplied — measuring the limb whole")
         pts, cols = _close_to_floor(pts, cols)
 
+    # Carry detection's candidates across the cut. This file is what the review
+    # screen reloads afterwards, and the detected bands have to survive an edit:
+    # without them a reviewer who removed a plane could only put it back by
+    # hand, replacing a fitted marker plane with a guess.
+    candidates = []
+    levelled_path = os.path.join(debug_dir_out, "cutting_line_levelled.json")
+    if os.path.exists(levelled_path):
+        try:
+            with open(levelled_path) as f:
+                published = _json.load(f)
+            candidates = published.get("candidates", published.get("markers", []))
+        except (ValueError, OSError) as exc:
+            print(f"  (candidates not carried over: {type(exc).__name__}: {exc})")
+
     with open(os.path.join(debug_dir_out, "cutting_line_review.json"), "w") as f:
-        _json.dump({"markers": markers, "space": "levelled", "source": "review"},
+        _json.dump({"markers": markers, "candidates": candidates,
+                    "space": "levelled", "source": "review"},
                    f, indent=2)
 
     leg_cut_path = os.path.join(objects_dir, "leg_cut.ply")

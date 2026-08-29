@@ -37,10 +37,36 @@ clipped the cube's base in two of six frames. This stage chooses the crop instea
 | step | how |
 |---|---|
 | cube bounds | ArUco `DICT_5X5_250` face quads, expanded to whole faces by homography, unioned with a GroundingDINO box |
-| limb + band | GroundingDINO boxes, SAM masks; the band box must sit on the selected limb |
+| limb + bands | GroundingDINO boxes, SAM masks; **every** band box that sits on the selected limb, up to two, duplicates suppressed by IoU and by a minimum separation |
 | band colour | per-column max-deviation trace of the cord, **dilated ±3 rows** so it reports the cord's body rather than its darkest pixel |
-| window | full frame width, sliding vertically; must hold cube and band with 5% margin |
+| window | full frame width, sliding vertically; must hold cube and **every** band with 5% margin |
 | gate | accept if that window fits everything, **or** if VGGT's own centre crop would keep what is visible; reject only when neither holds |
+
+### How many bands the capture wears
+
+The count is reported, not just the geometry: `framing.json` carries `bands`,
+and a frame's record carries `bands_seen`. A capture wears two bands when at
+least `BAND_MIN_FRAME_FRAC` of its frames saw two — the same corroboration rule
+the band colour uses, for the same reason. One frame's duplicate detection must
+not be able to turn a below-the-band measurement into a between-the-bands one.
+
+Measured: `inputs/champ` reads 2 bands on 8 of 8 frames, `inputs/small_leg` 1 on
+6 of 6, `inputs/est_325` (no cord) 0. **It under-counts on a hard capture** —
+`inputs/sunshine2` wears an ankle cord and a below-knee cord, and GroundingDINO
+returns the upper one on 1 frame of 8, below the bar. Two ways of forcing it out
+were tried and rejected on measurement: re-running the detector on the limb
+above the first band, and matching the primary band's own traced colour. Both
+produce candidates on one-band captures at the same rate as on two-band ones
+(`inputs/small_leg` scores a "second band" at 0.36–0.45 with contrasts of
+95–214), so neither separates the cases.
+
+That is why `--cut-mode auto` reads Stage 3's gated plane count rather than this
+one; the band count is a cross-check that says so when the two disagree.
+
+The boxes are not only used for framing. Stage 3 projects them through Stage 1's
+pointmap into 3D and fits a plane to what comes back — see **Band projection**
+below — so a band Stage 0 can see is a band the cut can use, whatever colour the
+cord is.
 
 The measured band colour goes to Stage 3 in place of the config's fixed
 thresholds — **when it is usable**. Stage 3 refuses it when the band and the limb
@@ -172,6 +198,49 @@ nothing checking them.
 5. Ghost filter each cluster (`pipeline/ghost.py`) — voxel dedup + normal-aware
    rejection. The pipeline's dominant decimation step, ~97% of points
 
+### Band projection — a second source for the cut
+
+**File**: `pipeline/core/bands3d.py`
+
+Colour detection needs the cord and the limb to be chromatically separable, and
+refuses outright below `MARKER_MIN_AXIS`. Measured on a web job with two cords:
+separation 0.0259 against a 0.05 floor, so the learned colour was refused, the
+config's khaki window matched 130 points on the whole limb, and the lower cord
+survived as an 11-point cluster that `MARKER_MIN_CLUSTER_PTS = 40` then dropped.
+Stage 0 had detected that cord on 6 of 7 photographs.
+
+The information was in the wrong space, not missing. Stage 0 records each band's
+box in frame pixels; Stage 1's `world_points` is a 3D position for every pixel of
+every frame. Mapping one through the other turns the 2D detection into thousands
+of 3D points, with no colour question asked:
+
+| step | how |
+|---|---|
+| pixel map | cropped frames map linearly from Stage 0's window; uncropped ones follow VGGT's own resize-and-centre-crop. Both branches verified: on `small_leg` the uncropped frame's points sit at −0.0045 from the fitted plane against −0.0060…+0.0054 for the cropped ones, with the same scatter |
+| sampling | the middle `BOX_CORE_FRAC` of each box, pixels above the frame's `CONF_PCT` confidence percentile |
+| grouping | DBSCAN in **3D**, not by box position per frame — a frame that saw only the lower cord makes that cord its first box, and pairing by list position would merge two bands into one plane |
+| corroboration | a cluster must appear in at least half the frames that saw a band, and never fewer than two |
+
+It is **additive**. Colour planes are never moved or dropped; a projected plane
+within `SAME_BAND_DISTANCE` of one is taken to be the same band and the colour
+fit wins, being fitted to the cord itself rather than to a slab of limb centred
+on it. So a run can only gain a plane here.
+
+Projected planes are exempt from the `MARKER_MIN_HEIGHT_CUBES` floor. That gate
+rejects uncorroborated blobs near the ground — feet, arch shadows, the floor
+junction — and a band seen on most of the photographs is the corroboration it
+stands in for. The perpendicularity gate still applies to everything: it is
+geometry, not corroboration.
+
+Measured: on the two-cord web job, colour finds 1 plane and projection supplies
+the second (1,842 points from 6 frames), giving cuts at 18.7% and 72.4% of the
+limb's span. On `champ` both projected planes agree with colour planes and the
+cut is unchanged, point for point. On `small_leg` the single plane agrees and
+the cut is unchanged. It cannot rescue a band Stage 0 never saw: `sunshine2`
+still reports one.
+
+---
+
 **Phase B — levelling**
 RANSAC ground plane → rotation to Z-up, plus an upside-down flip check. The
 combined transform `R_total` is applied to the marker planes too; applying only
@@ -191,10 +260,21 @@ combined transform `R_total` is applied to the marker planes too; applying only
    Gating happens **before** the two-plane cap, not after: ranking candidates
    by point count and trimming first discarded the real band on two captures,
    because a real band is small (194 points) and a false one is not (5 265).
-   `MARKER_CUT_MODE` then selects — `"upper"` keeps what is below the highest
-   valid plane, `"span"` keeps what lies between the outermost two. This is a
-   statement about what was physically measured, not something to infer from
-   how many bands the detector happened to find.
+   `--cut-mode` then selects, defaulting to `MARKER_CUT_MODE` (`auto`) —
+   `upper` keeps what is below the highest valid plane, `span` keeps what lies
+   between the outermost two, and `auto` chooses span exactly when two planes
+   survive the gates above. Auto reads the plane count and not Stage 0's band
+   count, because the gates here are the measured discriminator and a plane is
+   the only thing that can cut; Stage 0's count is printed as a cross-check and
+   the run says so when the two disagree. Selecting does not discard: **every** gated plane is published
+   as `candidates`, and only the selection is published as `markers`, so the
+   review screen can offer both bands of a two-band capture even on a run that
+   cut on one. This is a statement about what was physically measured, not
+   something to infer from how many bands the detector happened to find, so it
+   is a per-run flag rather than a per-capture guess: one capture set can hold
+   a one-band subject and an upper-and-lower-band subject side by side. Asking
+   for `span` when only one plane survives the gates cuts on that plane alone
+   and says so — the result is a below-the-band volume, not a segment.
    The cut itself is `core/segmentation.py:apply_marker_cut`: 0 planes no cut,
    1 keeps below, 2 keep between, each normal flipped along world up first so
    the detected sign cannot change the outcome
@@ -209,7 +289,7 @@ combined transform `R_total` is applied to the marker planes too; applying only
 5. Bottom cap (alpha-shape disc)
 
 **Output**: `objects/{box, leg_cut, leg_no_cut, merged}.ply`,
-`debug/{leg_cluster.ply, cutting_line.json}`
+`debug/{leg_cluster.ply, cutting_line.json, cutting_line_levelled.json, levelling.json}`
 
 ---
 
@@ -317,6 +397,28 @@ open.
 > method's `obb_a/obb_b/obb_c/height_cm`. The web viewer reads both and mirrors
 > whichever derivation produced the file, so runs display either way.
 
+### Circumference at the cut, printed here and shown live in the review
+
+`core/crosssection.py` slices `leg_open.ply` in a ±4 mm slab at each cutting
+plane, fits an ellipse (Halir-Flusser, direct least squares) and reports
+Ramanujan II's perimeter, plus the diagnostics that say whether the number
+means anything: angular coverage, radial residual, and an independent
+median-radius polygon. It is the one limb dimension a tape measure can check
+without water.
+
+The review screen computes the **same measurement in the browser**, per plane,
+while the plane is being dragged — `web/src/lib/crosssection.ts` is a port of
+that file, verified against it on a real slice to every digit printed
+(36.2753 cm, a 5.8960, b 5.6494, 147 slab points, polygon 36.5967) and against
+a synthetic ellipse of known axes to 1e-8. A round-trip to the service would
+describe a plane the user had already moved.
+
+Two differences, both deliberate: the browser slices `leg_no_cut.ply`, the cloud
+the review draws, which is the same points except near the floor where the
+fabricated base lives — a plane low enough to cut that is flagged rather than
+measured — and it reports a reason instead of raising, because a plane in
+motion passes through positions where no ellipse exists.
+
 ### Scale from a measured length
 
 ```
@@ -396,7 +498,9 @@ recon instead, so they always exist if a mesh was produced.
 
 ```bash
 python run.py -i inputs/est_325 --no-segment-leg    # rigid object, no marker
-python run.py -i inputs/small_leg                   # limb with marker band
+python run.py -i inputs/small_leg                   # limb with one band: measure below it
+python run.py -i inputs/champ                       # two bands: auto measures between them
+python run.py -i inputs/champ --cut-mode upper     # ...unless the ruler measured foot-to-upper-band
 python run.py -i inputs/est_325 --skip_mesh         # point cloud only
 python run.py -i inputs/small_leg --continue-on-rejected   # ignore the framing gate
 ./serve.sh                                          # web app + compute service

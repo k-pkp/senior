@@ -118,18 +118,24 @@ MARKER_MIN_HEIGHT_CUBES = 1.0
 #
 #     "upper"  keep everything BELOW the highest valid plane
 #     "span"   keep what lies BETWEEN the lowest and highest valid planes
+#     "auto"   follow the bands: one band -> upper, two bands -> span
 #
-# This is not something to infer from how many bands the detector happens to
-# find. It is a statement about what the operator measured, and it has to match
-# or the pipeline is answering a different question from the ruler. The Aug 2026
-# displacement volumes were taken foot-to-upper-band, so "upper" is what the
-# reported numbers are comparable against; a capture wearing two bands still
-# gets both detected, published and drawn for review, but only the upper one
-# cuts.
+# What "auto" reads is deliberately not one detector's opinion. Stage 0 counts
+# the bands in the photographs, across frames, and Stage 3 fits planes to the
+# marker points in 3D; auto cuts a span only when BOTH say two. Either alone is
+# a known failure: Stage 3 has fitted a plausible second plane to clothing and
+# to a floor junction, and Stage 0's detector will return a second box for a
+# cord's own shadow. Requiring agreement means a single false positive can no
+# longer change what quantity is being reported.
 #
-# Switch to "span" when the physical measurement is of a segment bounded at both
-# ends -- and re-measure the ground truth the same way when you do.
-MARKER_CUT_MODE = "upper"
+# It still is not a measurement. What a run reports has to match what the ruler
+# measured, and the Aug 2026 displacement volumes were taken foot-to-upper-band
+# -- so a two-band capture measured against those must be run with an explicit
+# --cut-mode upper, and re-measuring the ground truth is the alternative. Auto
+# picks the reading that matches the bands the subject is wearing, which is the
+# right default for a new capture and the wrong one for an old comparison.
+# Every run prints which mode it resolved to and why.
+MARKER_CUT_MODE = "auto"
 
 # Fallback for MARKER_MIN_HEIGHT_CUBES when no reference cube was segmented.
 # Set either to 0 to disable the gate.

@@ -157,17 +157,28 @@ export async function loadCutPlanes(url: string): Promise<CutPlane[]> {
     const res = await fetch(url);
     if (!res.ok) return [];
     const json = await res.json();
-    return (json.markers ?? []).map((m: any) => ({
-      id: newPlaneId(),
-      centroid: m.centroid as [number, number, number],
-      normal: m.normal as [number, number, number],
-      npts: m.npts ?? 0,
-      source: "detected" as const,
-      origin: {
+    // "candidates" is every band detection validated; "markers" is the subset
+    // the run happened to cut on, which --cut-mode upper trims to one even on a
+    // two-band capture. The reviewer is choosing what to cut, so they get the
+    // full set. Older files carry only "markers" — fall back to it.
+    const raw = json.candidates?.length ? json.candidates : (json.markers ?? []);
+    // Lowest first, so a caller picking "the outermost two" can take the ends.
+    // The pipeline already writes candidates in this order; sorting here means
+    // an older file, or a hand-edited one, cannot quietly break that.
+    return raw
+      .slice()
+      .sort((a: any, b: any) => a.centroid[2] - b.centroid[2])
+      .map((m: any) => ({
+        id: newPlaneId(),
         centroid: m.centroid as [number, number, number],
         normal: m.normal as [number, number, number],
-      },
-    }));
+        npts: m.npts ?? 0,
+        source: "detected" as const,
+        origin: {
+          centroid: m.centroid as [number, number, number],
+          normal: m.normal as [number, number, number],
+        },
+      }));
   } catch {
     return [];
   }

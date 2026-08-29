@@ -424,6 +424,97 @@ Some properties worth knowing:
 
 ---
 
+## 11. A limb can be measured below one band or between two, and the run works out which
+
+**`main`** — and this branch until now — read the number of cuts off the config
+constant `MARKER_CUT_MODE`, which meant a two-band capture and a one-band capture
+could not be measured in the same session without editing a source file between
+runs.
+
+**Now** the default is `--cut-mode auto`: `upper` measures everything below the
+highest valid band, `span` measures the segment between the outermost two, and
+auto picks span exactly when two marker planes survive Stage 3's height and
+perpendicularity gates. `inputs/champ` resolves to span, `inputs/small_leg` to
+upper, with no flag either way.
+
+**What auto reads, and what it deliberately does not.** The gated plane count
+decides, because those gates are the measured discriminator — genuine bands sit
+2.4-27 degrees off the limb's axis, planes fitted to shorts and floor junctions
+53-89 — and a plane is the only thing that can actually cut. Stage 0's band
+count is a cross-check that gets printed, not a veto, because it is measured to
+under-count (below).
+
+**Stage 0 now counts the bands rather than taking the detector's best box.**
+`core/vlm_detect.py:detect_all` returns every box over threshold with IoU
+suppression; `prep.py` keeps those that sit on the limb, are small against it,
+and are separated from each other; the crop window is sized to hold **all** of
+them, and `framing.json` carries `bands` plus a per-frame `bands_seen`. A capture
+wears two bands when BAND_MIN_FRAME_FRAC of its frames say so — the same
+corroboration rule the band colour already used.
+
+Measured: `champ` 2 bands on 8 of 8 frames, `small_leg` 1 on 6 of 6, `est_325`
+0. Framing on the one-band and no-band captures is **byte-identical** to before;
+on `champ` one frame's window moved 55 px to take in the lower band, and all
+eight verdicts are unchanged.
+
+**Where it does not work, stated plainly.** `inputs/sunshine2` wears an ankle
+cord and a below-knee cord, and the detector returns the upper one on 1 frame of
+8 — below the bar, so Stage 0 reports one band. Stage 3 finds one plane there
+too, so auto measures below the ankle cord. Two ways of forcing the upper cord
+out were tried and both were rejected on measurement: a second detector pass over
+the limb above the first band, and a search for the primary band's own traced
+colour. Each produces "second bands" on one-band captures at the same rate as on
+real two-band ones, which is worse than under-counting: it would silently change
+which quantity a run reports.
+
+**The cut no longer depends on the cord being a separable colour.**
+`core/bands3d.py` projects Stage 0's band boxes through Stage 1's own pointmap
+and fits a plane to the 3D points that come back, as a second source merged with
+colour detection inside Stage 3. On the web job that prompted it — two cords,
+band/limb separation 0.0259 against the 0.05 floor, so the learned colour was
+refused — colour found one plane and the lower cord survived only as an 11-point
+cluster that the 40-point floor dropped. Projection recovers it from 1,842 points
+across 6 frames, and the run now cuts at 18.7% and 72.4% of the limb's span.
+
+It is additive by construction: a projected plane within `SAME_BAND_DISTANCE` of
+a colour plane is the same band, and the colour fit wins. `champ` (colour already
+found both bands) and `small_leg` (one band) produce point-for-point identical
+cuts. Projected planes are exempt from the height floor, which exists to reject
+uncorroborated blobs near the ground and would otherwise throw away a real ankle
+cord at 0.66 cube heights; the perpendicularity gate still applies to everything.
+It cannot rescue a band Stage 0 never saw — `sunshine2` still reports one.
+
+**Selecting no longer discards.** `cutting_line_levelled.json` carries
+`candidates` — every plane that passed the gates, lowest first — beside
+`markers`, which keeps its old meaning of *the planes this run cut on*, and
+`cut_mode`. The review screen seeds from `candidates`, so a reviewer sees both
+bands of a two-band capture whatever the run cut on, and the candidates travel
+into `cutting_line_review.json` so they survive a re-cut.
+
+Stage 6's circumference reads the review's planes when a review happened, and
+the detected ones otherwise. It previously always read the detected file, so
+after a re-cut it reported a circumference at a plane the measured mesh had not
+been cut at.
+
+**The review screen measures girth while you drag.** Each plane's panel shows
+the circumference where it crosses the limb, in centimetres, recomputed on every
+move — the same ellipse fit Stage 6 prints, ported to TypeScript in
+`web/src/lib/crosssection.ts` and checked against the Python on a real slice to
+every digit displayed, and against a synthetic ellipse of known axes to 1e-8.
+The diagnostics are shown beside it rather than hidden: ring coverage, radial
+residual, and the independent polygon cross-check. An algebraic fit to half a
+ring returns a plausible number with a *better* residual than the truth, so a
+panel showing only centimetres would make that failure look like a measurement.
+It is what lets a reviewer put the cut at a height they have a tape measurement
+for and compare on the spot.
+
+**This changes a published number.** The accuracy table was measured
+foot-to-upper-band. `champ` wears two bands, so under the new default it reports
+the segment between them (~2377 cm³) instead of 3354 cm³. Reproducing the table
+needs an explicit `--cut-mode upper`; the README says so where the table is.
+
+---
+
 ## What has **not** improved, and should not be claimed
 
 Stated here so this file cannot be read as more than it is.

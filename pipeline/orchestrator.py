@@ -57,6 +57,12 @@ def _print_banner(args, device):
     print(f"║  Watertight    : {str(not args.no_watertight):<40}║")
     print(f"║  Seed          : {args.seed:<40}║")
     print(f"║  Leg segment   : {str(args.segment_leg):<40}║")
+    from pipeline.stages.clean import resolve_cut_mode
+    cut_label = {"upper": "upper (below top band)",
+                 "span": "span (between bands)",
+                 "auto": "auto (follows the bands found)"}[
+        resolve_cut_mode(getattr(args, "cut_mode", None))]
+    print(f"║  Cut mode      : {cut_label:<40}║")
     print(f"╚{'═' * 58}╝")
 
 
@@ -196,6 +202,8 @@ def main():
         # to re-take.
         inference_input = args.image_folder
         marker_colour = None
+        n_bands = None
+        manifest = None
         if getattr(args, "prep", True):
             from pipeline.stages.prep import prepare_frames
             prep_images = os.path.join(stage_dirs[0], "images")
@@ -216,6 +224,10 @@ def main():
             # Stage 3 uses the colour Stage 0 measured, so a marker of any
             # colour works without editing the config's khaki defaults.
             marker_colour = manifest.get("marker_colour")
+            # How many bands Stage 0 counted, for --cut-mode auto. Absent on a
+            # manifest written before multi-band detection, and None there means
+            # "unknown", not "none" — see clean.resolve_cut_mode.
+            n_bands = manifest.get("bands")
 
         # Record what VGGT was actually shown. This used to copy the submitted
         # folder, which stopped being the same thing once Stage 0 could rewrite
@@ -240,6 +252,17 @@ def main():
         ply_path = export_ply(predictions, stage_dirs[2], args)
         print(f"[DBG-stage] stage2 export_ply: {time.time() - _dbg_t:.2f}s")
 
+        # Planes projected from Stage 0's band boxes through Stage 1's own
+        # pointmap. A second source for the cut, independent of colour, merged
+        # with the colour planes inside Stage 3 — see core/bands3d.py.
+        band_planes = []
+        if getattr(args, "prep", True) and manifest is not None:
+            from pipeline.core.bands3d import band_planes_from_arrays
+            band_planes = band_planes_from_arrays(
+                manifest, predictions["world_points"],
+                predictions["world_points_conf"],
+                height_axis=args.segment_height_axis)
+
         # ── Stages 3-5: Clean + Reconstruct + Watertight ──
         scene_recon_path = None
         recon_mesh_paths = []
@@ -253,7 +276,10 @@ def main():
                 segment_leg=args.segment_leg,
                 segment_height_axis=args.segment_height_axis,
                 fill_enabled=not args.no_fill,
-                marker_colour=marker_colour)
+                marker_colour=marker_colour,
+                cut_mode=getattr(args, "cut_mode", None),
+                n_bands=n_bands,
+                band_planes=band_planes)
             print(f"[DBG-stage] stage3 clean_and_extract: {time.time() - _dbg_t:.2f}s")
             if object_paths:
                 _dbg_t = time.time()

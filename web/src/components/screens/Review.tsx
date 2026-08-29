@@ -6,6 +6,7 @@ import * as THREE from "three";
 import { Button, Caveat, Label, Panel, Slider } from "@/components/ui/primitives";
 import { linearScale, loadCutPlanes, loadVolumes, newPlaneId } from "@/lib/data";
 import { MAX_PLANES } from "@/components/three/CutReview";
+import { SLAB_HALF_MM, type CrossSectionResult } from "@/lib/crosssection";
 import type { CutPlane, SampleDataset, VolumeRow } from "@/lib/types";
 
 const Viewport = dynamic(
@@ -72,6 +73,81 @@ function controlsFromNormal(
   };
 }
 
+/** Girth of the limb where a plane crosses it, fitted while the plane moves.
+ *
+ * The same measurement Stage 6 prints, from the same code ported to TypeScript
+ * (`lib/crosssection.ts`), so a reviewer can put the cut at a height they have a
+ * tape measurement for and compare on the spot — the one limb dimension that can
+ * be checked without water.
+ *
+ * The diagnostics are shown, not hidden behind a threshold. An algebraic ellipse
+ * fit always returns something: a slice through half a ring comes back with a
+ * plausible number and a *better* residual than the truth, because it
+ * extrapolates the missing side. If this panel showed only the centimetres, that
+ * failure would look exactly like a measurement.
+ */
+function CircumferenceReadout({ section }: { section?: CrossSectionResult }) {
+  if (!section) return null;
+  if (!section.ok) {
+    return (
+      <div
+        style={{
+          font: "400 11.5px/1.5 var(--sans)",
+          color: "var(--muted)",
+          margin: "0 0 10px",
+        }}
+      >
+        no circumference here — {section.reason}
+      </div>
+    );
+  }
+
+  const polygonGap =
+    ((section.circumferenceCm - section.polygonCm) / section.polygonCm) * 100;
+  return (
+    <div style={{ margin: "0 0 12px" }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <span style={{ font: "500 11px/1 var(--sans)", letterSpacing: "0.04em",
+                       textTransform: "uppercase", color: "var(--muted)" }}>
+          Circumference
+        </span>
+        <span style={{ font: "500 15px/1.2 var(--mono)", marginLeft: "auto" }}>
+          {section.circumferenceCm.toFixed(2)} cm
+        </span>
+      </div>
+      <div
+        style={{
+          font: "400 11px/1.6 var(--mono)",
+          color: "var(--muted)",
+          marginTop: 4,
+        }}
+      >
+        a {section.aCm.toFixed(2)} · b {section.bCm.toFixed(2)} cm ·{" "}
+        {section.nSlab} pts in a ±{SLAB_HALF_MM.toFixed(0)} mm slab
+        <br />
+        {(section.coverage * 100).toFixed(0)}% of the ring · residual{" "}
+        {section.residRmsMm.toFixed(2)} mm · polygon check{" "}
+        {section.polygonCm.toFixed(2)} cm ({polygonGap >= 0 ? "+" : ""}
+        {polygonGap.toFixed(1)}%)
+      </div>
+      {section.partialArc && (
+        <Caveat>
+          The ring is open — the largest gap is{" "}
+          {section.maxGapDeg.toFixed(0)}°, so the fit is extrapolating across a
+          side that was never reconstructed. Not a measurement.
+        </Caveat>
+      )}
+      {section.nearFloor && !section.partialArc && (
+        <Caveat>
+          This plane sits close to the floor, where the cloud carries the
+          fabricated base the pipeline adds. The girth here is partly invented
+          geometry.
+        </Caveat>
+      )}
+    </div>
+  );
+}
+
 export function Review({
   dataset,
   live,
@@ -101,6 +177,9 @@ export function Review({
   // The loader's full translation. offset.y converts slider cm <-> mesh Z;
   // offset.x/z are what put a manually added plane on the object's axis.
   const [offset, setOffset] = useState(new THREE.Vector3());
+  // Circumference at each plane, recomputed in the viewport whenever a plane
+  // moves. Empty until the cloud has loaded.
+  const [sections, setSections] = useState<Record<string, CrossSectionResult>>({});
   const offsetY = offset.y;
   // Where the object actually is horizontally at mid height, in scene cm.
   const [midAxis, setMidAxis] = useState(new THREE.Vector2());
@@ -132,8 +211,19 @@ export function Review({
       // fake one would imply a detection that never happened, and the user
       // would be adjusting an invention rather than a measurement. With no
       // marker the user adds a plane deliberately, or continues uncut.
-      setPlanes(detected.slice(0, MAX_PLANES));
-      setActive(detected[0]?.id ?? null);
+      //
+      // Detection can validate more than the two a cut can use. Seed the
+      // OUTERMOST two rather than the first two: two planes keep what lies
+      // between them, so the outermost pair is the largest segment the
+      // detected bands describe, and dropping one is one click. Taking the
+      // lowest two would silently propose a segment the reviewer never saw a
+      // reason for.
+      const seeded =
+        detected.length > MAX_PLANES
+          ? [detected[0], detected[detected.length - 1]]
+          : detected;
+      setPlanes(seeded);
+      setActive(seeded[0]?.id ?? null);
       setCalibrated(false);   // control values need offsetY, which arrives with the geometry
     });
   }, [dataset, scale]);
@@ -260,6 +350,7 @@ export function Review({
             <Viewport error={scaleError ?? loadError}>
               {rows && (
                 <CutReview
+                  onCrossSections={setSections}
                   onLoadError={setLoadError}
                   url={dataset.meshes.legNoCut}
                   scale={scale}
@@ -357,6 +448,7 @@ export function Review({
                   </Button>
                 </div>
               )}
+              <CircumferenceReadout section={sections[p.id]} />
               <Slider
                 label="Height"
                 value={controls[p.id]?.height ?? 0}

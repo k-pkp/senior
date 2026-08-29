@@ -41,6 +41,14 @@ BOX_PROMPT = "a box."
 # on inputs/small_leg and above the noise floor.
 DETECT_THRESHOLD = 0.3
 
+# Two boxes overlapping by more than this are the same object seen twice.
+# GroundingDINO returns several near-duplicate boxes for one cord -- it is a
+# detection-per-query model, not a segmenter -- and a capture wearing two bands
+# has to be told apart from one band detected twice. 0.3 is deliberately strict
+# for this: two cords tied on the same limb never overlap at all, so anything
+# sharing a third of its area with a stronger box is the same cord.
+NMS_IOU = 0.3
+
 _CACHE = {}
 
 
@@ -68,8 +76,33 @@ def release():
         torch.cuda.empty_cache()
 
 
-def detect(image_pil, prompt, threshold=DETECT_THRESHOLD, device="cuda"):
-    """Best box for `prompt`, as [x0, y0, x1, y1], or None."""
+def _iou(a, b):
+    """Intersection over union of two [x0, y0, x1, y1] boxes."""
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def detect_all(image_pil, prompt, threshold=DETECT_THRESHOLD, device="cuda",
+               iou_max=NMS_IOU):
+    """Every distinct box for `prompt`, best score first.
+
+    `detect` answers "where is the thing"; this answers "how many are there",
+    which is a different question and the one a capture wearing two marker bands
+    needs asked. Taking the argmax cannot distinguish one band from two, so a
+    two-band subject was framed around whichever band scored higher and the
+    other one could fall outside the crop with nothing said.
+
+    Near-duplicates are suppressed greedily by IoU: the model returns several
+    boxes per real object, and counting those as separate objects would report
+    two bands on every one-band capture.
+    """
     m = _models(device)
     torch = m["torch"]
     inputs = m["dino_proc"](images=image_pil, text=prompt,
@@ -79,10 +112,21 @@ def detect(image_pil, prompt, threshold=DETECT_THRESHOLD, device="cuda"):
     res = m["dino_proc"].post_process_grounded_object_detection(
         out, inputs.input_ids, threshold=threshold, text_threshold=threshold,
         target_sizes=[image_pil.size[::-1]])[0]
-    if not len(res["scores"]):
-        return None, 0.0
-    i = int(res["scores"].argmax())
-    return [float(v) for v in res["boxes"][i]], float(res["scores"][i])
+
+    order = res["scores"].argsort(descending=True)
+    kept = []
+    for i in order:
+        box = [float(v) for v in res["boxes"][int(i)]]
+        if any(_iou(box, k) > iou_max for k, _ in kept):
+            continue
+        kept.append((box, float(res["scores"][int(i)])))
+    return kept
+
+
+def detect(image_pil, prompt, threshold=DETECT_THRESHOLD, device="cuda"):
+    """Best box for `prompt`, as [x0, y0, x1, y1], or None."""
+    found = detect_all(image_pil, prompt, threshold, device)
+    return found[0] if found else (None, 0.0)
 
 
 def segment(image_pil, box, device="cuda"):

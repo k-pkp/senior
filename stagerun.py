@@ -513,6 +513,41 @@ def _measured_marker_colour(args, name):
     return None
 
 
+def _detected_band_count(args, name):
+    """How many marker bands Stage 0 counted, for --cut-mode auto.
+
+    None when Stage 0 did not run, or ran before multi-band detection existed.
+    That is "unknown", not "none": resolve_cut_mode falls back to the plane
+    count alone rather than treating a missing report as evidence.
+    """
+    for cand in (name, args.src):
+        if not cand:
+            continue
+        path = os.path.join(stage_dir(cand, 0, create=False), "framing.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f).get("bands")
+    return None
+
+
+def _projected_band_planes(args, name):
+    """Cut planes projected from Stage 0's band boxes, if both stages ran.
+
+    Empty when Stage 0 or Stage 1 is missing from this run, which leaves Stage 3
+    on colour detection alone — exactly what it did before.
+    """
+    from pipeline.core.bands3d import band_planes_from_dirs
+    for cand in (name, args.src):
+        if not cand:
+            continue
+        prep = stage_dir(cand, 0, create=False)
+        npz = os.path.join(stage_dir(cand, 1, create=False), "predictions.npz")
+        if os.path.exists(os.path.join(prep, "manifest.json")) and os.path.exists(npz):
+            return band_planes_from_dirs(
+                prep, npz, height_axis=args.segment_height_axis)
+    return []
+
+
 def _review_planes(args):
     """Cutting planes supplied by an interactive review, if any.
 
@@ -566,9 +601,15 @@ def run_stage3(args, name):
         clean_ply_path=None,
         marker_colour=_measured_marker_colour(args, name),
         override_planes=_review_planes(args),
+        cut_mode=getattr(args, "cut_mode", None),
+        n_bands=_detected_band_count(args, name),
+        band_planes=_projected_band_planes(args, name),
         apply_cut=not getattr(args, "no_cut", False))
 
-    lines = [f"STAGE 3 — clean   fill={not args.no_fill}  segment_leg={args.segment_leg}", ""]
+    from pipeline.stages.clean import resolve_cut_mode
+    lines = [f"STAGE 3 — clean   fill={not args.no_fill}  "
+             f"segment_leg={args.segment_leg}  "
+             f"cut_mode={resolve_cut_mode(getattr(args, 'cut_mode', None))}", ""]
     for p in sorted(glob.glob(os.path.join(d, "**", "*.ply"), recursive=True)):
         lines.append("  " + _pcd_stats(p))
     lines += ["", f"  objects handed to stage 4: {len(paths or [])}"]
@@ -785,6 +826,14 @@ def main():
     p.add_argument("--no-fill", action="store_true")
     p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg")
     p.add_argument("--segment-height-axis", default="z", choices=["x", "y", "z"])
+    p.add_argument("--cut-mode", dest="cut_mode", default=None,
+                   choices=["upper", "span", "auto"],
+                   help="stage 3: 'upper' measures everything below the highest "
+                        "valid band (one-band capture); 'span' measures the "
+                        "segment between the outermost two (upper and lower "
+                        "band); 'auto' follows the bands, cutting a span only "
+                        "when Stage 0's band count and Stage 3's plane count "
+                        "both say two. Default: config.MARKER_CUT_MODE (auto).")
     p.add_argument("--cut-only", dest="cut_only", action="store_true",
                    help="stage 3: skip straight to the cut, reusing the uncut "
                         "result a previous --no-cut run left on disk. Needs "

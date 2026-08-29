@@ -195,7 +195,7 @@ flowchart TB
     F3B[/"<b>03_clean/objects/leg_no_cut.ply</b><br/>19,333 pts · the cloud the Review screen draws"/]:::file
     F3C[/"<b>03_clean/objects/box.ply</b><br/>19,573 pts · the reference, extent (0.315,0.321,0.231)"/]:::file
     F3D[/"<b>03_clean/objects/merged.ply</b><br/>35,020 pts · both objects, for inspection"/]:::file
-    F3E[/"<b>03_clean/debug/cutting_line_levelled.json</b><br/>markers[]: centroid (3,), normal (3,), npts<br/>space = 'levelled' ← the ONLY file the web app may read"/]:::file
+    F3E[/"<b>03_clean/debug/cutting_line_levelled.json</b><br/>markers[]: the planes this run cut on<br/>candidates[]: every gated plane, lowest first — what the review seeds from<br/>cut_mode: upper or span<br/>space = 'levelled' ← the ONLY file the web app may read"/]:::file
     F3F[/"<b>03_clean/debug/levelling.json</b><br/>R_total (3,3) · floor_z · note"/]:::file
     NOLEG(["<b>NO leg_cut.ply is written</b><br/>and a stale one is deleted<br/>enforced by service/jobs.py:_postcondition"]):::guard
 

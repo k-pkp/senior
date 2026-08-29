@@ -193,6 +193,7 @@ so you can see what VGGT actually produced rather than infer it.
 | `--recon-method` | `poisson` | also `alpha_shape`, `poisson_omp1`, `box_primitive`. **Does not affect the reference cube** — use `--box-recon-method` for that |
 | `--box-recon-method` / `--obj-recon-method` | — | per-object override |
 | `--no-segment-leg` | off | **required** for objects with no marker band |
+| `--cut-mode` | `auto` | what the bands bound. `upper` measures everything **below** the highest band (one-band capture); `span` measures the segment **between** an upper and a lower band; `auto` cuts a span when two marker planes survive Stage 3's gates. **Pass it explicitly when the run has to match a ground truth measured a particular way** — the table above was measured foot-to-upper-band |
 | `--no-fill` | off | skip bottom cap and floor extend |
 | `--no-watertight` | off | publish the Stage 4 recon as the final meshes |
 | `--voxel-res` | 150 | voxel cross-check resolution |
@@ -252,6 +253,12 @@ first accuracy figure; everything before it was the system checking itself.
 | `sunshine` | 3093 cm³ | 3130 | **−1.2%** |
 | `champ` | 3354 cm³ | 2810 | **+19.4%** — unresolved, below |
 | `blue shirt` | — | 3420 | capture unusable, `inputs/blue shirt/UNUSABLE.md` |
+
+**These numbers were measured foot-to-upper-band, so reproducing them now needs
+`--cut-mode upper`.** The default became `auto` on 2026-08-29, and auto cuts a
+span wherever two marker planes survive Stage 3's gates — which `champ` does, so
+under the default it now reports the segment between its two bands (~2377 cm³)
+rather than the 3354 cm³ above. That is a different quantity, not a correction.
 
 Verified on a full cold run — Stage 0's detectors, a fresh VGGT pass, every
 stage after it — which reproduces the cached-stage-1 numbers to seven

@@ -65,6 +65,17 @@ Examples:
                    help="Disable marker-based leg surface segmentation (enabled by default)")
     p.add_argument("--segment-height-axis", type=str, default="z", choices=["x", "y", "z"],
                    help="Height axis for leg cut (default: z, vertical after leveling)")
+    p.add_argument("--cut-mode", dest="cut_mode", default=None,
+                   choices=["upper", "span", "auto"],
+                   help="stage 3: what the marker bands bound. 'upper' measures "
+                        "everything BELOW the highest valid band — the capture "
+                        "wears one band. 'span' measures the segment BETWEEN "
+                        "the outermost two — the capture wears an upper and a "
+                        "lower band. 'auto' (the default) follows the capture: "
+                        "it cuts a span only when Stage 0's band count and "
+                        "Stage 3's plane count BOTH say two. Set it explicitly "
+                        "when the run has to match a ground truth measured a "
+                        "particular way. Default: config.MARKER_CUT_MODE.")
     recon_choices = ["alpha_shape", "poisson", "poisson_omp1", "box_primitive"]
     p.add_argument("--recon-method", type=str, default="poisson",
                    choices=recon_choices,

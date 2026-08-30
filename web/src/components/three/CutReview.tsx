@@ -25,16 +25,35 @@ export const MAX_PLANES = 2;
  * A dot product per point per plane; at a few thousand points this is far below
  * frame budget, so no need to debounce.
  */
+// One cut plane reduced to a half-space in scene space: an upward normal, its
+// signed offset, and the height used to tell an upper plane from a lower one.
+interface PreparedPlane {
+  d0: number;
+  nrm: THREE.Vector3;
+  height: number;
+}
+
+// Splits a point cloud into the part the cut keeps and the part it discards.
 export function splitByPlanes(
   positions: Float32Array,
   planes: CutPlane[],
   sceneScale: number,
   offset: THREE.Vector3,
 ): { keep: Float32Array; drop: Float32Array } {
-  const n = positions.length / 3;
-  const UP = new THREE.Vector3(0, 1, 0);
+  const prepared = preparePlanes(planes, sceneScale, offset);
+  return splitPrepared(positions, prepared);
+}
 
-  const prepared = planes.slice(0, MAX_PLANES).flatMap((p) => {
+// Turns review planes into upward-facing half-spaces in scene space. Shared by
+// the point split and the surface clip so the two cannot disagree about which
+// side is kept.
+export function preparePlanes(
+  planes: CutPlane[],
+  sceneScale: number,
+  offset: THREE.Vector3,
+): PreparedPlane[] {
+  const UP = new THREE.Vector3(0, 1, 0);
+  return planes.slice(0, MAX_PLANES).flatMap((p) => {
     // Plane data is in levelled Z-up mesh units; scene space is Y-up cm, and
     // the cloud was also recentred — `offset` carries that same translation.
     const c = pointToScene(p.centroid, sceneScale, offset);
@@ -44,9 +63,18 @@ export function splitByPlanes(
     // undefined for it. Skipping beats guessing a side.
     if (Math.abs(vert) < 1e-3) return [];
     if (vert < 0) nrm.negate();
-    return [{ d0: nrm.dot(c), nrm }];
+    return [{ d0: nrm.dot(c), nrm, height: c.dot(UP) }];
   });
 
+}
+
+// Splits the positions against prepared half-spaces: below a single plane, or
+// between two.
+function splitPrepared(
+  positions: Float32Array,
+  prepared: PreparedPlane[],
+): { keep: Float32Array; drop: Float32Array } {
+  const n = positions.length / 3;
   if (!prepared.length) return { keep: positions, drop: new Float32Array(0) };
 
   const keep: number[] = [];
@@ -93,6 +121,64 @@ function midAxis(geom: THREE.BufferGeometry): THREE.Vector2 {
   }
   if (!k) return new THREE.Vector2((bb.min.x + bb.max.x) / 2, (bb.min.z + bb.max.z) / 2);
   return new THREE.Vector2(sx / k, sz / k);
+}
+
+
+// Renders the limb as a solid surface, clipped to the region the cut keeps.
+// Used whenever the loaded geometry carries faces; a point cloud falls back to
+// the Points path below. A surface is what a clinician actually places a cut
+// on — judging where a plane meets skin is far harder against a scatter of
+// points than against the skin itself.
+function Surface({
+  geometry,
+  prepared,
+}: {
+  geometry: THREE.BufferGeometry;
+  prepared: PreparedPlane[];
+}) {
+  const clippingPlanes = useMemo(() => {
+    // three.js keeps whatever satisfies normal·p + constant >= 0, and the
+    // planes here are prepared with their normals pointing up.
+    if (prepared.length === 0) return [];
+    if (prepared.length === 1) {
+      // Keep what is BELOW the plane.
+      const only = prepared[0];
+      return [new THREE.Plane(only.nrm.clone().negate(), only.d0)];
+    }
+    // Keep what lies BETWEEN: below the upper plane and above the lower one.
+    // Several clipping planes intersect, which is exactly that conjunction.
+    const byHeight = [...prepared].sort((a, b) => a.height - b.height);
+    const lower = byHeight[0];
+    const upper = byHeight[1];
+    return [
+      new THREE.Plane(upper.nrm.clone().negate(), upper.d0),
+      new THREE.Plane(lower.nrm.clone(), -lower.d0),
+    ];
+  }, [prepared]);
+
+  return (
+    <group>
+      {/* The discarded remainder, faint, so the cut reads as a cut rather than
+          as the limb simply ending where it does. */}
+      <mesh geometry={geometry}>
+        <meshStandardMaterial
+          color="#b9bcc0"
+          transparent
+          opacity={0.16}
+          depthWrite={false}
+          roughness={0.9}
+        />
+      </mesh>
+      <mesh geometry={geometry}>
+        <meshStandardMaterial
+          color="#3b7dd8"
+          clippingPlanes={clippingPlanes}
+          roughness={0.65}
+          metalness={0.05}
+        />
+      </mesh>
+    </group>
+  );
 }
 
 // Renders one point cloud as a three.js points object.
@@ -315,8 +401,27 @@ export function CutReview({
   return (
     <Bounds fit clip observe margin={1.5}>
       <group>
-        <Points data={split.keep} color="#3b7dd8" size={0.22} />
-        <Points data={split.drop} color="#b9bcc0" size={0.16} opacity={0.4} />
+        {/* Stage 5 publishes a watertight solid, and that is what the cut is
+            actually applied to, so the review draws it as a surface. Jobs
+            measured before the cut moved — and the bundled samples — still
+            arrive as point clouds, which have no index; those fall back to the
+            point split. */}
+        {geometry.index ? (
+          <Surface
+            geometry={geometry}
+            prepared={preparePlanes(
+              planes,
+              scale,
+              (geometry.userData.sceneOffset as THREE.Vector3) ??
+                new THREE.Vector3(),
+            )}
+          />
+        ) : (
+          <>
+            <Points data={split.keep} color="#3b7dd8" size={0.22} />
+            <Points data={split.drop} color="#b9bcc0" size={0.16} opacity={0.4} />
+          </>
+        )}
         {planes.map((p) => (
           <OriginWidget
             key={`o${p.id}`}

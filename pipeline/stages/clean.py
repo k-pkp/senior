@@ -562,7 +562,7 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     # Rotate the marker planes into levelled space. This happens before any
     # cutting so the planes can be published for review whether or not the cut
     # is applied here.
-    leg_no_cut_path = os.path.join(objects_dir, "leg_no_cut.ply")
+    leg_path = os.path.join(objects_dir, "leg.ply")
     markers_rotated = []
     candidates = []
     if len(markers) > 0:
@@ -813,18 +813,41 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
                     .astype(np.uint8) if p.has_colors() else cols)
         return out_pts, out_cols
 
-    # The cut operates on the OPEN cloud — floor-cut but not yet floor-closed —
-    # and only then closes what the cut leaves open. Saving it is what lets a
-    # deferred cut reproduce this pass exactly instead of approximating it by
-    # cutting the closed cloud, which carries a fabricated skirt the real path
-    # never cuts through.
-    _quick_save_ply(leg_pts_rot, leg_cols_arr,
-                    os.path.join(objects_dir, "leg_open.ply"))
+    def _close_top(pts, cols):
+        """Cap the limb's open upper end, the way the bottom is capped.
 
-    # Complete but uncut — the review cloud. Always floor-closed.
+        The limb does not end at the top; the reconstruction simply stops where
+        the frame did, leaving an open tube. Poisson wants a closed surface, and
+        on an open one it returns chi=-2 -- not a single closed solid -- which
+        sends Stage 4 to its alpha-shape fallback. That ladder has to open to 40x
+        point spacing before it seals, and a wrap that loose reads volume high:
+        it is what put inputs/sunshine 10% over its displacement volume.
+
+        This did not arise while Stage 3 cut the cloud, because Stage 4 then only
+        ever saw a limb whose top was the cut face, already capped. Now that the
+        UNCUT limb is what gets reconstructed, its top has to be closed here.
+        """
+        if not fill_enabled or len(pts) == 0:
+            return pts, cols
+        height_index = {"x": 0, "y": 1, "z": 2}[segment_height_axis]
+        plane_normal = [0.0, 0.0, 0.0]
+        plane_normal[height_index] = 1.0
+        top_height = float(np.asarray(pts)[:, height_index].max())
+        plane_point = [0.0, 0.0, 0.0]
+        plane_point[height_index] = top_height
+        return cap_points_on_plane(pts, cols, plane_point, plane_normal,
+                                   label="limb top")
+
+    # The complete limb, closed at both ends. Stage 3 publishes exactly one limb
+    # cloud now: the open/closed pair existed only because the cut used to happen
+    # here and had to run on the open cloud before closing what it left open. The
+    # cut is applied to Stage 5's solid instead, so there is nothing left to
+    # sequence around -- but the limb must now be closed at the top as well as
+    # the bottom, because it is reconstructed uncut.
     nc_pts, nc_cols = _close_to_floor(leg_pts_rot, leg_cols_arr)
-    _quick_save_ply(nc_pts, nc_cols, leg_no_cut_path)
-    print(f"Saved (complete, uncut): {leg_no_cut_path} ({len(nc_pts):,} pts)")
+    nc_pts, nc_cols = _close_top(nc_pts, nc_cols)
+    _quick_save_ply(nc_pts, nc_cols, leg_path)
+    print(f"Saved (complete limb): {leg_path} ({len(nc_pts):,} pts)")
 
     n_markers = len(markers_rotated)
     if apply_cut and n_markers > 0 and len(leg_pts_rot) > 0:
@@ -881,8 +904,8 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     elif not apply_cut:
         if os.path.exists(leg_cut_path):
             os.remove(leg_cut_path)   # a stale one would be measured instead
-        if os.path.exists(leg_no_cut_path):
-            output_paths.append(leg_no_cut_path)
+        if os.path.exists(leg_path):
+            output_paths.append(leg_path)
         print("Stage 3 deferred the cut — passing the uncut limb to Stage 4")
     if len(o3d_box.points) > 0:
         o3d.io.write_point_cloud(box_path, o3d_box)
@@ -968,120 +991,3 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
         print(f"  ERROR during stage 3: {e}")
         return None
 
-
-def cut_only(stage3_dir, planes, fill_enabled=True):
-    """Apply confirmed cutting planes to a stage 3 output that deferred its cut.
-
-    This is the second half of a split Stage 3. The first half did all the
-    expensive work — SOR, RANSAC, DBSCAN, ghost filtering, MLS, levelling,
-    marker detection — and saved the levelled limb in the exact state the cut
-    operates on (`leg_open.ply`: floor-cut, not yet floor-closed). None of that
-    depends on where the cut goes, so none of it is repeated here.
-
-    The steps below are the same ones, in the same order, that
-    `_segment_and_export` runs after its own detection. They have to be: the
-    whole point of splitting is that confirming the detected plane must give
-    the identical answer to never having split at all.
-
-    `planes` are {"centroid", "normal"} in LEVELLED space. An empty list means
-    the user chose to measure the object whole.
-    """
-    import json as _json
-
-    objects_dir = os.path.join(stage3_dir, "objects")
-    debug_dir_out = os.path.join(stage3_dir, "debug")
-    open_path = os.path.join(objects_dir, "leg_open.ply")
-    box_path = os.path.join(objects_dir, "box.ply")
-    if not os.path.exists(open_path):
-        raise SystemExit(
-            f"ERROR: {open_path} missing — run stage 3 with --no-cut first, so "
-            f"there is a detected-but-uncut result to apply a cut to")
-
-    with open(os.path.join(debug_dir_out, "levelling.json")) as f:
-        floor_z = _json.load(f).get("floor_z")
-
-    pcd = o3d.io.read_point_cloud(open_path)
-    pts = np.asarray(pcd.points, dtype=np.float32)
-    cols = ((np.clip(np.asarray(pcd.colors, dtype=np.float32), 0, 1) * 255)
-            .astype(np.uint8) if pcd.has_colors() else None)
-    print(f"Loaded uncut limb: {len(pts):,} pts")
-
-    markers = []
-    for m in list(planes)[:MAX_MARKERS]:
-        n = np.asarray(m["normal"], dtype=np.float64)
-        n = n / (np.linalg.norm(n) + 1e-8)
-        markers.append({"centroid": np.asarray(m["centroid"], dtype=np.float64).tolist(),
-                        "normal": n.tolist(), "npts": int(m.get("npts", 0))})
-
-    def _close_to_floor(p_pts, p_cols):
-        """Extends the cluster down to the floor plane and caps its underside.
-
-        Returns the points and colours unchanged when filling is disabled or no
-        floor height was found.
-        """
-        if not fill_enabled or floor_z is None or len(p_pts) == 0:
-            return p_pts, p_cols
-        p = _array_to_o3d(p_pts, p_cols)
-        p = extend_point_cloud_to_floor(p, floor_z, label="obj")
-        p = cap_point_cloud_bottom(p, alpha=2.0)
-        out = np.asarray(p.points, dtype=np.float32)
-        oc = ((np.clip(np.asarray(p.colors, dtype=np.float32), 0, 1) * 255)
-              .astype(np.uint8) if p.has_colors() else p_cols)
-        return out, oc
-
-    if markers:
-        keep, case = apply_marker_cut(pts.astype(np.float64), markers)
-        if int(keep.sum()) >= 50:
-            pts, cols = pts[keep], (None if cols is None else cols[keep])
-            print(f"Marker cut ({case}): leg → {len(pts):,} pts")
-            if fill_enabled:
-                for i, mr in enumerate(markers):
-                    pts, cols = cap_points_on_plane(pts, cols, mr["centroid"],
-                                                    mr["normal"], label=f"marker {i}")
-                pts = pts.astype(np.float32)
-            if len(markers) < 2:
-                pts, cols = _close_to_floor(pts, cols)
-        else:
-            print(f"Marker cut ({case}): only {int(keep.sum())} pts (< 50) — "
-                  f"keeping the whole limb")
-            pts, cols = _close_to_floor(pts, cols)
-    else:
-        print("No cutting planes supplied — measuring the limb whole")
-        pts, cols = _close_to_floor(pts, cols)
-
-    # Carry detection's candidates across the cut. This file is what the review
-    # screen reloads afterwards, and the detected bands have to survive an edit:
-    # without them a reviewer who removed a plane could only put it back by
-    # hand, replacing a fitted marker plane with a guess.
-    candidates = []
-    levelled_path = os.path.join(debug_dir_out, "cutting_line_levelled.json")
-    if os.path.exists(levelled_path):
-        try:
-            with open(levelled_path) as f:
-                published = _json.load(f)
-            candidates = published.get("candidates", published.get("markers", []))
-        except (ValueError, OSError) as exc:
-            print(f"  (candidates not carried over: {type(exc).__name__}: {exc})")
-
-    with open(os.path.join(debug_dir_out, "cutting_line_review.json"), "w") as f:
-        _json.dump({"markers": markers, "candidates": candidates,
-                    "space": "levelled", "source": "review"},
-                   f, indent=2)
-
-    leg_cut_path = os.path.join(objects_dir, "leg_cut.ply")
-    o3d_leg = _array_to_o3d(pts, cols)
-    o3d.io.write_point_cloud(leg_cut_path, o3d_leg)
-    print(f"Saved: {leg_cut_path} ({len(pts):,} pts)")
-
-    out = [leg_cut_path]
-    if os.path.exists(box_path):
-        out.append(box_path)
-        box = o3d.io.read_point_cloud(box_path)
-        merged = o3d.geometry.PointCloud()
-        merged.points = o3d.utility.Vector3dVector(
-            np.vstack([np.asarray(o3d_leg.points), np.asarray(box.points)]))
-        if o3d_leg.has_colors() and box.has_colors():
-            merged.colors = o3d.utility.Vector3dVector(
-                np.vstack([np.asarray(o3d_leg.colors), np.asarray(box.colors)]))
-        o3d.io.write_point_cloud(os.path.join(objects_dir, "merged.ply"), merged)
-    return out

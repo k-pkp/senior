@@ -239,15 +239,10 @@ def _postcondition(job: Job, extra: list[str], done_state: str) -> str | None:
     if "--no-cut" not in extra:
         return None
 
-    leaked = os.path.join(job.dir, "03_clean", "objects", "leg_cut.ply")
-    if os.path.exists(leaked):
-        return ("deferred-cut violation: leg_cut.ply exists after a --no-cut "
-                "pass, so the subject was measured before the cut was confirmed")
-
-    # A deferred pass now reconstructs the UNCUT limb, so that the review screen
-    # can show a solid rather than a point cloud. leg_no_cut.ply is therefore
-    # expected here. A cut limb mesh is not: its presence would mean some stage
-    # applied a cut this pass was told to defer.
+    # The cut now happens in Stage 5, on the repaired solid, so the thing that
+    # must not exist after a deferred pass is a cut MESH. Stage 3 publishes only
+    # leg.ply and box.ply and has no way to cut anything, which is why there is
+    # no longer a check against its objects directory.
     for stage_dir_name in ("04_recon", "05_watertight"):
         for mesh_name in ("leg_cut.ply", "leg_cut_recon.ply"):
             cut_mesh = os.path.join(job.dir, stage_dir_name, "mesh", mesh_name)

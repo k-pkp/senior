@@ -4,10 +4,11 @@ Stage 6 reports a volume, which says nothing about the shape that produced it.
 A circumference at the cut is the one limb dimension that can be checked against
 a tape measure without water, so it is measured here and printed alongside.
 
-The slice is taken from `leg_open.ply`, never `leg_cut.ply`: Stage 3 caps the
+The slice is taken from `leg.ply`, Stage 3's complete limb, never a cut one:
+the cut caps the
 exposed cross-section with a synthetic grid (`core/fill.py:cap_points_on_plane`)
 that lies on exactly the plane being measured, and fitting to those interior
-points pulls the ellipse inward. `leg_open.ply` is the same cloud levelled and
+points pulls the ellipse inward. `leg.ply` is the same cloud levelled and
 floor-cut but before the cut and before any capping, so every point in the slab
 is reconstructed surface.
 
@@ -220,7 +221,7 @@ def load_cut_geometry(clean_dir):
     review_json = os.path.join(debug_dir, "cutting_line_review.json")
     plane_json = (review_json if os.path.exists(review_json)
                   else os.path.join(debug_dir, "cutting_line_levelled.json"))
-    cloud_path = os.path.join(clean_dir, "objects", "leg_open.ply")
+    cloud_path = os.path.join(clean_dir, "objects", "leg.ply")
 
     for p in (plane_json, cloud_path):
         if not os.path.exists(p):

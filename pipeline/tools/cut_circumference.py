@@ -69,7 +69,7 @@ def main():
     ap.add_argument("--scale-cm-per-unit", type=float, default=None,
                     help="override the scale instead of reading volumes.csv")
     ap.add_argument("--cloud", default=None,
-                    help="override the point cloud (default: leg_open.ply)")
+                    help="override the point cloud (default: leg.ply)")
     ap.add_argument("--json", action="store_true", help="also print JSON")
     args = ap.parse_args()
 

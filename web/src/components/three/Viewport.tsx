@@ -116,7 +116,9 @@ export function Viewport({
       <Canvas
         dpr={[1, 2]}
         camera={{ position: cameraPosition, fov: 40, near: 0.1, far: 2000 }}
-        gl={{ antialias: true }}
+        // localClippingEnabled lets a material carry its own clipping planes,
+        // which is how the review shows the kept side of the cut as a solid.
+        gl={{ antialias: true, localClippingEnabled: true }}
       >
         <hemisphereLight intensity={0.55} groundColor="#404040" />
         <directionalLight position={[18, 30, 14]} intensity={1.5} />

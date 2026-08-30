@@ -1,4 +1,5 @@
 import type { CutPlane, FramingReport, SampleDataset } from "./types";
+import type { CameraData, LevellingData } from "./imagecamera";
 
 /** Port the compute service listens on. */
 const API_PORT = 8000;
@@ -160,4 +161,39 @@ export function jobDataset(id: string, frames: number): SampleDataset {
 // Base URL for this job's Stage 0 prep images.
 export function jobPrepBase(id: string) {
   return `${API}/jobs/${id}/files/prep`;
+}
+
+/** URLs of the frames VGGT consumed, in order — Stage 0's 518px crops. */
+export function jobFrameUrls(id: string, frames: number): string[] {
+  const urls: string[] = [];
+  for (let index = 0; index < frames; index++) {
+    const name = `frame_${String(index).padStart(2, "0")}.png`;
+    urls.push(`${API}/jobs/${id}/files/prep/${name}`);
+  }
+  return urls;
+}
+
+/**
+ * VGGT's per-frame cameras for this job, or null if the run has not produced
+ * them. Only Stage 1 writes them, so they are absent until inference has run.
+ */
+export async function loadCameras(id: string): Promise<CameraData | null> {
+  try {
+    const response = await fetch(`${API}/jobs/${id}/files/cameras.json`);
+    if (!response.ok) return null;
+    return (await response.json()) as CameraData;
+  } catch {
+    return null;
+  }
+}
+
+/** Stage 3's levelling rotation for this job, or null if it has not run. */
+export async function loadLevelling(id: string): Promise<LevellingData | null> {
+  try {
+    const response = await fetch(`${API}/jobs/${id}/files/levelling.json`);
+    if (!response.ok) return null;
+    return (await response.json()) as LevellingData;
+  } catch {
+    return null;
+  }
 }

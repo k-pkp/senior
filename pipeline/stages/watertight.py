@@ -19,6 +19,11 @@ _MESHFIX_WORKER = os.path.join(_PROJECT_ROOT, "pipeline", "workers",
 UNCUT_LIMB_NAME = "leg_no_cut.ply"
 CUT_LIMB_NAME = "leg_cut.ply"
 
+# What Stage 3's limb is called by the time Stage 5 has repaired it. Stage 3
+# publishes one limb, leg.ply; Stage 5 renames it to leg_no_cut.ply so the two
+# solids it publishes read as a pair against leg_cut.ply.
+REPAIRED_LIMB_NAME = "leg.ply"
+
 
 def _wt_name(recon_path):
     """Derive output name from recon path: box_recon.ply → box, obj_recon.ply → obj."""
@@ -169,6 +174,26 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
     return scene_colour_ply, scene_stl, watertight_paths
 
 
+def _rename_repaired_limb(watertight_paths):
+    """Renames the repaired limb from Stage 3's leg.ply to leg_no_cut.ply.
+
+    Stage 5 publishes the limb twice -- uncut and cut -- so the uncut one is
+    named for what it is rather than carrying Stage 3's name forward.
+    """
+    renamed = []
+    for candidate in watertight_paths:
+        if os.path.basename(candidate) != REPAIRED_LIMB_NAME:
+            renamed.append(candidate)
+            continue
+        uncut_path = os.path.join(os.path.dirname(candidate), UNCUT_LIMB_NAME)
+        os.replace(candidate, uncut_path)
+        stl_source = os.path.splitext(candidate)[0] + ".stl"
+        if os.path.exists(stl_source):
+            os.replace(stl_source, os.path.splitext(uncut_path)[0] + ".stl")
+        renamed.append(uncut_path)
+    return renamed
+
+
 def _cut_limb_mesh(watertight_paths, mesh_output_dir, cut_planes, height_axis):
     """Cuts the repaired limb against the confirmed planes and writes leg_cut.ply.
 
@@ -234,6 +259,8 @@ def watertight_stage(recon_paths, output_dir, cut_planes=None, height_axis="z"):
         print(f"  Scene watertight mesh: {scene_wt}")
         for p in wt_paths:
             print(f"  Object watertight mesh: {p}")
+        wt_paths = _rename_repaired_limb(wt_paths)
+
         if cut_planes:
             cut_path = _cut_limb_mesh(wt_paths, mesh_output_dir, cut_planes,
                                       height_axis)

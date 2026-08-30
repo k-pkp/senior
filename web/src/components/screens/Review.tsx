@@ -8,6 +8,8 @@ import { linearScale, loadCutPlanes, loadVolumes, newPlaneId } from "@/lib/data"
 import { MAX_PLANES } from "@/components/three/CutReview";
 import { SLAB_HALF_MM, type CrossSectionResult } from "@/lib/crosssection";
 import type { CutPlane, SampleDataset, VolumeRow } from "@/lib/types";
+import { jobFrameUrls, loadCameras, loadLevelling } from "@/lib/api";
+import type { CameraData, LevellingData } from "@/lib/imagecamera";
 
 const Viewport = dynamic(
   () => import("@/components/three/Viewport").then((m) => m.Viewport),
@@ -15,6 +17,10 @@ const Viewport = dynamic(
 );
 const CutReview = dynamic(
   () => import("@/components/three/CutReview").then((m) => m.CutReview),
+  { ssr: false },
+);
+const ImageCut = dynamic(
+  () => import("@/components/three/ImageCut").then((m) => m.ImageCut),
   { ssr: false },
 );
 
@@ -268,6 +274,35 @@ export function Review({
   }
 
   // Adds a new plane at mid-height, up to MAX_PLANES.
+  // Placing the cut on a photograph needs VGGT's own camera for the frame and
+  // the rotation Stage 3 levelled by. Only a live job has them; a shipped
+  // sample ships meshes and nothing else, so the option stays hidden there.
+  const [cameras, setCameras] = useState<CameraData | null>(null);
+  const [levelling, setLevelling] = useState<LevellingData | null>(null);
+  const [photoCutOpen, setPhotoCutOpen] = useState(false);
+
+  useEffect(() => {
+    if (!live) return;
+    let stillMounted = true;
+    loadCameras(dataset.id).then((data) => stillMounted && setCameras(data));
+    loadLevelling(dataset.id).then((data) => stillMounted && setLevelling(data));
+    return () => {
+      stillMounted = false;
+    };
+  }, [live, dataset.id]);
+
+  /** Adds a plane the user placed by clicking the photograph. */
+  function placePlaneFromPhoto(plane: CutPlane) {
+    if (planes.length >= MAX_PLANES) return;
+    setPlanes((ps) => [...ps, plane]);
+    setControls((c) => ({
+      ...c,
+      [plane.id]: { height: plane.centroid[2] * scale + offsetY, tilt: 0, dir: 0 },
+    }));
+    setActive(plane.id);
+  }
+
+  // Adds a plane at mid-height, up to MAX_PLANES.
   function addPlane() {
     if (planes.length >= MAX_PLANES) return;
     const id = newPlaneId();

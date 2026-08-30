@@ -574,31 +574,14 @@ def _review_planes(args):
 
 
 def run_stage3(args, name):
-    """Segments the cloud, detects the marker planes, and exports the per-object clouds.
+    """Segments the cloud, detects the marker planes, and exports leg.ply and box.ply.
 
-    With --cut-only it skips straight to applying already-confirmed planes to
-    the uncut limb on disk, which avoids paying for a second clustering pass.
+    No cutting happens here. The planes are published for review and applied in
+    Stage 5, to the watertight solid, so re-cutting costs a plane slice rather
+    than a second clustering, ghost filter, MLS and levelling pass.
     """
     import glob
-    from pipeline.stages.clean import clean_and_extract, cut_only
-
-    # --cut-only is the second half of a Stage 3 that deferred its cut. Every
-    # expensive step already ran and its result is on disk, so this reads the
-    # uncut limb back and applies the confirmed planes to it. Doing that instead
-    # of a full re-run is what keeps a review from costing a second clustering,
-    # ghost filter, MLS and levelling pass.
-    if getattr(args, "cut_only", False):
-        d = stage_dir(name, 3)
-        paths = cut_only(d, _review_planes(args) or [],
-                         fill_enabled=not args.no_fill)
-        lines = ["STAGE 3 — cut only   (planes confirmed by review)", ""]
-        for p in sorted(glob.glob(os.path.join(d, "objects", "*.ply"))):
-            lines.append("  " + _pcd_stats(p))
-        lines += ["", f"  objects handed to stage 4: {len(paths or [])}"]
-        for p in (paths or []):
-            lines.append(f"    {p}")
-        _write_summary(d, lines)
-        return
+    from pipeline.stages.clean import clean_and_extract
 
     prev = src_dir(args, name, 2)
     ply = os.path.join(prev, "points.ply")
@@ -693,12 +676,10 @@ def run_stage4(args, name):
 
     prev = src_dir(args, name, 3)
     objs = sorted(glob.glob(os.path.join(prev, "objects", "*.ply")))
-    # leg_no_cut.ply is here so that a deferred run still produces a limb MESH.
-    # The review screen has to show the surgeon a solid to place the cut on, and
-    # before this it had only Stage 3's point cloud. Measuring it is a separate
-    # question, and the answer is no -- see the guard in compute_volumes.
+    # leg.ply is Stage 3's complete limb. Stage 5 repairs it, cuts the solid and
+    # publishes both leg_no_cut.ply and leg_cut.ply from it.
     objs = [p for p in objs if os.path.basename(p) in
-            ("box.ply", "leg_cut.ply", "leg_no_cut.ply", "obj.ply")]
+            ("box.ply", "leg.ply", "obj.ply")]
     if not objs:
         sys.exit("ERROR: stage 3 objects missing — run stage 3 first")
 
@@ -866,14 +847,10 @@ def main():
                         "band); 'auto' follows the bands, cutting a span only "
                         "when Stage 0's band count and Stage 3's plane count "
                         "both say two. Default: config.MARKER_CUT_MODE (auto).")
-    p.add_argument("--cut-only", dest="cut_only", action="store_true",
-                   help="stage 3: skip straight to the cut, reusing the uncut "
-                        "result a previous --no-cut run left on disk. Needs "
-                        "--planes.")
     p.add_argument("--no-cut", dest="no_cut", action="store_true",
-                   help="stage 3: detect the cutting planes and publish them, "
-                        "but do not cut. The uncut cloud is measured instead, "
-                        "so a review can approve the cut before it is applied.")
+                   help="defer the cut: Stage 3 publishes the detected planes "
+                        "and Stage 5 leaves the limb uncut, so a review can "
+                        "approve where it falls before anything is measured.")
     p.add_argument("--planes", default=None,
                    help="JSON of cutting planes in levelled space to use instead "
                         "of the detected ones (stage 3) — the shape stage 3 "

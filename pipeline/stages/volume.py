@@ -325,7 +325,19 @@ def compute_volumes(object_mesh_paths: list[str],
           f"(ref = {REFERENCE_REAL_SIZE_CM} cm ArUco cube  |  voxel_res={res_label})")
     print("=" * 60)
 
-    rows = [_load_mesh_info(p, voxel_res, auto_res=auto_res) for p in object_mesh_paths]
+    # The uncut limb is published so a person can place the cut on a solid; it
+    # is not a measurement. Reporting a volume for it would put a number on
+    # screen for a cut nobody confirmed, which is the one output this pipeline
+    # must never produce. Refused here rather than only in the caller, so every
+    # entry point inherits it.
+    measurable_paths = []
+    for mesh_path in object_mesh_paths:
+        if os.path.basename(mesh_path) == "leg_no_cut.ply":
+            print(f"  skipping (uncut limb, published for review only): {mesh_path}")
+            continue
+        measurable_paths.append(mesh_path)
+
+    rows = [_load_mesh_info(p, voxel_res, auto_res=auto_res) for p in measurable_paths]
     rows = [r for r in rows if r is not None]
     if not rows:
         print("  No meshes loaded.")

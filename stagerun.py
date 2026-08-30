@@ -618,7 +618,13 @@ def run_stage3(args, name):
         cut_mode=getattr(args, "cut_mode", None),
         n_bands=_detected_band_count(args, name),
         band_planes=_projected_band_planes(args, name),
-        apply_cut=not getattr(args, "no_cut", False))
+        # Stage 3 no longer cuts. It segments the limb, detects the marker
+        # planes and publishes both; the cut itself is applied in Stage 5,
+        # to the repaired watertight solid. Cutting the mesh is what lets a
+        # clinician place the cut on a surface rather than on a scatter of
+        # points, and it leaves no reconstruction step between the cut and
+        # the measurement.
+        apply_cut=False)
 
     from pipeline.stages.clean import resolve_cut_mode
     lines = [f"STAGE 3 — clean   fill={not args.no_fill}  "
@@ -687,7 +693,12 @@ def run_stage4(args, name):
 
     prev = src_dir(args, name, 3)
     objs = sorted(glob.glob(os.path.join(prev, "objects", "*.ply")))
-    objs = [p for p in objs if os.path.basename(p) in ("box.ply", "leg_cut.ply", "obj.ply")]
+    # leg_no_cut.ply is here so that a deferred run still produces a limb MESH.
+    # The review screen has to show the surgeon a solid to place the cut on, and
+    # before this it had only Stage 3's point cloud. Measuring it is a separate
+    # question, and the answer is no -- see the guard in compute_volumes.
+    objs = [p for p in objs if os.path.basename(p) in
+            ("box.ply", "leg_cut.ply", "leg_no_cut.ply", "obj.ply")]
     if not objs:
         sys.exit("ERROR: stage 3 objects missing — run stage 3 first")
 
@@ -720,9 +731,23 @@ def run_stage5(args, name):
     if not recon:
         sys.exit("ERROR: stage 4 recon meshes missing — run stage 4 first")
 
+    # Which planes this stage cuts on, in priority order: the ones a review
+    # handed back, else the ones Stage 3 detected. --no-cut defers entirely, so
+    # the uncut solid is published and nothing is cut until a person confirms.
+    cut_planes = None
+    if not getattr(args, "no_cut", False):
+        cut_planes = _review_planes(args)
+        if cut_planes is None:
+            detected = os.path.join(src_dir(args, name, 3), "debug",
+                                    "cutting_line_levelled.json")
+            if os.path.exists(detected):
+                with open(detected) as planes_file:
+                    cut_planes = json.load(planes_file).get("markers", [])
+
     d = stage_dir(name, 5)
     _clear_meshes(d)
-    scene, wt = watertight_stage(recon, d)
+    scene, wt = watertight_stage(recon, d, cut_planes=cut_planes,
+                                 height_axis=args.segment_height_axis)
 
     lines = ["STAGE 5 — watertight", ""]
     lines += ["  " + _mesh_stats(p) for p in (wt or [])]
@@ -737,8 +762,12 @@ def run_stage6(args, name):
     for n in (5, 4):
         prev = os.path.join(src_dir(args, name, n), "mesh")
         meshes = sorted(glob.glob(os.path.join(prev, "*.ply")))
+        # scene* is the merge of the others, and leg_no_cut is the UNCUT limb
+        # published for review. Measuring either reports a volume nobody asked
+        # for -- in leg_no_cut's case, one for a cut nobody has confirmed.
         meshes = [p for p in meshes
-                  if not os.path.basename(p).startswith("scene")]
+                  if not os.path.basename(p).startswith("scene")
+                  and os.path.basename(p) != "leg_no_cut.ply"]
         if meshes:
             break
     if not meshes:

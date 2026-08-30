@@ -863,14 +863,16 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     box_path = os.path.join(objects_dir, "box.ply")
     merged_path = os.path.join(objects_dir, "merged.ply")
 
-    # leg_cut + box
+    # the limb + box
     #
-    # With the cut deferred there is deliberately no leg_cut.ply. Writing the
-    # uncut cloud under that name would send stages 4-6 off to reconstruct and
-    # integrate a limb whose extent nobody has agreed to yet, and every second
-    # of that is thrown away the moment the cut is confirmed. The reference cube
-    # still goes through, because its measurement does not depend on the cut and
-    # the review needs its edge length to show anything in centimetres.
+    # Stage 3 no longer cuts: it hands the UNCUT limb forward so Stage 4 can
+    # reconstruct it and Stage 5 can cut the resulting solid. That is what puts a
+    # surface in front of the person placing the cut, instead of a point cloud,
+    # and it leaves no reconstruction step between the cut and the measurement.
+    #
+    # No leg_cut.ply is written here in either case. Stage 6 measures the cut
+    # solid Stage 5 produces, so a cut cloud under that name would be a second,
+    # unmeasured answer to the same question.
     output_paths = []
     if apply_cut and len(o3d_leg.points) > 0:
         o3d.io.write_point_cloud(leg_cut_path, o3d_leg)
@@ -879,7 +881,9 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     elif not apply_cut:
         if os.path.exists(leg_cut_path):
             os.remove(leg_cut_path)   # a stale one would be measured instead
-        print("Deferred: leg_cut.ply not written — awaiting the confirmed cut")
+        if os.path.exists(leg_no_cut_path):
+            output_paths.append(leg_no_cut_path)
+        print("Stage 3 deferred the cut — passing the uncut limb to Stage 4")
     if len(o3d_box.points) > 0:
         o3d.io.write_point_cloud(box_path, o3d_box)
         output_paths.append(box_path)
@@ -927,7 +931,7 @@ def _array_to_o3d(points, colors_uint8):
 
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
                       segment_leg=False, segment_height_axis="z",
-                      fill_enabled=True, clean_ply_path=None, apply_cut=True,
+                      fill_enabled=True, clean_ply_path=None, apply_cut=False,
                       marker_colour=None, override_planes=None, cut_mode=None,
                       n_bands=None, band_planes=None):
     """Pipeline wrapper. clean_ply_path is accepted for call-site compatibility

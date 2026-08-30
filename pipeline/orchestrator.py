@@ -295,8 +295,19 @@ def main():
 
                 if recon_mesh_paths and not args.no_watertight:
                     _dbg_t = time.time()
+                    # Stage 3 detects the planes and publishes them; Stage 5 is
+                    # where they are actually applied, to the repaired solid.
+                    detected_planes_path = os.path.join(
+                        stage_dirs[3], "debug", "cutting_line_levelled.json")
+                    cut_planes = None
+                    if os.path.exists(detected_planes_path):
+                        import json as _json
+                        with open(detected_planes_path) as planes_file:
+                            cut_planes = _json.load(planes_file).get("markers", [])
                     scene_wt_path, wt_mesh_paths = watertight_stage(
-                        recon_mesh_paths, stage_dirs[5])
+                        recon_mesh_paths, stage_dirs[5],
+                        cut_planes=cut_planes,
+                        height_axis=args.segment_height_axis)
                     print(f"[DBG-stage] stage5 watertight: {time.time() - _dbg_t:.2f}s")
         else:
             print("\n  (Skipping mesh stages — --skip_mesh was set)")

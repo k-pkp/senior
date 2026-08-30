@@ -14,6 +14,11 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _MESHFIX_WORKER = os.path.join(_PROJECT_ROOT, "pipeline", "workers",
                                "meshfix_worker.py")
 
+# The two limb solids Stage 5 publishes. leg_no_cut is the surface a person
+# places the cut on; leg_cut is the result, and the only one Stage 6 measures.
+UNCUT_LIMB_NAME = "leg_no_cut.ply"
+CUT_LIMB_NAME = "leg_cut.ply"
+
 
 def _wt_name(recon_path):
     """Derive output name from recon path: box_recon.ply → box, obj_recon.ply → obj."""
@@ -164,8 +169,55 @@ def make_watertight_meshes(recon_paths, output_folder="output_mesh", base_name="
     return scene_colour_ply, scene_stl, watertight_paths
 
 
-def watertight_stage(recon_paths, output_dir):
-    """Pipeline wrapper. Returns (scene_watertight_path, watertight_mesh_paths)."""
+def _cut_limb_mesh(watertight_paths, mesh_output_dir, cut_planes, height_axis):
+    """Cuts the repaired limb against the confirmed planes and writes leg_cut.ply.
+
+    The uncut solid stays on disk as leg_no_cut.ply, so Stage 5 publishes both:
+    the surface a person places the cut on, and the result of placing it.
+    Returns the path to the cut mesh, or None when there was nothing to cut.
+    """
+    import trimesh
+
+    from pipeline.core.meshcut import apply_marker_cut_to_mesh
+
+    uncut_path = None
+    for candidate in watertight_paths:
+        if os.path.basename(candidate) == UNCUT_LIMB_NAME:
+            uncut_path = candidate
+            break
+    if uncut_path is None:
+        print(f"  No {UNCUT_LIMB_NAME} to cut — skipping the marker cut")
+        return None
+
+    mesh = trimesh.load(uncut_path, force="mesh", process=False)
+    mesh.merge_vertices()
+
+    axis_index = {"x": 0, "y": 1, "z": 2}[height_axis]
+    up_axis = [0.0, 0.0, 0.0]
+    up_axis[axis_index] = 1.0
+
+    cut_mesh, case = apply_marker_cut_to_mesh(mesh, cut_planes, up_axis=up_axis)
+    if case in ("no_markers", "no_usable_markers", "too_few_after_cut"):
+        print(f"  Marker cut on mesh ({case}): leg_cut.ply not written")
+        return None
+
+    cut_path = os.path.join(mesh_output_dir, CUT_LIMB_NAME)
+    cut_mesh.export(cut_path)
+    print(f"  Marker cut on mesh ({case}): {len(cut_mesh.faces):,} faces, "
+          f"watertight={cut_mesh.is_watertight}, euler={cut_mesh.euler_number}")
+    print(f"  Cut mesh: {cut_path}")
+    return cut_path
+
+
+def watertight_stage(recon_paths, output_dir, cut_planes=None, height_axis="z"):
+    """Pipeline wrapper. Returns (scene_watertight_path, watertight_mesh_paths).
+
+    `cut_planes` are the confirmed marker planes in levelled space. Given them,
+    the repaired limb is also cut here and published as leg_cut.ply beside the
+    uncut leg_no_cut.ply. Cutting the closed solid rather than the point cloud
+    is what lets a clinician place the cut on a surface, and it leaves no
+    reconstruction step between the cut and the measurement.
+    """
     print()
     print("=" * 60)
     print("STAGE 5: Making meshes watertight (PyMeshFix)")
@@ -182,6 +234,12 @@ def watertight_stage(recon_paths, output_dir):
         print(f"  Scene watertight mesh: {scene_wt}")
         for p in wt_paths:
             print(f"  Object watertight mesh: {p}")
+        if cut_planes:
+            cut_path = _cut_limb_mesh(wt_paths, mesh_output_dir, cut_planes,
+                                      height_axis)
+            if cut_path is not None:
+                wt_paths = list(wt_paths) + [cut_path]
+
         return scene_wt, wt_paths
     except Exception as e:
         print(f"  ERROR during watertight repair: {e}")

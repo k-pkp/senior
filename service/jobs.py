@@ -244,6 +244,18 @@ def _postcondition(job: Job, extra: list[str], done_state: str) -> str | None:
         return ("deferred-cut violation: leg_cut.ply exists after a --no-cut "
                 "pass, so the subject was measured before the cut was confirmed")
 
+    # A deferred pass now reconstructs the UNCUT limb, so that the review screen
+    # can show a solid rather than a point cloud. leg_no_cut.ply is therefore
+    # expected here. A cut limb mesh is not: its presence would mean some stage
+    # applied a cut this pass was told to defer.
+    for stage_dir_name in ("04_recon", "05_watertight"):
+        for mesh_name in ("leg_cut.ply", "leg_cut_recon.ply"):
+            cut_mesh = os.path.join(job.dir, stage_dir_name, "mesh", mesh_name)
+            if os.path.exists(cut_mesh):
+                return (f"deferred-cut violation: {stage_dir_name}/mesh/{mesh_name} "
+                        f"exists after a --no-cut pass, so a cut was applied "
+                        f"before it was confirmed")
+
     csv_path = os.path.join(job.dir, "06_volume", "volumes.csv")
     if os.path.exists(csv_path):
         import csv as _csv

@@ -7,6 +7,7 @@ export const metadata: Metadata = {
     "Measure an object's real-world volume from a handful of phone photos, scaled by an ArUco reference cube.",
 };
 
+// Root HTML shell wrapping every page.
 export default function RootLayout({
   children,
 }: {

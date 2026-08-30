@@ -102,21 +102,25 @@ class RunRequest(BaseModel):
     # True refuses to measure a set stage 0 rejected. False is the user
     # overruling that after seeing the overlays — the pipeline still runs, but
     # VGGT does its own centre crop on the frames we could not frame.
+    """Body of a run request. `strict` False lets the user overrule Stage 0's rejection."""
     strict: bool = True
 
 
 class Plane(BaseModel):
+    """One cutting plane, as the review UI sends it back: centroid, normal, supporting point count."""
     centroid: tuple[float, float, float]
     normal: tuple[float, float, float]
     npts: int = 0
 
 
 class RecutRequest(BaseModel):
+    """Body of a recut request: the planes the user confirmed or moved."""
     planes: list[Plane] = []
 
 
 @app.get("/health")
 def health():
+    """Liveness probe. Returns ok plus the current queue depth."""
     return {"ok": True, "queue": REGISTRY.depth()}
 
 
@@ -165,6 +169,7 @@ async def create_job(files: list[UploadFile] = File(...)):
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
+    """Returns the job's current state, stage, and framing verdict."""
     job = _lookup(job_id)
     return {
         "job_id": job.id,
@@ -256,6 +261,13 @@ def recut(job_id: str, req: RecutRequest):
 
 @app.get("/jobs/{job_id}/files/{path:path}")
 def get_file(job_id: str, path: str):
+    """Serves one named artifact from the job directory.
+
+    The requested name is mapped through ARTIFACTS rather than used as a path,
+    and every resolved path is checked to be inside the job directory, so a
+    crafted name cannot escape it. Responses are marked no-store because a
+    recut rewrites these files in place.
+    """
     job = _lookup(job_id)
     root = os.path.realpath(job.dir)
 
@@ -283,6 +295,7 @@ def get_file(job_id: str, path: str):
 
 
 def _lookup(job_id: str) -> Job:
+    """Returns the job, or raises 404 if there is no such job."""
     job = REGISTRY.get(job_id)
     if job is None:
         raise HTTPException(404, "no such job")

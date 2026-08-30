@@ -2,12 +2,12 @@
 """Standalone volume computation — run directly, no pipeline needed.
 
 Usage:
-    python volume.py                          # use defaults below
-    python volume.py --obj output/mesh/segmented_obj.stl
-    python volume.py --obj path/to/leg.stl --box path/to/box.stl --ref-size 14.0
-    python volume.py --voxel-res 200          # voxel grid resolution (default: 150)
-    python volume.py --auto-res               # auto-tune voxel resolution until converged
-    python volume.py --list-meshes            # show all meshes in output/mesh/
+    python pipeline/tools/volume.py                          # use defaults below
+    python pipeline/tools/volume.py --obj output/mesh/segmented_obj.stl
+    python pipeline/tools/volume.py --obj path/to/leg.stl --box path/to/box.stl --ref-size 14.0
+    python pipeline/tools/volume.py --voxel-res 200          # voxel grid resolution (default: 150)
+    python pipeline/tools/volume.py --auto-res               # auto-tune voxel resolution until converged
+    python pipeline/tools/volume.py --list-meshes            # show all meshes in output/mesh/
 
 Volume method priority (per mesh):
     1. watertight        — exact signed volume, best accuracy
@@ -55,6 +55,7 @@ if _WARP_AVAILABLE:
         pitch:     float,
         threshold: float,
     ):
+        """Warp kernel: marks every voxel whose centre lies within threshold of the mesh surface."""
         i, j, k = wp.tid()
         cx = b_min[0] + (float(i) + 0.5) * pitch
         cy = b_min[1] + (float(j) + 0.5) * pitch
@@ -130,6 +131,7 @@ def _export_voxel_meshes(mesh: trimesh.Trimesh, resolution: int,
 
 
 def _volume_convex_hull(mesh: trimesh.Trimesh) -> float:
+    """Returns the volume of the mesh's convex hull. Overestimates any concave shape."""
     return float(abs(mesh.convex_hull.volume))
 
 
@@ -230,6 +232,12 @@ def _measure_volume(mesh: trimesh.Trimesh, voxel_res: int,
 def load_mesh_info(path: str, label: str, voxel_res: int,
                    auto_res: bool = False,
                    export_voxel_dir: str | None = None) -> dict:
+    """Loads one mesh, measures its volume and extents, and returns them as a dict.
+
+    Exits with an error if the file is missing or the mesh has no vertices.
+    Merges duplicate vertices first, because STL stores per-triangle vertices
+    and the watertight check needs restored connectivity.
+    """
     if not os.path.exists(path):
         sys.exit(f"[ERROR] file not found: {path}")
 
@@ -313,6 +321,7 @@ def compute_volumes(obj_path: str, box_path: str,
 # ---------------------------------------------------------------------------
 
 def parse_args():
+    """Parses the standalone volume tool's command line and returns the namespace."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--obj",       default=DEFAULT_OBJ_MESH,
@@ -334,6 +343,10 @@ def parse_args():
 
 
 def main():
+    """Measures the object and reference meshes and prints their real-world volumes.
+
+    With --list-meshes it lists what is available under output/mesh/ and exits.
+    """
     args = parse_args()
 
     if args.list_meshes:

@@ -3,6 +3,7 @@ import argparse
 
 
 def parse_args():
+    """Parses the full-pipeline command line and returns the populated namespace."""
     p = argparse.ArgumentParser(
         description="VGGT — run full pipeline: inference → PLY → clean → mesh",
         formatter_class=argparse.RawDescriptionHelpFormatter,

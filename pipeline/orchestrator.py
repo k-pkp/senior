@@ -40,6 +40,7 @@ FINAL_NAMES = {"leg_cut": "leg_mesh", "obj": "leg_mesh",
 
 
 def _print_banner(args, device):
+    """Prints the run's configuration banner before any stage starts."""
     print(f"╔{'═' * 58}╗")
     print(f"║  VGGT Full Pipeline                                      ║")
     print(f"╠{'═' * 58}╣")
@@ -117,6 +118,7 @@ def _copy_images_to_target(image_folder, target_images_dir):
 def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
                    recon_mesh_paths, scene_wt_path, wt_mesh_paths,
                    npz_path2, target_dir, target_images_dir):
+    """Prints the closing summary: timings, every output path, and viewer commands."""
     print()
     print(f"╔{'═' * 58}╗")
     print(f"║  Pipeline Complete                                       ║")
@@ -141,15 +143,15 @@ def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
     print(f"╚{'═' * 58}╝")
     print()
     print("To view results interactively:")
-    print(f"  python viewer.py {ply_path}")
+    print(f"  python pipeline/tools/viewer.py {ply_path}")
     if scene_recon_path:
-        print(f"  python viewer.py {scene_recon_path}  # recon scene")
+        print(f"  python pipeline/tools/viewer.py {scene_recon_path}  # recon scene")
     for p in recon_mesh_paths:
-        print(f"  python viewer.py {p}")
+        print(f"  python pipeline/tools/viewer.py {p}")
     if scene_wt_path:
-        print(f"  python viewer.py {scene_wt_path}  # watertight scene")
+        print(f"  python pipeline/tools/viewer.py {scene_wt_path}  # watertight scene")
     for p in wt_mesh_paths:
-        print(f"  python viewer.py {p}")
+        print(f"  python pipeline/tools/viewer.py {p}")
     print()
     print("To use with demo_gradio.py:")
     print(f"  The predictions are saved at: {target_dir}/predictions.npz")
@@ -157,6 +159,7 @@ def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
 
 
 def main():
+    """Runs Stages 0-6 end to end, then publishes the final meshes and writes the run log."""
     args = parse_args()
     device = get_device()
     total_t0 = time.time()
@@ -302,9 +305,6 @@ def main():
         vol_objects = wt_mesh_paths or recon_mesh_paths
         if vol_objects:
             _dbg_t = time.time()
-            # PARKED — inference_dir=stage_dirs[1] fed Stage 6's marker
-            # cross-check, reverted with Stage 6. See the PARKED block in
-            # pipeline/stages/volume.py.
             vol_df = compute_volumes(vol_objects,
                                      voxel_res=args.voxel_res,
                                      auto_res=args.auto_res,

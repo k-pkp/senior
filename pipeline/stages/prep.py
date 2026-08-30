@@ -198,6 +198,7 @@ def _frame_verdict(cube_seen, band_seen, cube_ok, band_ok):
     notes, severity, verdict = [], None, PASS
 
     def escalate(level, note, sev):
+        """Records a note and raises the run's verdict to the given level if it is worse."""
         nonlocal verdict, severity
         notes.append(note)
         if _VERDICT_RANK[level] > _VERDICT_RANK[verdict]:
@@ -329,6 +330,7 @@ def _debug_overlay(img, window, cube, bands, ok, mode, notes, max_side=1200,
     out = img.copy()
 
     def rect(box, colour, thickness):
+        """Draws one debug rectangle onto the overlay image. Does nothing for a missing box."""
         if box is None:
             return
         p0 = (int(round(box[0])), int(round(box[1])))
@@ -885,6 +887,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
         # keep everything that matters. So: prefer our window, fall back to
         # VGGT's, and reject only when the reference survives neither.
         def _fits(window, box):
+            """Returns True when the box lies inside the window with the configured padding."""
             return _box_fits_inside(window, box, pad)
 
         visible_face_corners = np.concatenate(faces) if faces else None
@@ -1116,6 +1119,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             by_sev.setdefault(r["severity"], []).append(r)
 
         def _listing(rows):
+            """Prints one line per rejected frame, giving its index and source filename."""
             for r in rows:
                 print(f"    img{r['index']}  ({r['source']})")
             print()

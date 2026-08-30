@@ -148,6 +148,7 @@ function CircumferenceReadout({ section }: { section?: CrossSectionResult }) {
   );
 }
 
+// Cut review screen: shows the detected planes and lets the user move, add or remove them before the cut is applied.
 export function Review({
   dataset,
   live,
@@ -244,6 +245,7 @@ export function Review({
     setCalibrated(true);
   }, [planes, offsetY, scale, calibrated]);
 
+  // Applies a partial control change to one plane and mirrors it into the plane list.
   function update(id: string, patch: Partial<Controls>) {
     setControls((prev) => {
       const next = { ...prev, [id]: { ...prev[id], ...patch } };
@@ -265,6 +267,7 @@ export function Review({
     });
   }
 
+  // Adds a new plane at mid-height, up to MAX_PLANES.
   function addPlane() {
     if (planes.length >= MAX_PLANES) return;
     const id = newPlaneId();
@@ -311,6 +314,7 @@ export function Review({
     }));
   }
 
+  // Removes a plane and clears the selection if it was the active one.
   function removePlane(id: string) {
     setPlanes((ps) => ps.filter((p) => p.id !== id));
     setActive((a) => (a === id ? null : a));

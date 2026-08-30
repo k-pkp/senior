@@ -100,6 +100,7 @@ export function Framing({
     if (!jobId) return;
     let live = true;
 
+    // Polls the job until Stage 0 publishes its framing verdict, then stops.
     const tick = async () => {
       try {
         const j = await getJob(jobId);
@@ -182,6 +183,7 @@ export function Framing({
   // A sample has no job to be ready; a live one must have finished stage 0.
   const ready = !jobId || state === "awaiting-framing";
 
+  // Sends the run request. strict=false overrules Stage 0's rejection.
   async function go(strict: boolean) {
     if (!onContinue) return;
     setSending(true);

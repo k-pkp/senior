@@ -95,6 +95,7 @@ function midAxis(geom: THREE.BufferGeometry): THREE.Vector2 {
   return new THREE.Vector2(sx / k, sz / k);
 }
 
+// Renders one point cloud as a three.js points object.
 function Points({
   data,
   color,
@@ -235,6 +236,7 @@ function OriginWidget({
   );
 }
 
+// Interactive 3D view of the limb with the cutting planes drawn over it.
 export function CutReview({
   url,
   onLoadError,

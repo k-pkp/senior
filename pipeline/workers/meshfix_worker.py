@@ -67,12 +67,18 @@ def _o3d_fill_holes(vertices, faces, hole_size=1e9):
 
 
 def _is_watertight(vertices, faces):
+    """Returns True when the vertex and face arrays form a watertight trimesh."""
     import trimesh
     m = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     return bool(m.is_watertight)
 
 
 def main():
+    """Repairs the input mesh with PyMeshFix and writes the watertight result.
+
+    Takes (input_path, output_path) plus an optional colour-source mesh whose
+    vertex colours are transferred onto the repaired geometry.
+    """
     input_path = sys.argv[1]
     output_path = sys.argv[2]
     color_source_path = sys.argv[3] if len(sys.argv) > 3 else None

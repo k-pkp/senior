@@ -72,8 +72,11 @@ export function parseVolumesCsv(text: string): VolumeRow[] {
     .filter((l) => l.trim())
     .map((line) => {
       const cells = line.split(",");
+      // True when the CSV carries this column.
       const has = (k: string) => cols.indexOf(k) >= 0;
+      // Raw cell text for this column on the current row.
       const get = (k: string) => cells[cols.indexOf(k)];
+      // Cell parsed as a number, falling back to 0 when it is not finite.
       const num = (k: string) => {
         const v = parseFloat(get(k));
         return Number.isFinite(v) ? v : 0;
@@ -106,6 +109,7 @@ export function parseVolumesCsv(text: string): VolumeRow[] {
     });
 }
 
+// Fetches and parses a run's volumes.csv.
 export async function loadVolumes(url: string): Promise<VolumeRow[]> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`volumes.csv ${res.status}`);
@@ -148,10 +152,12 @@ export function linearScale(rows: VolumeRow[]): number | null {
 }
 
 let planeSeq = 0;
+// Returns a fresh unique id for a newly added plane.
 export function newPlaneId() {
   return `p${++planeSeq}`;
 }
 
+// Fetches the detected cutting planes, returning an empty list when there are none yet.
 export async function loadCutPlanes(url: string): Promise<CutPlane[]> {
   try {
     const res = await fetch(url);

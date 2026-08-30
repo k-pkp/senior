@@ -51,6 +51,7 @@ plane_coefficients, *_ = np.linalg.lstsq(plane_design, h, rcond=None)
 target_u = float((points[centre_index] - centre) @ tangent_u)
 target_v = float((points[centre_index] - centre) @ tangent_v)
 def surface(uu, vv, c):
+    """Evaluates the fitted local surface at (uu, vv), quadratic when the coefficients carry the extra terms."""
     return c[0] + c[1]*uu + c[2]*vv + (c[3]*uu*uu + c[4]*uu*vv + c[5]*vv*vv
                                        if len(c) > 3 else 0.0)
 fitted = surface(target_u, target_v, coefficients)

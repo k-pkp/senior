@@ -190,6 +190,11 @@ def _adaptive_poisson_depth(n_points):
 
 
 def method_poisson(pcd, output_path, seed=None):
+    """Reconstructs a surface by screened Poisson, retrying at shallower depth if it fails.
+
+    The depth starts from the input point count and the low-density tail is
+    trimmed afterwards, which is what removes the balloon around the cloud.
+    """
     import tempfile
     import subprocess as sp
 
@@ -404,6 +409,7 @@ BOX_SQUARENESS_TOL = 0.20
 def _fit_yaw_footprint(xy):
     """Minimum-area rectangle over yaw. Returns (yaw_deg, edges, min_corner)."""
     def measure(deg):
+        """Returns (area, edge lengths, min corner) for the footprint rotated by deg degrees."""
         t = np.radians(deg)
         c, s = np.cos(t), np.sin(t)
         aligned = xy @ np.array([[c, s], [-s, c]])
@@ -479,6 +485,7 @@ def method_box_primitive(pcd, output_path, seed=None):
 
 
 def method_poisson_omp1(pcd, output_path, seed=None):
+    """Runs method_poisson pinned to a single OpenMP thread, for reproducible output."""
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -494,6 +501,7 @@ METHODS = {
 
 
 def main():
+    """Reconstructs one point cloud into a mesh. Takes input, output, --method and --seed."""
     input_path = sys.argv[1]
     output_path = sys.argv[2]
 

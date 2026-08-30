@@ -259,7 +259,7 @@ flowchart TB
     K_CAP --> F3G
 
 %% ═══════════════════════ STAGE 4 ═══════════════════════
-    subgraph SG4["STAGE 4 · surface reconstruction — reconstruct.py + workers/recons_methods_worker.py"]
+    subgraph SG4["STAGE 4 · surface reconstruction — reconstruct.py + pipeline/workers/recons_methods_worker.py"]
         direction TB
         R_PICK["<b>_pick_method(path, method, box_method, obj_method)</b><br/>in ▸ object path + any overrides<br/>out ▸ method name — <b>poisson</b> for both by default<br/>--recon-method does NOT affect the cube; use --box-recon-method"]
         R_SUB["<b>subprocess per object</b><br/>in ▸ one PLY + method<br/>out ▸ one mesh — exiting is what frees the solver's memory"]
@@ -289,7 +289,7 @@ flowchart TB
     R_RANK --> F4
 
 %% ═══════════════════════ STAGE 5 ═══════════════════════
-    subgraph SG5["STAGE 5 · watertight repair — watertight.py + workers/meshfix_worker.py"]
+    subgraph SG5["STAGE 5 · watertight repair — watertight.py + pipeline/workers/meshfix_worker.py"]
         direction TB
         W_FIX["<b>_pymeshfix_repair(vertices, faces)</b><br/>in ▸ (V,3) float64 + (F,3) int32<br/>out ▸ repaired (V,3) + (F,3)<br/>fill_holes() ONLY — never drops faces, shape preserved"]
         W_O3D["<b>_o3d_fill_holes(vertices, faces)</b><br/>in ▸ still-open mesh<br/>out ▸ closed mesh — only runs if needed"]
@@ -500,7 +500,7 @@ filtered, closed at the floor, *not* cut: the input a re-cut reuses),
 ### Stage 4 · surface reconstruction — `pipeline/stages/reconstruct.py`
 
 `reconstruct_mesh_stage(object_paths, output_dir, seed, method, ...)`. Each
-object is reconstructed in its own subprocess (`workers/recons_methods_worker.py`),
+object is reconstructed in its own subprocess (`pipeline/workers/recons_methods_worker.py`),
 which is what releases the memory Open3D's tetrahedralisation holds.
 
 | sub-process | in | out | notes |
@@ -527,7 +527,7 @@ measured, because after repair they close at χ = 22 and χ = 256 instead of 2.
 
 ### Stage 5 · watertight repair — `pipeline/stages/watertight.py`
 
-Runs `workers/meshfix_worker.py` as a subprocess.
+Runs `pipeline/workers/meshfix_worker.py` as a subprocess.
 
 | sub-process | in | out | notes |
 |---|---|---|---|

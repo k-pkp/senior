@@ -295,7 +295,7 @@ combined transform `R_total` is applied to the marker planes too; applying only
 
 ## Stage 4 — Surface reconstruction
 
-**File**: `pipeline/stages/reconstruct.py` → `workers/recons_methods_worker.py`
+**File**: `pipeline/stages/reconstruct.py` → `pipeline/workers/recons_methods_worker.py`
 
 Default **`poisson` for both objects, with `alpha_shape` as an automatic
 per-object fallback.** Changed 2026-08-23; see `experiments.md`, E-psr-adopted.
@@ -347,7 +347,7 @@ but not default. It builds a *bounding* prism, so on a ~2 mm-noisy shell it sits
 
 ## Stage 5 — Watertight check
 
-**File**: `pipeline/stages/watertight.py` → `workers/meshfix_worker.py`
+**File**: `pipeline/stages/watertight.py` → `pipeline/workers/meshfix_worker.py`
 
 Skipped when the mesh is already closed, which with alpha_shape is always — it
 selects for watertightness by construction. So Stage 5 is **insurance, not a
@@ -377,7 +377,8 @@ open.
 > recommended as its replacement. Scored against five water-displacement
 > volumes, the recommendation loses: **1.7% mean absolute error for what ships,
 > against 4.1% for the parked fitted-face method and 7.4% for its OBB form.**
-> The parked block stays commented at the bottom of `volume.py` as the record.
+> The parked block was deleted from `volume.py` on 2026-08-31; `git log`
+> is now the record. It last appeared in commit 371d3da.
 > Full table in `docs/stage06_experiments.md`.
 >
 > The *epistemic* objection is untouched and still correct — calibrating on the
@@ -576,7 +577,7 @@ depends on which is meant.
 ```
 run.py                    entry point
 stagerun.py               stage-by-stage runner with per-stage diagnostics
-viewer.py                 PLY/STL viewer
+pipeline/tools/viewer.py  PLY/STL viewer
 volume.py                 standalone volume CLI
 pipeline/
   orchestrator.py         drives stages 0-6, publishes final meshes

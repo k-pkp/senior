@@ -65,6 +65,7 @@ interface PlyState {
   loading: boolean;
 }
 
+// Loads a PLY from the URL into three.js geometry, scaled, with loading and error state.
 export function usePly(url: string | null, scale = 1): PlyState {
   const [state, setState] = useState<PlyState>({
     geometry: null,

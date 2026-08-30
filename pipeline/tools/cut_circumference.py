@@ -7,9 +7,9 @@ a different cloud. The fit lives in `pipeline/core/crosssection.py` — this fil
 is only the command line around it.
 
 Usage:
-    python3 tools/cut_circumference.py                      # reads ./output
-    python3 tools/cut_circumference.py --run work/est_test  # a stagerun dir
-    python3 tools/cut_circumference.py --slab-mm 6 --json
+    python3 pipeline/tools/cut_circumference.py                      # reads ./output
+    python3 pipeline/tools/cut_circumference.py --run work/est_test  # a stagerun dir
+    python3 pipeline/tools/cut_circumference.py --slab-mm 6 --json
 """
 import argparse
 import csv
@@ -19,7 +19,8 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 
 from pipeline.core.crosssection import (      # noqa: E402
     SLAB_HALF_MM, fit_slice, load_cut_geometry,
@@ -54,6 +55,12 @@ def _resolve(run_dir, *parts):
 
 
 def main():
+    """Re-measures the limb's circumference at the cutting plane on a finished run.
+
+    Reads the scale from the run's volumes.csv unless --scale-cm-per-unit
+    overrides it, then fits an ellipse to the points in the slab around each
+    cutting plane.
+    """
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", default="output", help="run directory (default: output)")

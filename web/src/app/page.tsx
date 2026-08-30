@@ -22,6 +22,7 @@ const TABS: { id: Screen; label: string }[] = [
   { id: "how", label: "How it works" },
 ];
 
+// The whole single-page app: owns the current screen and the dataset being viewed.
 export default function Page() {
   const { theme, setTheme } = useTheme();
   const [screen, setScreenRaw] = useState<Screen>("samples");

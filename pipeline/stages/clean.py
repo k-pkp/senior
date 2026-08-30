@@ -1010,6 +1010,11 @@ def cut_only(stage3_dir, planes, fill_enabled=True):
                         "normal": n.tolist(), "npts": int(m.get("npts", 0))})
 
     def _close_to_floor(p_pts, p_cols):
+        """Extends the cluster down to the floor plane and caps its underside.
+
+        Returns the points and colours unchanged when filling is disabled or no
+        floor height was found.
+        """
         if not fill_enabled or floor_z is None or len(p_pts) == 0:
             return p_pts, p_cols
         p = _array_to_o3d(p_pts, p_cols)

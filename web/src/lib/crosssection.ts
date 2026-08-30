@@ -61,6 +61,7 @@ export type CrossSectionResult = CrossSection | CrossSectionFailure;
 type Vec3 = readonly [number, number, number];
 type Mat3 = number[][];
 
+// Multiplies two 3x3 matrices.
 function mul(a: Mat3, b: Mat3): Mat3 {
   const out: Mat3 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
   for (let i = 0; i < 3; i++)
@@ -72,6 +73,7 @@ function mul(a: Mat3, b: Mat3): Mat3 {
   return out;
 }
 
+// Transposes a 3x3 matrix.
 function transpose(m: Mat3): Mat3 {
   return [
     [m[0][0], m[1][0], m[2][0]],
@@ -80,6 +82,7 @@ function transpose(m: Mat3): Mat3 {
   ];
 }
 
+// Determinant of a 3x3 matrix.
 function det3(m: Mat3): number {
   return (
     m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -

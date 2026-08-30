@@ -41,6 +41,7 @@ STAGE_DIRS = {
 
 
 def stage_dir(name, n, create=True):
+    """Returns the directory holding stage n's output for this run, creating it by default."""
     d = os.path.join(WORK, name, STAGE_DIRS[n])
     if create:
         os.makedirs(d, exist_ok=True)
@@ -53,6 +54,7 @@ def src_dir(args, name, n):
 
 
 def _write_summary(d, lines):
+    """Writes the summary lines to summary.txt in the stage directory and prints them."""
     path = os.path.join(d, "summary.txt")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -373,6 +375,12 @@ def run_stage0(args, name):
 
 
 def run_stage1(args, name):
+    """Runs VGGT inference and caches predictions.npz, so later stages cost no inference time.
+
+    Warns when Stage 0 produced framed images but this run is reading a
+    different folder, because VGGT would then crop the frames itself and
+    silently discard Stage 0's framing.
+    """
     from vggt.utils.device import get_device
 
     # Guard the same trap when the stages are run separately. Stage 0's summary
@@ -467,6 +475,7 @@ def run_stage1(args, name):
 # ── Stage 2 ────────────────────────────────────────────────────────────
 
 def run_stage2(args, name):
+    """Exports the confidence-filtered point cloud from Stage 1's predictions."""
     from pipeline.stages.pointcloud import export_ply
 
     src = os.path.join(src_dir(args, name, 1), "predictions.npz")
@@ -565,6 +574,11 @@ def _review_planes(args):
 
 
 def run_stage3(args, name):
+    """Segments the cloud, detects the marker planes, and exports the per-object clouds.
+
+    With --cut-only it skips straight to applying already-confirmed planes to
+    the uncut limb on disk, which avoids paying for a second clustering pass.
+    """
     import glob
     from pipeline.stages.clean import clean_and_extract, cut_only
 
@@ -621,6 +635,7 @@ def run_stage3(args, name):
 # ── Stage 4 / 5 / 6 ────────────────────────────────────────────────────
 
 def _mesh_stats(path):
+    """Returns a one-line summary of a mesh: vertex and face counts, watertightness, volume."""
     import trimesh
     m = trimesh.load(path, process=False)
     m.merge_vertices()
@@ -666,6 +681,7 @@ def _prune_meshes(d, object_paths):
 
 
 def run_stage4(args, name):
+    """Reconstructs a surface mesh for every object cloud Stage 3 exported."""
     import glob
     from pipeline.stages.reconstruct import reconstruct_mesh_stage
 
@@ -688,6 +704,7 @@ def run_stage4(args, name):
 
 
 def run_stage5(args, name):
+    """Repairs Stage 4's meshes into watertight solids, skipping the merged scene mesh."""
     import glob
     from pipeline.stages.watertight import watertight_stage
 
@@ -713,6 +730,7 @@ def run_stage5(args, name):
 
 
 def run_stage6(args, name):
+    """Computes real-world volumes, preferring Stage 5's meshes and falling back to Stage 4's."""
     import glob
     from pipeline.stages.volume import compute_volumes
 
@@ -727,23 +745,6 @@ def run_stage6(args, name):
         sys.exit("ERROR: no meshes from stage 4/5 — run those first")
 
     d = stage_dir(name, 6)
-    # PARKED — the marker cross-check that used this was reverted with Stage 6.
-    # Stage 1's pointmap is what let Stage 6 measure the printed markers, the
-    # one length its scale is not calibrated on. Looked up separately from the
-    # meshes because --src redirects every earlier stage at once: re-running
-    # stage 6 alone on a run whose stage 1 lives elsewhere would otherwise pull
-    # that run's meshes in too. See the PARKED block in pipeline/stages/volume.py.
-    #
-    # inference = None
-    # for cand in (args.inference, name, args.src):
-    #     if not cand:
-    #         continue
-    #     cand_dir = stage_dir(cand, 1, create=False)
-    #     if os.path.exists(os.path.join(cand_dir, "predictions.npz")):
-    #         inference = cand_dir
-    #         break
-    # src_dir, not stage_dir: --src redirects the earlier stages, and the
-    # circumference must come from the same Stage 3 that produced these meshes.
     df = compute_volumes(meshes, voxel_res=args.voxel_res,
                          auto_res=args.auto_res,
                          clean_dir=src_dir(args, name, 3))
@@ -759,6 +760,7 @@ RUNNERS = {0: run_stage0, 1: run_stage1, 2: run_stage2, 3: run_stage3,
 
 
 def parse_stages(spec):
+    """Expands a stage spec into a list of stage numbers. Accepts '3' or a '2-6' range."""
     if "-" in spec:
         a, b = spec.split("-", 1)
         return list(range(int(a), int(b) + 1))
@@ -766,6 +768,7 @@ def parse_stages(spec):
 
 
 def main():
+    """Parses the stage spec and runs each requested stage in order."""
     p = argparse.ArgumentParser(description="Run pipeline stages individually")
     p.add_argument("stages", help="stage number or range, e.g. 1 or 1-3")
     p.add_argument("-i", "--image_folder", default="./inputs/small_leg/")

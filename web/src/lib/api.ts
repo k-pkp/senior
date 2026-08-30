@@ -97,6 +97,7 @@ export function createJob(
   });
 }
 
+// Fetches one job's current status, bypassing the browser cache.
 export async function getJob(id: string): Promise<JobStatus> {
   return json<JobStatus>(await fetch(`${API}/jobs/${id}`, { cache: "no-store" }));
 }
@@ -137,6 +138,7 @@ export async function recut(id: string, planes: CutPlane[]) {
  * shipped sample only in where those URLs point. Result and Review therefore
  * need no knowledge of jobs at all — they keep loading a dataset. */
 export function jobDataset(id: string, frames: number): SampleDataset {
+  // Builds the artifact URL for one named file of this job.
   const f = (name: string) => `${API}/jobs/${id}/files/${name}`;
   return {
     id,
@@ -155,6 +157,7 @@ export function jobDataset(id: string, frames: number): SampleDataset {
   };
 }
 
+// Base URL for this job's Stage 0 prep images.
 export function jobPrepBase(id: string) {
   return `${API}/jobs/${id}/files/prep`;
 }

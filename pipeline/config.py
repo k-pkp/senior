@@ -24,29 +24,6 @@ import os
 # than it was on the 14 cm one (1.4% linear, 4.3% volume).
 REFERENCE_REAL_SIZE_CM = float(os.environ.get("REFERENCE_REAL_SIZE_CM", 10.0))
 
-# Stage 2 multi-view consistency
-#
-# Keep only points whose depth is corroborated by at least this many OTHER
-# views. 0 disables it.
-#
-# DISABLED, and the reason matters: this was built to remove ghost sheets and
-# it does not work. Measured on small_leg, local shell thickness was unchanged
-# at every setting while up to 41% of the cloud was discarded:
-#
-#     min_views=0   527,769 pts   shell std 0.72 mm
-#     min_views=2   446,218 pts   shell std 0.73 mm
-#     min_views=3   311,760 pts   shell std 0.72 mm
-#
-# Multi-view consistency assumes each view's errors are independent, so a wrong
-# point fails corroboration. The ghost sheet is the same model making the same
-# mistake in every view — the views agree with each other and the ghost passes.
-# At min_views=3 the thinned cloud also destabilised Stage 3 clustering.
-#
-# Kept because it is a genuine measure of geometric self-consistency and useful
-# as a Stage 1 diagnostic; just not a ghost filter.
-MULTIVIEW_MIN_VIEWS = 0
-MULTIVIEW_REL_THRESHOLD = 0.05
-
 # Stage 3 floor removal band, in multiples of the RANSAC distance threshold.
 #
 # VGGT reconstructs the floor as a duplicate pair of sheets — the same ghosting
@@ -311,49 +288,6 @@ VGGT_MODEL_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
 # Image extensions accepted by the input loader
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp", ".heic", ".heif")
 
-# Stage 6 marker cross-check
-#
-# The reference cube is the pipeline's only ruler, so it cannot check itself:
-# the scale is derived from its own fitted faces, and it therefore measures
-# REFERENCE_REAL_SIZE_CM exactly whatever it really is. The squareness check
-# above says as much — it cannot see a common-mode error, because inflating all
-# three edges equally leaves the shares untouched.
-#
-# The markers printed on the cube are the missing second structure. ArUco finds
-# their corners to sub-pixel accuracy, and those corner pixels index the
-# pointmap directly, so a marker lifts into 3D with no colour thresholding, no
-# meshing and no image-to-cloud mapping. Measured on both datasets:
-#
-#     marker / face ratio     small_leg 0.4518   est_325 0.4507
-#
-# Two independent captures, different scenes and scale factors, agreeing to
-# 0.24%. That reproducibility is what makes it usable as a check.
-#
-# Most of its value needs no constant at all. A printed marker is physically
-# flat and square, so departures are pure reconstruction error:
-#
-#     flatness      0.04-0.45 mm    the surface is locally accurate
-#     aspect        1.077-1.079     a square reconstructs ~8% out of square
-#     size spread   3.7-3.9%        one physical square, measured on five faces
-#
-# REFERENCE_MARKER_CM is the black square's outer edge, and it is deliberately
-# left unset. The sheet was designed at 7.00 cm but did not print at that size:
-# rectifying the photographs through the marker's own homography and holding the
-# box at its measured 14.00 cm puts the printed square at 6.49-6.58 cm, roughly
-# 93% of design and consistent with "fit to page" scaling. Setting 7.00 here
-# would bake in a false 10% discrepancy, so leave it None until the physical
-# square is measured with a ruler; the calibration-free checks run regardless.
-REFERENCE_MARKER_CM = None
-
 # ArUco family on the reference cube: ids 10-14, one per visible face, detected
 # on every frame of both datasets.
 REFERENCE_MARKER_DICT = "DICT_5X5_250"
-
-# Warn above these. Both are calibration-free, so they work before
-# REFERENCE_MARKER_CM is known.
-#   spread  — the same physical square measured on five faces; 3.9% observed on
-#             a run whose reference residual was -1.86%, so this is roughly the
-#             current state of the art rather than a failure threshold.
-#   aspect  — longest over shortest side of a printed square; 1.08 observed.
-MARKER_SPREAD_WARN = 0.06
-MARKER_ASPECT_WARN = 1.15

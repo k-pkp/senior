@@ -208,8 +208,8 @@ the measurement that set it.
 ## Viewing
 
 ```bash
-python viewer.py output/leg_mesh.ply
-python viewer.py output/scene_mesh.ply --info
+python pipeline/tools/viewer.py output/leg_mesh.ply
+python pipeline/tools/viewer.py output/scene_mesh.ply --info
 ```
 
 ---
@@ -297,8 +297,6 @@ seed, which is what makes an error bar worth quoting.
 ```
 run.py            full pipeline, stages 0-6
 stagerun.py       per-stage runner with caching and metrics
-viewer.py         PLY/STL viewer
-volume.py         standalone volume CLI
 serve.sh          starts the web app and the compute service together
 
 pipeline/
@@ -307,17 +305,18 @@ pipeline/
   config.py         every tunable constant, with its justification
   ghost.py          the whole ghost chain: voxel dedup, normal-aware
                     filter, and MLS surface projection
-  multiview.py      multi-view consistency (written, not wired into Stage 2)
-  core/             cluster, faces, fill, filters, markers3d, mesh, plane,
-                    segmentation, vlm_detect
+  core/             bands3d, cluster, crosssection, fill, filters, mesh,
+                    plane, segmentation, vlm_detect
   stages/           prep, inference, pointcloud, clean, reconstruct,
                     watertight, volume
+  workers/          recons_methods_worker, meshfix_worker — the two
+                    subprocess workers Stages 4 and 5 spawn
+  tools/            viewer (PLY/STL), volume (standalone volume CLI),
+                    com_vol, cut_circumference
   utils/            seeding, runlog
 
-workers/          recons_methods_worker.py, meshfix_worker.py
 service/          HTTP front end: upload, run, serve artifacts
 web/              viewer and review UI (Next.js)
-tools/            com_vol.py
 inputs/           sample image sets
 work/             stagerun and web-job outputs (gitignored)
 ```

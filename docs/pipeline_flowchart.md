@@ -611,7 +611,7 @@ Phases: A → figure 2, marker sub-flow → figure 3, B and C → figure 4.
 
 ---
 
-### Stage 4 — reconstruction · `workers/recons_methods_worker.py`
+### Stage 4 — reconstruction · `pipeline/workers/recons_methods_worker.py`
 
 **In:** `03_clean/objects/*.ply` · **Out:** `04_recon/mesh/*_recon.ply`
 

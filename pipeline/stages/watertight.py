@@ -11,7 +11,8 @@ from pipeline.core.mesh import merge_meshes, verify_watertight, clean_merged_sce
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
-_MESHFIX_WORKER = os.path.join(_PROJECT_ROOT, "workers", "meshfix_worker.py")
+_MESHFIX_WORKER = os.path.join(_PROJECT_ROOT, "pipeline", "workers",
+                               "meshfix_worker.py")
 
 
 def _wt_name(recon_path):

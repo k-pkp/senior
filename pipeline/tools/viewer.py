@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""View .ply and .stl files. Usage: python viewer.py <file> [file2 ...]"""
+"""View .ply and .stl files. Usage: python pipeline/tools/viewer.py <file> [file2 ...]"""
 import sys
 from pathlib import Path
 import numpy as np
@@ -16,6 +16,10 @@ except ImportError:
 
 
 def load(path: Path):
+    """Loads a .ply or .stl as an Open3D mesh, falling back to a point cloud for a PLY with no faces.
+
+    Raises ValueError for an empty file or an unsupported extension.
+    """
     ext = path.suffix.lower()
     if ext == ".stl":
         mesh = o3d.io.read_triangle_mesh(str(path))
@@ -36,6 +40,7 @@ def load(path: Path):
 
 
 def geom_to_trace(geom, name="geom"):
+    """Converts an Open3D mesh or point cloud into a Plotly trace, carrying vertex colours across."""
     if isinstance(geom, o3d.geometry.TriangleMesh):
         v = np.asarray(geom.vertices)
         f = np.asarray(geom.triangles)
@@ -68,8 +73,9 @@ def geom_to_trace(geom, name="geom"):
 
 
 def main():
+    """Loads every path given on the command line and shows them together in one Plotly figure."""
     if len(sys.argv) < 2:
-        sys.exit("Usage: python viewer.py <file.ply|file.stl> [...]")
+        sys.exit("Usage: python pipeline/tools/viewer.py <file.ply|file.stl> [...]")
 
     traces = []
     for arg in sys.argv[1:]:

@@ -9,6 +9,7 @@ export const THEMES: { id: ThemeName; label: string; swatch: string }[] = [
   { id: "paper", label: "Paper", swatch: "#efe9dd" },
 ];
 
+// Theme state hook: keeps the chosen theme on the document root element.
 export function useTheme() {
   const [theme, setTheme] = useState<ThemeName>("clinical");
   useEffect(() => {

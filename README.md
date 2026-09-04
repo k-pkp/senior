@@ -252,22 +252,42 @@ python pipeline/tools/viewer.py output/scene_mesh.ply --info
 **The pipeline reads 3.3% mean absolute error against water displacement**, on
 four limb captures with a 10 cm 3D-printed reference.
 
-**Where the cut is applied changes the number.** Until 2026-08-31 Stage 3 cut
-the point cloud and Stage 4 reconstructed only what survived; the cut now
-happens in Stage 5, on the mesh. Both were measured on the same captures, the
-same cached Stage 1, and `--cut-mode upper` throughout:
+**Three pipelines, measured on the same captures.** `old pipeline` is the tree
+at `bab2bbc`, before Stage 0 framing existed. `Stage 3 cut` cut the point cloud
+and reconstructed what survived. `Stage 5 cut` is current: it reconstructs the
+whole limb and cuts the watertight solid. All three were run against the same
+photographs, with `--cut-mode upper` where that flag exists:
 
-| capture | displacement | Stage 3 cut (cloud) | error | Stage 5 cut (mesh) | error |
-|---|---|---|---|---|---|
-| `orange shirt` | 4090 cm³ | 4094 cm³ | +0.1% | 4098 cm³ | **+0.2%** |
-| `keng` | 2210 cm³ | 2249 cm³ | +1.8% | 2287 cm³ | **+3.5%** |
-| `black shirt` | 3510 cm³ | 3648 cm³ | +3.9% | 3656 cm³ | **+4.2%** |
-| `sunshine` | 3130 cm³ | 3093 cm³ | −1.2% | 3298 cm³ | **+5.4%** |
-| `champ` | 2810 cm³ | 3354 cm³ | +19.4% | 3371 cm³ | **+20.0%** — unresolved, below |
-| `blue shirt` | 3420 | — | — | — | capture unusable, `inputs/blue shirt/UNUSABLE.md` |
-| **mean absolute error** | | | **1.74%** | | **3.29%** |
+| capture | displacement | old pipeline | error | Stage 3 cut | error | Stage 5 cut | error |
+|---|---|---|---|---|---|---|---|
+| `orange shirt` | 4090 cm³ | 5395 cm³ | +31.9% | 4094 cm³ | +0.1% | 4098 cm³ | **+0.2%** |
+| `keng` | 2210 cm³ | 2490 cm³ | +12.7% | 2249 cm³ | +1.8% | 2287 cm³ | **+3.5%** |
+| `black shirt` | 3510 cm³ | 3119 cm³ | −11.1% | 3648 cm³ | +3.9% | 3656 cm³ | **+4.2%** |
+| `sunshine` | 3130 cm³ | 4161 cm³ | +32.9% | 3093 cm³ | −1.2% | 3298 cm³ | **+5.4%** |
+| `champ` | 2810 cm³ | 2432 cm³ | −13.5% | 3354 cm³ | +19.4% | 3371 cm³ | **+20.0%** — unresolved, below |
+| `blue shirt` | 3420 cm³ | — | — | — | — | — | capture unusable |
+| **mean abs. error** | | | **22.17%** | | **1.75%** | | **3.29%** |
 
-Mean excludes `champ`, which is unresolved under both (n = 4).
+Mean excludes `champ`, unresolved under all three (n = 4).
+
+**The old column is not one variable apart from the others.** That tree had no
+Stage 0 framing gate, so VGGT centre-cropped the raw photographs itself; it
+predates the marker-detection rewrite, the ghost chain and the levelling gates.
+It also could not close most of its meshes: four of the five fell back to
+`warp+floodfill`, which leaks through an open surface, and its errors run in
+both directions — +32.9% on `sunshine`, −11.1% on `black shirt` — which is what
+an unreliable volume *method* looks like rather than a geometric bias. Both
+current pipelines report `watertight` on every capture, so their errors are
+comparable to each other in a way the old column's are not.
+
+**Stage 3 against Stage 5 is the clean comparison**, since only the cut moved.
+It costs 1.75% → 3.29%, and every mesh-cut figure is higher than its cloud-cut
+counterpart — none reads low. The reason is that Stage 4 must now reconstruct
+the whole limb including the region above the cut, which is the far end of the
+capture and its worst-reconstructed part; the old order discarded that region
+before Stage 4 ever saw it. The trade was made deliberately: a clinician places
+the cut, and placing it on a solid surface is far easier than on a scatter of
+points.
 
 **This is worse than the 1.7% the cloud cut read, and the reason is understood.**
 Until 2026-08-31 Stage 3 cut the point cloud and Stage 4 reconstructed only what

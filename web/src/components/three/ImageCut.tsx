@@ -27,6 +27,7 @@ import * as THREE from "three";
 
 import {
   CameraData,
+  FrameCamera,
   LevellingData,
   cameraForFrame,
   rayThroughImagePoint,
@@ -57,6 +58,7 @@ function sceneToMesh(
   ];
 }
 
+
 // The image-cut view: one of VGGT's own frames with the limb drawn over it,
 // where clicking the marker band places the cut at that point.
 export function ImageCut({
@@ -67,6 +69,7 @@ export function ImageCut({
   scale,
   disabled,
   onPlacePlane,
+  onFrameCamera,
 }: {
   url: string;
   frameUrls: string[];
@@ -75,6 +78,8 @@ export function ImageCut({
   scale: number;
   disabled?: boolean;
   onPlacePlane: (plane: CutPlane) => void;
+  /** Called with the selected frame's camera, so the 3D view can adopt it. */
+  onFrameCamera?: (camera: FrameCamera | null) => void;
 }) {
   // The same solid the 3D view draws. Loading it here rather than receiving it
   // keeps the two views independent; the browser serves the second request from
@@ -106,6 +111,13 @@ export function ImageCut({
     setLastHit(null);
     setMessage(null);
   }, [frameIndex]);
+
+  // Selecting a photo swings the 3D view round to that photo's viewpoint, which
+  // is the whole point of choosing one: the two views then show the same thing
+  // from the same place.
+  useEffect(() => {
+    onFrameCamera?.(frameCamera);
+  }, [frameCamera, onFrameCamera]);
 
   /** Casts the clicked pixel at the limb and turns the hit into a cut plane. */
   function handleClick(event: React.MouseEvent<HTMLDivElement>) {
@@ -148,13 +160,19 @@ export function ImageCut({
   const ready = Boolean(frameCamera && pickTarget);
 
   return (
-    <div style={{ display: "grid", gap: 10 }}>
+    <div style={{ display: "grid", gap: 12, padding: 12 }}>
       <div
         onClick={handleClick}
         style={{
           position: "relative",
-          width: "100%",
+          // Exactly square, and sized by WIDTH alone. A max-height here would
+          // fight the aspect ratio and letterbox the photo inside a wider box,
+          // at which point a click no longer maps to the pixel it looks like it
+          // maps to -- the frames are 518x518 and the click is read as a
+          // fraction of this element.
+          width: "min(100%, 560px)",
           aspectRatio: "1 / 1",
+          margin: "0 auto",
           borderRadius: "var(--radius)",
           overflow: "hidden",
           backgroundImage: `url(${frameUrls[frameIndex]})`,
@@ -186,8 +204,8 @@ export function ImageCut({
             key={url}
             onClick={() => setFrameIndex(index)}
             style={{
-              width: 46,
-              height: 46,
+              width: 62,
+              height: 62,
               padding: 0,
               borderRadius: 6,
               cursor: "pointer",

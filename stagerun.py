@@ -724,6 +724,12 @@ def run_stage5(args, name):
             if os.path.exists(detected):
                 with open(detected) as planes_file:
                     cut_planes = json.load(planes_file).get("markers", [])
+            else:
+                # Stage 3 found no marker planes, so there is nothing to cut and
+                # the whole object is the measurement. That is an empty list, not
+                # None: None is reserved for a cut deliberately deferred, which
+                # must produce no measurement at all.
+                cut_planes = []
 
     d = stage_dir(name, 5)
     _clear_meshes(d)

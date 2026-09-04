@@ -118,6 +118,13 @@ export function Viewport({
         camera={{ position: cameraPosition, fov: 40, near: 0.1, far: 2000 }}
         // localClippingEnabled lets a material carry its own clipping planes,
         // which is how the review shows the kept side of the cut as a solid.
+        // `flat` turns OFF ACES filmic tone mapping, which react-three-fiber
+        // applies by default. That curve is built for HDR lighting: it
+        // compresses highlights and desaturates, and on photographed vertex
+        // colour it is why the limb rendered washed-out grey next to a plain
+        // PLY viewer. Viewers like imagetostl.com simply do not tone-map, and
+        // neither should this — the colour came off a camera already graded.
+        flat
         gl={{ antialias: true, localClippingEnabled: true }}
       >
         <hemisphereLight intensity={0.55} groundColor="#404040" />

@@ -9,7 +9,7 @@ import { MAX_PLANES } from "@/components/three/CutReview";
 import { SLAB_HALF_MM, type CrossSectionResult } from "@/lib/crosssection";
 import type { CutPlane, SampleDataset, VolumeRow } from "@/lib/types";
 import { jobFrameUrls, loadCameras, loadLevelling } from "@/lib/api";
-import type { CameraData, LevellingData } from "@/lib/imagecamera";
+import type { CameraData, FrameCamera, LevellingData } from "@/lib/imagecamera";
 
 const Viewport = dynamic(
   () => import("@/components/three/Viewport").then((m) => m.Viewport),
@@ -23,6 +23,25 @@ const ImageCut = dynamic(
   () => import("@/components/three/ImageCut").then((m) => m.ImageCut),
   { ssr: false },
 );
+
+
+/** Disclosure triangle. Points down when open, right when closed. */
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <span
+      aria-hidden
+      style={{
+        display: "inline-block",
+        width: 10,
+        transition: "transform 120ms",
+        transform: open ? "rotate(90deg)" : "none",
+        color: "var(--muted)",
+      }}
+    >
+      ›
+    </span>
+  );
+}
 
 /** Height slider works in scene cm; tilt/direction rebuild the normal. */
 function planeFromControls(
@@ -280,6 +299,24 @@ export function Review({
   const [cameras, setCameras] = useState<CameraData | null>(null);
   const [levelling, setLevelling] = useState<LevellingData | null>(null);
   const [photoCutOpen, setPhotoCutOpen] = useState(false);
+  // The viewpoint of the photo currently selected, so the 3D view can look
+  // from the same place. Cleared when the photo view closes.
+  const [frameCamera, setFrameCamera] = useState<FrameCamera | null>(null);
+
+  // The plane cards carry three sliders each, which is a lot of chrome when two
+  // planes are open at once. Collapsed by default past the first, so the list
+  // reads as a list and a plane is expanded only while it is being adjusted.
+  const [cuttingLineOpen, setCuttingLineOpen] = useState(true);
+  const [openPlaneIds, setOpenPlaneIds] = useState<string[]>([]);
+
+  /** Opens or closes one plane's controls. */
+  function togglePlaneOpen(planeId: string) {
+    setOpenPlaneIds((ids) =>
+      ids.includes(planeId)
+        ? ids.filter((id) => id !== planeId)
+        : [...ids, planeId],
+    );
+  }
 
   useEffect(() => {
     if (!live) return;
@@ -300,6 +337,7 @@ export function Review({
       [plane.id]: { height: plane.centroid[2] * scale + offsetY, tilt: 0, dir: 0 },
     }));
     setActive(plane.id);
+    setOpenPlaneIds((ids) => [...ids, plane.id]);
   }
 
   // Adds a plane at mid-height, up to MAX_PLANES.
@@ -327,6 +365,7 @@ export function Review({
     setPlanes((ps) => [...ps, p]);
     setControls((c) => ({ ...c, [id]: { height: midY, tilt: 0, dir: 0 } }));
     setActive(id);
+    setOpenPlaneIds((ids) => [...ids, id]);
   }
 
   /** Put a dragged plane back exactly where detection had it. */
@@ -384,12 +423,15 @@ export function Review({
         }}
         className="review-grid"
       >
+        {/* The 3D view and the photo view share the wide column, stacked. */}
+        <div style={{ display: "grid", gap: 16, minWidth: 0 }}>
         <Panel pad={0} style={{ overflow: "hidden" }}>
           <div style={{ height: "clamp(380px, 58vh, 620px)" }}>
             <Viewport error={scaleError ?? loadError}>
               {rows && (
                 <CutReview
-                  onCrossSections={setSections}
+                  frameCamera={photoCutOpen ? frameCamera : null}
+                onCrossSections={setSections}
                   onLoadError={setLoadError}
                   url={dataset.meshes.legNoCut}
                   scale={scale}
@@ -421,8 +463,47 @@ export function Review({
           </div>
         </Panel>
 
+        {/* The photograph sits under the 3D view rather than in the controls
+            column, because the whole point is to click a band a few pixels
+            across — at sidebar width that is a coin toss. */}
+        {photoCutOpen && live && cameras && levelling && (
+          <Panel pad={0} style={{ overflow: "hidden" }}>
+            <ImageCut
+              url={dataset.meshes.legNoCut}
+              frameUrls={jobFrameUrls(dataset.id, dataset.frames)}
+              cameras={cameras}
+              levelling={levelling}
+              scale={scale}
+              disabled={planes.length >= MAX_PLANES}
+              onPlacePlane={placePlaneFromPhoto}
+              onFrameCamera={setFrameCamera}
+            />
+          </Panel>
+        )}
+        </div>
+
         <div style={{ display: "grid", gap: 12 }}>
-          {planes.map((p, i) => (
+          {planes.length > 0 && (
+            <div
+              onClick={() => setCuttingLineOpen((open) => !open)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                cursor: "pointer",
+                userSelect: "none",
+              }}
+            >
+              <Chevron open={cuttingLineOpen} />
+              <Label>
+                Cutting line · {planes.length}{" "}
+                {planes.length === 1 ? "plane" : "planes"}
+              </Label>
+            </div>
+          )}
+
+          {cuttingLineOpen &&
+            planes.map((p, i) => (
             <Panel
               key={p.id}
               style={{
@@ -438,9 +519,13 @@ export function Review({
                   alignItems: "center",
                   marginBottom: 12,
                 }}
-                onClick={() => setActive(p.id)}
+                onClick={() => {
+                  setActive(p.id);
+                  togglePlaneOpen(p.id);
+                }}
               >
                 <Label>
+                  <Chevron open={openPlaneIds.includes(p.id)} />{" "}
                   Plane {i + 1}
                   {p.source === "detected" ? ` · ${p.npts} marker pts` : " · manual"}
                 </Label>
@@ -452,6 +537,8 @@ export function Review({
                   remove
                 </Button>
               </div>
+              {openPlaneIds.includes(p.id) && (
+                <>
               {p.origin && (
                 <div
                   style={{
@@ -519,8 +606,10 @@ export function Review({
                 suffix="°"
                 onChange={(v) => update(p.id, { dir: v })}
               />
+                  </>
+                )}
             </Panel>
-          ))}
+            ))}
 
           {planes.length === 0 && (
             <Panel>
@@ -548,6 +637,23 @@ export function Review({
               + Add a cutting plane
             </Button>
           )}
+
+            {/* The photograph is where the band is actually visible, so this stays
+                offered even at the plane limit -- the view still shows where the
+                existing planes fall, and placing is disabled rather than hidden. */}
+            {live && cameras && levelling && (
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setPhotoCutOpen((open) => !open);
+                  setFrameCamera(null);
+                }}
+                style={{ borderStyle: "dashed", padding: 11, width: "100%" }}
+              >
+                {photoCutOpen ? "Close the photo view" : "+ Place the cut on a photo"}
+              </Button>
+            )}
+
 
           {planes.length >= MAX_PLANES && (
             <Caveat>

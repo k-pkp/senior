@@ -68,6 +68,42 @@ def _slice_keeping(mesh, origin, normal):
     return sliced
 
 
+def _restore_vertex_colours(cut_mesh, source_mesh):
+    """Copies the source mesh's vertex colours onto the cut one, by nearest vertex.
+
+    `slice_plane` builds new geometry and drops the visual data, so a cut limb
+    comes out flat grey -- which is what the result screen was showing next to a
+    volume measured from it. Every vertex the cut kept sits exactly where it did
+    before, so a nearest-vertex lookup returns its own colour unchanged; only the
+    cap is new, and its vertices take the colour of the rim they were cut from.
+    That is the same thing the point-cloud path did when it capped a cut.
+    """
+    source_colours = getattr(source_mesh.visual, "vertex_colors", None)
+    if source_colours is None or len(source_colours) == 0:
+        return cut_mesh
+
+    source_points = np.asarray(source_mesh.vertices, dtype=np.float64)
+    cut_points = np.asarray(cut_mesh.vertices, dtype=np.float64)
+
+    try:
+        from scipy.spatial import cKDTree
+
+        _distances, nearest = cKDTree(source_points).query(cut_points)
+    except ImportError:
+        # Without scipy, fall back to a chunked brute-force search. Slower, but
+        # a limb mesh is tens of thousands of vertices, not millions.
+        nearest = np.empty(len(cut_points), dtype=np.int64)
+        chunk_size = 2048
+        for start in range(0, len(cut_points), chunk_size):
+            chunk = cut_points[start:start + chunk_size]
+            distances = np.linalg.norm(
+                chunk[:, None, :] - source_points[None, :, :], axis=2)
+            nearest[start:start + chunk_size] = distances.argmin(axis=1)
+
+    cut_mesh.visual.vertex_colors = np.asarray(source_colours)[nearest]
+    return cut_mesh
+
+
 def apply_marker_cut_to_mesh(mesh, markers, up_axis=(0.0, 0.0, 1.0)):
     """Cuts a watertight mesh against at most two marker planes, by height.
 
@@ -127,4 +163,5 @@ def apply_marker_cut_to_mesh(mesh, markers, up_axis=(0.0, 0.0, 1.0)):
     if cut is None or len(cut.faces) < MIN_FACES_AFTER_CUT:
         return mesh, "too_few_after_cut"
 
+    cut = _restore_vertex_colours(cut, mesh)
     return cut, case

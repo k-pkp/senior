@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo } from "react";
 import * as THREE from "three";
+import type { FrameCamera } from "@/lib/imagecamera";
+import { useThree } from "@react-three/fiber";
 import { Bounds } from "@react-three/drei";
 import type { CutPlane } from "@/lib/types";
 import { fitSlice, type CrossSectionResult } from "@/lib/crosssection";
@@ -129,6 +131,66 @@ function midAxis(geom: THREE.BufferGeometry): THREE.Vector2 {
 // the Points path below. A surface is what a clinician actually places a cut
 // on — judging where a plane meets skin is far harder against a scatter of
 // points than against the skin itself.
+
+/**
+ * Points the view from wherever a chosen photograph was taken.
+ *
+ * Selecting a frame in the photo view should swing the 3D view round to match
+ * it, so the two show the same thing from the same place. The focal length is
+ * taken from that frame too — VGGT predicts a different one per frame, so a
+ * fixed field of view would agree with only one of them.
+ */
+function FrameViewpoint({
+  frameCamera,
+  geometry,
+}: {
+  frameCamera: FrameCamera | null;
+  geometry: THREE.BufferGeometry | null;
+}) {
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | null;
+  const invalidate = useThree((state) => state.invalidate);
+
+  useEffect(() => {
+    if (!frameCamera || !geometry) return;
+
+    // OrbitControls is `makeDefault`, which means it owns the camera: every
+    // update it rewrites position and orientation from its own target and
+    // spherical state. Setting the camera directly is therefore pointless —
+    // the next frame overwrites it. The pose has to be expressed the way the
+    // controls express it, as a position plus a target.
+    geometry.computeBoundingBox();
+    const centre = new THREE.Vector3();
+    geometry.boundingBox?.getCenter(centre);
+
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+      frameCamera.quaternion,
+    );
+    const distance = centre.distanceTo(frameCamera.position);
+    const target = frameCamera.position
+      .clone()
+      .add(forward.multiplyScalar(distance));
+
+    camera.position.copy(frameCamera.position);
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.fov = frameCamera.verticalFieldOfViewDeg;
+      camera.updateProjectionMatrix();
+    }
+    if (controls) {
+      controls.target.copy(target);
+      controls.update();
+    } else {
+      camera.lookAt(target);
+    }
+    camera.updateMatrixWorld();
+    invalidate();
+  }, [camera, controls, frameCamera, geometry, invalidate]);
+
+  return null;
+}
+
 function Surface({
   geometry,
   prepared,
@@ -136,9 +198,9 @@ function Surface({
   geometry: THREE.BufferGeometry;
   prepared: PreparedPlane[];
 }) {
-  const clippingPlanes = useMemo(() => {
-    // three.js keeps whatever satisfies normal·p + constant >= 0, and the
-    // planes here are prepared with their normals pointing up.
+  // The half-spaces the cut KEEPS. three.js keeps whatever satisfies
+  // normal·p + constant >= 0, and the prepared normals point up.
+  const keepPlanes = useMemo(() => {
     if (prepared.length === 0) return [];
     if (prepared.length === 1) {
       // Keep what is BELOW the plane.
@@ -146,7 +208,7 @@ function Surface({
       return [new THREE.Plane(only.nrm.clone().negate(), only.d0)];
     }
     // Keep what lies BETWEEN: below the upper plane and above the lower one.
-    // Several clipping planes intersect, which is exactly that conjunction.
+    // Clipping planes intersect by default, which is exactly that conjunction.
     const byHeight = [...prepared].sort((a, b) => a.height - b.height);
     const lower = byHeight[0];
     const upper = byHeight[1];
@@ -156,25 +218,63 @@ function Surface({
     ];
   }, [prepared]);
 
+  // The complement, for the discarded remainder. Negating each plane and
+  // switching to `clipIntersection` turns the conjunction above into its
+  // union — everything above the upper plane OR below the lower one.
+  //
+  // Drawing the two as separate, non-overlapping regions is what keeps the
+  // colour readable. A faint copy of the WHOLE limb drawn over the kept part
+  // is blended in the transparent pass, after the opaque geometry, so it laid
+  // a white veil across the very thing it was meant to sit behind.
+  const discardPlanes = useMemo(
+    () => keepPlanes.map((plane) => plane.clone().negate()),
+    [keepPlanes],
+  );
+
+  const hasVertexColours = Boolean(geometry.getAttribute("color"));
+
   return (
     <group>
-      {/* The discarded remainder, faint, so the cut reads as a cut rather than
-          as the limb simply ending where it does. */}
+      {/* The discarded remainder: real colour, dimmed, and clipped so it
+          never overlaps the kept side. */}
       <mesh geometry={geometry}>
         <meshStandardMaterial
-          color="#b9bcc0"
-          transparent
-          opacity={0.16}
-          depthWrite={false}
-          roughness={0.9}
+          color={hasVertexColours ? "#ffffff" : "#b9bcc0"}
+          vertexColors={hasVertexColours}
+          clippingPlanes={discardPlanes}
+          clipIntersection={discardPlanes.length > 1}
+          // Opaque. At 0.4 over a near-white background the discarded half
+          // washed to pale grey, which read as "the reconstruction has no
+          // colour" rather than "this part is not being measured". The blue
+          // veil below is what marks the kept side; the rest of the limb is
+          // just the limb.
+          roughness={0.95}
         />
       </mesh>
+
+      {/* The kept side at full photographed colour, untinted. Anything mixed
+          into the material here — a multiply or an emissive — changes the
+          colour itself, and this is the surface a clinician is reading. */}
       <mesh geometry={geometry}>
         <meshStandardMaterial
-          color="#3b7dd8"
-          clippingPlanes={clippingPlanes}
-          roughness={0.65}
-          metalness={0.05}
+          color="#ffffff"
+          vertexColors={hasVertexColours}
+          clippingPlanes={keepPlanes}
+          roughness={0.85}
+          metalness={0}
+        />
+      </mesh>
+
+      {/* The selection, as a light blue veil laid OVER the kept side rather
+          than mixed into it. Separating the two means the tint can be made as
+          faint as it likes without ever costing colour fidelity. */}
+      <mesh geometry={geometry} renderOrder={2}>
+        <meshBasicMaterial
+          color="#8fc0ff"
+          clippingPlanes={keepPlanes}
+          transparent
+          opacity={0.13}
+          depthWrite={false}
         />
       </mesh>
     </group>
@@ -325,6 +425,7 @@ function OriginWidget({
 // Interactive 3D view of the limb with the cutting planes drawn over it.
 export function CutReview({
   url,
+  frameCamera,
   onLoadError,
   scale,
   planes,
@@ -334,6 +435,8 @@ export function CutReview({
   onExtent,
 }: {
   url: string;
+  /** Pose of the photo being reviewed, if the photo view is open. */
+  frameCamera?: FrameCamera | null;
   scale: number;
   planes: CutPlane[];
   activePlaneId: string | null;
@@ -398,9 +501,14 @@ export function CutReview({
   const radius =
     Math.max(bb.max.x - bb.min.x, bb.max.z - bb.min.z) * 0.85 || 6;
 
-  return (
-    <Bounds fit clip observe margin={1.5}>
-      <group>
+  // Bounds owns the camera: with `observe` it refits whenever size, camera or
+  // controls change, and `controls` only arrives after the first mount — so a
+  // pose set from inside it is applied and then immediately overwritten. React
+  // runs child effects before parent ones, so a child could never win that
+  // race. While a photograph's viewpoint is in force the auto-fit is therefore
+  // not mounted at all; it comes back the moment the photo view closes.
+  const scene = (
+    <group>
         {/* Stage 5 publishes a watertight solid, and that is what the cut is
             actually applied to, so the review draws it as a surface. Jobs
             measured before the cut moved — and the bundled samples — still
@@ -447,7 +555,21 @@ export function CutReview({
             active={p.id === activePlaneId}
           />
         ))}
-      </group>
+    </group>
+  );
+
+  if (frameCamera) {
+    return (
+      <>
+        <FrameViewpoint frameCamera={frameCamera} geometry={geometry} />
+        {scene}
+      </>
+    );
+  }
+
+  return (
+    <Bounds fit clip observe margin={1.5}>
+      {scene}
     </Bounds>
   );
 }

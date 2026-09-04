@@ -299,7 +299,10 @@ def main():
                     # where they are actually applied, to the repaired solid.
                     detected_planes_path = os.path.join(
                         stage_dirs[3], "debug", "cutting_line_levelled.json")
-                    cut_planes = None
+                    # An empty list means there was nothing to cut, so the whole
+                    # object is measured. run.py never defers, so this is never
+                    # None here.
+                    cut_planes = []
                     if os.path.exists(detected_planes_path):
                         import json as _json
                         with open(detected_planes_path) as planes_file:

@@ -194,6 +194,40 @@ def _rename_repaired_limb(watertight_paths):
     return renamed
 
 
+def _rebuild_scene_from_cut(mesh_output_dir, watertight_paths, cut_path):
+    """Re-merges the published scene so it shows the CUT limb, not the uncut one.
+
+    make_watertight_meshes merges its objects before this stage cuts anything,
+    so the scene it wrote pairs the reference cube with the whole limb. That is
+    the wrong picture the moment a cut exists: the scene is what the result
+    screen shows beside the measured volume, and the two have to be of the same
+    object.
+
+    Returns the rewritten colour scene path.
+    """
+    import trimesh
+
+    keep_paths = [cut_path]
+    for candidate in watertight_paths:
+        if os.path.basename(candidate) not in (UNCUT_LIMB_NAME, CUT_LIMB_NAME):
+            keep_paths.append(candidate)
+
+    parts = [trimesh.load(p, process=False) for p in keep_paths]
+    scene = trimesh.util.concatenate(parts)
+
+    scene_colour_ply = os.path.join(mesh_output_dir, "scene_colour.ply")
+    scene_colour_stl = os.path.join(mesh_output_dir, "scene_colour.stl")
+    scene_ply = os.path.join(mesh_output_dir, "scene.ply")
+    scene_stl = os.path.join(mesh_output_dir, "scene.stl")
+    for target in (scene_colour_ply, scene_colour_stl, scene_ply, scene_stl):
+        scene.export(target)
+
+    names = ", ".join(os.path.basename(p) for p in keep_paths)
+    print(f"  Scene rebuilt from the cut: {names} "
+          f"({len(scene.vertices):,} verts)")
+    return scene_colour_ply
+
+
 def _cut_limb_mesh(watertight_paths, mesh_output_dir, cut_planes, height_axis):
     """Cuts the repaired limb against the confirmed planes and writes leg_cut.ply.
 
@@ -223,8 +257,13 @@ def _cut_limb_mesh(watertight_paths, mesh_output_dir, cut_planes, height_axis):
 
     cut_mesh, case = apply_marker_cut_to_mesh(mesh, cut_planes, up_axis=up_axis)
     if case in ("no_markers", "no_usable_markers", "too_few_after_cut"):
-        print(f"  Marker cut on mesh ({case}): leg_cut.ply not written")
-        return None
+        # No cut was applicable, which is not the same as no answer. The cloud
+        # path treated every one of these as "keep everything" and measured the
+        # whole object -- that is how a rigid object with no marker band, run
+        # with --no-segment-leg, gets a volume at all. Publishing the uncut solid
+        # under the measured name keeps that working; returning nothing here left
+        # Stage 6 with only the reference cube to report.
+        print(f"  Marker cut on mesh ({case}): measuring the whole object")
 
     cut_path = os.path.join(mesh_output_dir, CUT_LIMB_NAME)
     cut_mesh.export(cut_path)
@@ -261,10 +300,15 @@ def watertight_stage(recon_paths, output_dir, cut_planes=None, height_axis="z"):
             print(f"  Object watertight mesh: {p}")
         wt_paths = _rename_repaired_limb(wt_paths)
 
-        if cut_planes:
+        # None means the cut is deferred and nothing may be measured yet.
+        # An empty list is different: it is a confirmed decision to cut
+        # nowhere, and the whole object is then the measurement.
+        if cut_planes is not None:
             cut_path = _cut_limb_mesh(wt_paths, mesh_output_dir, cut_planes,
                                       height_axis)
             if cut_path is not None:
+                scene_wt = _rebuild_scene_from_cut(mesh_output_dir, wt_paths,
+                                                   cut_path)
                 wt_paths = list(wt_paths) + [cut_path]
 
         return scene_wt, wt_paths

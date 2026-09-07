@@ -6,7 +6,10 @@ import * as THREE from "three";
 import { Button, Caveat, Label, Panel, Slider } from "@/components/ui/primitives";
 import { linearScale, loadCutPlanes, loadVolumes, newPlaneId } from "@/lib/data";
 import { MAX_PLANES } from "@/components/three/CutReview";
+import { SLAB_HALF_MM, type CrossSectionResult } from "@/lib/crosssection";
 import type { CutPlane, SampleDataset, VolumeRow } from "@/lib/types";
+import { jobFrameUrls, loadCameras, loadLevelling } from "@/lib/api";
+import type { CameraData, FrameCamera, LevellingData } from "@/lib/imagecamera";
 
 const Viewport = dynamic(
   () => import("@/components/three/Viewport").then((m) => m.Viewport),
@@ -16,6 +19,29 @@ const CutReview = dynamic(
   () => import("@/components/three/CutReview").then((m) => m.CutReview),
   { ssr: false },
 );
+const ImageCut = dynamic(
+  () => import("@/components/three/ImageCut").then((m) => m.ImageCut),
+  { ssr: false },
+);
+
+
+/** Disclosure triangle. Points down when open, right when closed. */
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <span
+      aria-hidden
+      style={{
+        display: "inline-block",
+        width: 10,
+        transition: "transform 120ms",
+        transform: open ? "rotate(90deg)" : "none",
+        color: "var(--muted)",
+      }}
+    >
+      ›
+    </span>
+  );
+}
 
 /** Height slider works in scene cm; tilt/direction rebuild the normal. */
 function planeFromControls(
@@ -72,6 +98,82 @@ function controlsFromNormal(
   };
 }
 
+/** Girth of the limb where a plane crosses it, fitted while the plane moves.
+ *
+ * The same measurement Stage 6 prints, from the same code ported to TypeScript
+ * (`lib/crosssection.ts`), so a reviewer can put the cut at a height they have a
+ * tape measurement for and compare on the spot — the one limb dimension that can
+ * be checked without water.
+ *
+ * The diagnostics are shown, not hidden behind a threshold. An algebraic ellipse
+ * fit always returns something: a slice through half a ring comes back with a
+ * plausible number and a *better* residual than the truth, because it
+ * extrapolates the missing side. If this panel showed only the centimetres, that
+ * failure would look exactly like a measurement.
+ */
+function CircumferenceReadout({ section }: { section?: CrossSectionResult }) {
+  if (!section) return null;
+  if (!section.ok) {
+    return (
+      <div
+        style={{
+          font: "400 11.5px/1.5 var(--sans)",
+          color: "var(--muted)",
+          margin: "0 0 10px",
+        }}
+      >
+        no circumference here — {section.reason}
+      </div>
+    );
+  }
+
+  const polygonGap =
+    ((section.circumferenceCm - section.polygonCm) / section.polygonCm) * 100;
+  return (
+    <div style={{ margin: "0 0 12px" }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <span style={{ font: "500 11px/1 var(--sans)", letterSpacing: "0.04em",
+                       textTransform: "uppercase", color: "var(--muted)" }}>
+          Circumference
+        </span>
+        <span style={{ font: "500 15px/1.2 var(--mono)", marginLeft: "auto" }}>
+          {section.circumferenceCm.toFixed(2)} cm
+        </span>
+      </div>
+      <div
+        style={{
+          font: "400 11px/1.6 var(--mono)",
+          color: "var(--muted)",
+          marginTop: 4,
+        }}
+      >
+        a {section.aCm.toFixed(2)} · b {section.bCm.toFixed(2)} cm ·{" "}
+        {section.nSlab} pts in a ±{SLAB_HALF_MM.toFixed(0)} mm slab
+        <br />
+        {(section.coverage * 100).toFixed(0)}% of the ring · residual{" "}
+        {section.residRmsMm.toFixed(2)} mm · polygon check{" "}
+        {section.polygonCm.toFixed(2)} cm ({polygonGap >= 0 ? "+" : ""}
+        {polygonGap.toFixed(1)}%)
+      </div>
+      {section.partialArc && (
+        <Caveat>
+          The ring is open — the largest gap is{" "}
+          {section.maxGapDeg.toFixed(0)}°, so the fit is extrapolating across a
+          side that was never reconstructed. Not a measurement.
+        </Caveat>
+      )}
+      {section.nearFloor && !section.partialArc && (
+        <Caveat>
+          This plane sits close to the floor, where the cloud carries the
+          fabricated base the pipeline adds. The girth here is partly invented
+          geometry.
+        </Caveat>
+      )}
+    </div>
+  );
+}
+
+// Cut review screen: shows the detected planes and lets the user move, add or remove them before the cut is applied.
 export function Review({
   dataset,
   live,
@@ -101,6 +203,9 @@ export function Review({
   // The loader's full translation. offset.y converts slider cm <-> mesh Z;
   // offset.x/z are what put a manually added plane on the object's axis.
   const [offset, setOffset] = useState(new THREE.Vector3());
+  // Circumference at each plane, recomputed in the viewport whenever a plane
+  // moves. Empty until the cloud has loaded.
+  const [sections, setSections] = useState<Record<string, CrossSectionResult>>({});
   const offsetY = offset.y;
   // Where the object actually is horizontally at mid height, in scene cm.
   const [midAxis, setMidAxis] = useState(new THREE.Vector2());
@@ -132,8 +237,19 @@ export function Review({
       // fake one would imply a detection that never happened, and the user
       // would be adjusting an invention rather than a measurement. With no
       // marker the user adds a plane deliberately, or continues uncut.
-      setPlanes(detected.slice(0, MAX_PLANES));
-      setActive(detected[0]?.id ?? null);
+      //
+      // Detection can validate more than the two a cut can use. Seed the
+      // OUTERMOST two rather than the first two: two planes keep what lies
+      // between them, so the outermost pair is the largest segment the
+      // detected bands describe, and dropping one is one click. Taking the
+      // lowest two would silently propose a segment the reviewer never saw a
+      // reason for.
+      const seeded =
+        detected.length > MAX_PLANES
+          ? [detected[0], detected[detected.length - 1]]
+          : detected;
+      setPlanes(seeded);
+      setActive(seeded[0]?.id ?? null);
       setCalibrated(false);   // control values need offsetY, which arrives with the geometry
     });
   }, [dataset, scale]);
@@ -154,6 +270,7 @@ export function Review({
     setCalibrated(true);
   }, [planes, offsetY, scale, calibrated]);
 
+  // Applies a partial control change to one plane and mirrors it into the plane list.
   function update(id: string, patch: Partial<Controls>) {
     setControls((prev) => {
       const next = { ...prev, [id]: { ...prev[id], ...patch } };
@@ -175,6 +292,55 @@ export function Review({
     });
   }
 
+  // Adds a new plane at mid-height, up to MAX_PLANES.
+  // Placing the cut on a photograph needs VGGT's own camera for the frame and
+  // the rotation Stage 3 levelled by. Only a live job has them; a shipped
+  // sample ships meshes and nothing else, so the option stays hidden there.
+  const [cameras, setCameras] = useState<CameraData | null>(null);
+  const [levelling, setLevelling] = useState<LevellingData | null>(null);
+  const [photoCutOpen, setPhotoCutOpen] = useState(false);
+  // The viewpoint of the photo currently selected, so the 3D view can look
+  // from the same place. Cleared when the photo view closes.
+  const [frameCamera, setFrameCamera] = useState<FrameCamera | null>(null);
+
+  // The plane cards carry three sliders each, which is a lot of chrome when two
+  // planes are open at once. Collapsed by default past the first, so the list
+  // reads as a list and a plane is expanded only while it is being adjusted.
+  const [cuttingLineOpen, setCuttingLineOpen] = useState(true);
+  const [openPlaneIds, setOpenPlaneIds] = useState<string[]>([]);
+
+  /** Opens or closes one plane's controls. */
+  function togglePlaneOpen(planeId: string) {
+    setOpenPlaneIds((ids) =>
+      ids.includes(planeId)
+        ? ids.filter((id) => id !== planeId)
+        : [...ids, planeId],
+    );
+  }
+
+  useEffect(() => {
+    if (!live) return;
+    let stillMounted = true;
+    loadCameras(dataset.id).then((data) => stillMounted && setCameras(data));
+    loadLevelling(dataset.id).then((data) => stillMounted && setLevelling(data));
+    return () => {
+      stillMounted = false;
+    };
+  }, [live, dataset.id]);
+
+  /** Adds a plane the user placed by clicking the photograph. */
+  function placePlaneFromPhoto(plane: CutPlane) {
+    if (planes.length >= MAX_PLANES) return;
+    setPlanes((ps) => [...ps, plane]);
+    setControls((c) => ({
+      ...c,
+      [plane.id]: { height: plane.centroid[2] * scale + offsetY, tilt: 0, dir: 0 },
+    }));
+    setActive(plane.id);
+    setOpenPlaneIds((ids) => [...ids, plane.id]);
+  }
+
+  // Adds a plane at mid-height, up to MAX_PLANES.
   function addPlane() {
     if (planes.length >= MAX_PLANES) return;
     const id = newPlaneId();
@@ -199,6 +365,7 @@ export function Review({
     setPlanes((ps) => [...ps, p]);
     setControls((c) => ({ ...c, [id]: { height: midY, tilt: 0, dir: 0 } }));
     setActive(id);
+    setOpenPlaneIds((ids) => [...ids, id]);
   }
 
   /** Put a dragged plane back exactly where detection had it. */
@@ -221,6 +388,7 @@ export function Review({
     }));
   }
 
+  // Removes a plane and clears the selection if it was the active one.
   function removePlane(id: string) {
     setPlanes((ps) => ps.filter((p) => p.id !== id));
     setActive((a) => (a === id ? null : a));
@@ -255,11 +423,15 @@ export function Review({
         }}
         className="review-grid"
       >
+        {/* The 3D view and the photo view share the wide column, stacked. */}
+        <div style={{ display: "grid", gap: 16, minWidth: 0 }}>
         <Panel pad={0} style={{ overflow: "hidden" }}>
           <div style={{ height: "clamp(380px, 58vh, 620px)" }}>
             <Viewport error={scaleError ?? loadError}>
               {rows && (
                 <CutReview
+                  frameCamera={photoCutOpen ? frameCamera : null}
+                onCrossSections={setSections}
                   onLoadError={setLoadError}
                   url={dataset.meshes.legNoCut}
                   scale={scale}
@@ -291,8 +463,47 @@ export function Review({
           </div>
         </Panel>
 
+        {/* The photograph sits under the 3D view rather than in the controls
+            column, because the whole point is to click a band a few pixels
+            across — at sidebar width that is a coin toss. */}
+        {photoCutOpen && live && cameras && levelling && (
+          <Panel pad={0} style={{ overflow: "hidden" }}>
+            <ImageCut
+              url={dataset.meshes.legNoCut}
+              frameUrls={jobFrameUrls(dataset.id, dataset.frames)}
+              cameras={cameras}
+              levelling={levelling}
+              scale={scale}
+              disabled={planes.length >= MAX_PLANES}
+              onPlacePlane={placePlaneFromPhoto}
+              onFrameCamera={setFrameCamera}
+            />
+          </Panel>
+        )}
+        </div>
+
         <div style={{ display: "grid", gap: 12 }}>
-          {planes.map((p, i) => (
+          {planes.length > 0 && (
+            <div
+              onClick={() => setCuttingLineOpen((open) => !open)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                cursor: "pointer",
+                userSelect: "none",
+              }}
+            >
+              <Chevron open={cuttingLineOpen} />
+              <Label>
+                Cutting line · {planes.length}{" "}
+                {planes.length === 1 ? "plane" : "planes"}
+              </Label>
+            </div>
+          )}
+
+          {cuttingLineOpen &&
+            planes.map((p, i) => (
             <Panel
               key={p.id}
               style={{
@@ -308,9 +519,13 @@ export function Review({
                   alignItems: "center",
                   marginBottom: 12,
                 }}
-                onClick={() => setActive(p.id)}
+                onClick={() => {
+                  setActive(p.id);
+                  togglePlaneOpen(p.id);
+                }}
               >
                 <Label>
+                  <Chevron open={openPlaneIds.includes(p.id)} />{" "}
                   Plane {i + 1}
                   {p.source === "detected" ? ` · ${p.npts} marker pts` : " · manual"}
                 </Label>
@@ -322,6 +537,8 @@ export function Review({
                   remove
                 </Button>
               </div>
+              {openPlaneIds.includes(p.id) && (
+                <>
               {p.origin && (
                 <div
                   style={{
@@ -357,6 +574,7 @@ export function Review({
                   </Button>
                 </div>
               )}
+              <CircumferenceReadout section={sections[p.id]} />
               <Slider
                 label="Height"
                 value={controls[p.id]?.height ?? 0}
@@ -388,8 +606,10 @@ export function Review({
                 suffix="°"
                 onChange={(v) => update(p.id, { dir: v })}
               />
+                  </>
+                )}
             </Panel>
-          ))}
+            ))}
 
           {planes.length === 0 && (
             <Panel>
@@ -417,6 +637,23 @@ export function Review({
               + Add a cutting plane
             </Button>
           )}
+
+            {/* The photograph is where the band is actually visible, so this stays
+                offered even at the plane limit -- the view still shows where the
+                existing planes fall, and placing is disabled rather than hidden. */}
+            {live && cameras && levelling && (
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setPhotoCutOpen((open) => !open);
+                  setFrameCamera(null);
+                }}
+                style={{ borderStyle: "dashed", padding: 11, width: "100%" }}
+              >
+                {photoCutOpen ? "Close the photo view" : "+ Place the cut on a photo"}
+              </Button>
+            )}
+
 
           {planes.length >= MAX_PLANES && (
             <Caveat>

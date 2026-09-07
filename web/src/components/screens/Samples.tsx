@@ -4,6 +4,7 @@ import { Button, Label, Panel } from "@/components/ui/primitives";
 import { SAMPLES } from "@/lib/data";
 import type { SampleDataset } from "@/lib/types";
 
+// Landing screen: pick a bundled sample capture or start an upload.
 export function Samples({
   onOpen,
   onUpload,

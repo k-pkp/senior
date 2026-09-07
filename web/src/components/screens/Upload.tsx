@@ -7,6 +7,7 @@ import { Button, Caveat, Label, Panel } from "@/components/ui/primitives";
 const MIN_FILES = 6;
 const MAX_FILES = 12;
 
+// Upload screen: choose a photo set and submit it as a new job.
 export function Upload({
   onStart,
   onBack,
@@ -24,6 +25,7 @@ export function Upload({
   const [error, setError] = useState<string | null>(null);
   const ok = files.length >= MIN_FILES && files.length <= MAX_FILES;
 
+  // Uploads the chosen files, reporting progress and surfacing any error.
   async function send() {
     setSending(true);
     setError(null);

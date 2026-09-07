@@ -24,6 +24,7 @@ LOG_COLUMNS = [
 
 
 def _fmt(v, spec):
+    """Formats a number to the given format spec, or returns an empty string for anything else."""
     return format(v, spec) if isinstance(v, (int, float)) else ""
 
 
@@ -31,6 +32,7 @@ class RunLogger:
     """Sample CPU/RAM in background, capture VRAM peak via torch counters, write row on stop."""
 
     def __init__(self, log_path, device, sample_interval=0.5):
+        """Starts the run clock and resets the CUDA peak-memory counter if this is a CUDA device."""
         self.log_path = log_path
         self.device = str(device)
         self.dkind = self.device.split(":")[0]
@@ -45,6 +47,7 @@ class RunLogger:
             torch.cuda.reset_peak_memory_stats()
 
     def start(self):
+        """Begins background CPU and RAM sampling. Does nothing when psutil is unavailable."""
         if self.proc is None:
             return
         # Prime cpu_percent so subsequent calls return deltas.
@@ -53,6 +56,7 @@ class RunLogger:
         self._thread.start()
 
     def _sample_loop(self):
+        """Records peak RSS and CPU percent until stopped. Runs on the background thread."""
         while not self._stop.is_set():
             try:
                 rss = self.proc.memory_info().rss
@@ -65,6 +69,7 @@ class RunLogger:
             self._stop.wait(self.sample_interval)
 
     def _gpu_name(self):
+        """Returns the accelerator's display name, or an empty string on CPU."""
         if self.dkind == "cuda" and torch.cuda.is_available():
             try:
                 return torch.cuda.get_device_name(0)
@@ -75,6 +80,7 @@ class RunLogger:
         return ""
 
     def _vram(self):
+        """Returns (used_gb, peak_gb) for the accelerator, or (None, None) when unavailable."""
         if self.dkind == "cuda" and torch.cuda.is_available():
             used = torch.cuda.memory_allocated() / (1024 ** 3)
             peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
@@ -90,6 +96,10 @@ class RunLogger:
 
     def stop_and_write(self, input_path, output_path, inference_time,
                        obj_vol_cm3=None, box_vol_cm3=None):
+        """Stops sampling and appends one row of run metrics to the CSV.
+
+        Writes the header first if the log file does not exist yet.
+        """
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)

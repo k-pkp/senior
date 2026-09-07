@@ -41,6 +41,7 @@ STAGE_DIRS = {
 
 
 def stage_dir(name, n, create=True):
+    """Returns the directory holding stage n's output for this run, creating it by default."""
     d = os.path.join(WORK, name, STAGE_DIRS[n])
     if create:
         os.makedirs(d, exist_ok=True)
@@ -53,6 +54,7 @@ def src_dir(args, name, n):
 
 
 def _write_summary(d, lines):
+    """Writes the summary lines to summary.txt in the stage directory and prints them."""
     path = os.path.join(d, "summary.txt")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -373,6 +375,12 @@ def run_stage0(args, name):
 
 
 def run_stage1(args, name):
+    """Runs VGGT inference and caches predictions.npz, so later stages cost no inference time.
+
+    Warns when Stage 0 produced framed images but this run is reading a
+    different folder, because VGGT would then crop the frames itself and
+    silently discard Stage 0's framing.
+    """
     from vggt.utils.device import get_device
 
     # Guard the same trap when the stages are run separately. Stage 0's summary
@@ -467,6 +475,7 @@ def run_stage1(args, name):
 # ── Stage 2 ────────────────────────────────────────────────────────────
 
 def run_stage2(args, name):
+    """Exports the confidence-filtered point cloud from Stage 1's predictions."""
     from pipeline.stages.pointcloud import export_ply
 
     src = os.path.join(src_dir(args, name, 1), "predictions.npz")
@@ -513,6 +522,41 @@ def _measured_marker_colour(args, name):
     return None
 
 
+def _detected_band_count(args, name):
+    """How many marker bands Stage 0 counted, for --cut-mode auto.
+
+    None when Stage 0 did not run, or ran before multi-band detection existed.
+    That is "unknown", not "none": resolve_cut_mode falls back to the plane
+    count alone rather than treating a missing report as evidence.
+    """
+    for cand in (name, args.src):
+        if not cand:
+            continue
+        path = os.path.join(stage_dir(cand, 0, create=False), "framing.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f).get("bands")
+    return None
+
+
+def _projected_band_planes(args, name):
+    """Cut planes projected from Stage 0's band boxes, if both stages ran.
+
+    Empty when Stage 0 or Stage 1 is missing from this run, which leaves Stage 3
+    on colour detection alone — exactly what it did before.
+    """
+    from pipeline.core.bands3d import band_planes_from_dirs
+    for cand in (name, args.src):
+        if not cand:
+            continue
+        prep = stage_dir(cand, 0, create=False)
+        npz = os.path.join(stage_dir(cand, 1, create=False), "predictions.npz")
+        if os.path.exists(os.path.join(prep, "manifest.json")) and os.path.exists(npz):
+            return band_planes_from_dirs(
+                prep, npz, height_axis=args.segment_height_axis)
+    return []
+
+
 def _review_planes(args):
     """Cutting planes supplied by an interactive review, if any.
 
@@ -530,26 +574,14 @@ def _review_planes(args):
 
 
 def run_stage3(args, name):
-    import glob
-    from pipeline.stages.clean import clean_and_extract, cut_only
+    """Segments the cloud, detects the marker planes, and exports leg.ply and box.ply.
 
-    # --cut-only is the second half of a Stage 3 that deferred its cut. Every
-    # expensive step already ran and its result is on disk, so this reads the
-    # uncut limb back and applies the confirmed planes to it. Doing that instead
-    # of a full re-run is what keeps a review from costing a second clustering,
-    # ghost filter, MLS and levelling pass.
-    if getattr(args, "cut_only", False):
-        d = stage_dir(name, 3)
-        paths = cut_only(d, _review_planes(args) or [],
-                         fill_enabled=not args.no_fill)
-        lines = ["STAGE 3 — cut only   (planes confirmed by review)", ""]
-        for p in sorted(glob.glob(os.path.join(d, "objects", "*.ply"))):
-            lines.append("  " + _pcd_stats(p))
-        lines += ["", f"  objects handed to stage 4: {len(paths or [])}"]
-        for p in (paths or []):
-            lines.append(f"    {p}")
-        _write_summary(d, lines)
-        return
+    No cutting happens here. The planes are published for review and applied in
+    Stage 5, to the watertight solid, so re-cutting costs a plane slice rather
+    than a second clustering, ghost filter, MLS and levelling pass.
+    """
+    import glob
+    from pipeline.stages.clean import clean_and_extract
 
     prev = src_dir(args, name, 2)
     ply = os.path.join(prev, "points.ply")
@@ -566,9 +598,21 @@ def run_stage3(args, name):
         clean_ply_path=None,
         marker_colour=_measured_marker_colour(args, name),
         override_planes=_review_planes(args),
-        apply_cut=not getattr(args, "no_cut", False))
+        cut_mode=getattr(args, "cut_mode", None),
+        n_bands=_detected_band_count(args, name),
+        band_planes=_projected_band_planes(args, name),
+        # Stage 3 no longer cuts. It segments the limb, detects the marker
+        # planes and publishes both; the cut itself is applied in Stage 5,
+        # to the repaired watertight solid. Cutting the mesh is what lets a
+        # clinician place the cut on a surface rather than on a scatter of
+        # points, and it leaves no reconstruction step between the cut and
+        # the measurement.
+        apply_cut=False)
 
-    lines = [f"STAGE 3 — clean   fill={not args.no_fill}  segment_leg={args.segment_leg}", ""]
+    from pipeline.stages.clean import resolve_cut_mode
+    lines = [f"STAGE 3 — clean   fill={not args.no_fill}  "
+             f"segment_leg={args.segment_leg}  "
+             f"cut_mode={resolve_cut_mode(getattr(args, 'cut_mode', None))}", ""]
     for p in sorted(glob.glob(os.path.join(d, "**", "*.ply"), recursive=True)):
         lines.append("  " + _pcd_stats(p))
     lines += ["", f"  objects handed to stage 4: {len(paths or [])}"]
@@ -580,6 +624,7 @@ def run_stage3(args, name):
 # ── Stage 4 / 5 / 6 ────────────────────────────────────────────────────
 
 def _mesh_stats(path):
+    """Returns a one-line summary of a mesh: vertex and face counts, watertightness, volume."""
     import trimesh
     m = trimesh.load(path, process=False)
     m.merge_vertices()
@@ -625,12 +670,16 @@ def _prune_meshes(d, object_paths):
 
 
 def run_stage4(args, name):
+    """Reconstructs a surface mesh for every object cloud Stage 3 exported."""
     import glob
     from pipeline.stages.reconstruct import reconstruct_mesh_stage
 
     prev = src_dir(args, name, 3)
     objs = sorted(glob.glob(os.path.join(prev, "objects", "*.ply")))
-    objs = [p for p in objs if os.path.basename(p) in ("box.ply", "leg_cut.ply", "obj.ply")]
+    # leg.ply is Stage 3's complete limb. Stage 5 repairs it, cuts the solid and
+    # publishes both leg_no_cut.ply and leg_cut.ply from it.
+    objs = [p for p in objs if os.path.basename(p) in
+            ("box.ply", "leg.ply", "obj.ply")]
     if not objs:
         sys.exit("ERROR: stage 3 objects missing — run stage 3 first")
 
@@ -647,6 +696,7 @@ def run_stage4(args, name):
 
 
 def run_stage5(args, name):
+    """Repairs Stage 4's meshes into watertight solids, skipping the merged scene mesh."""
     import glob
     from pipeline.stages.watertight import watertight_stage
 
@@ -662,9 +712,29 @@ def run_stage5(args, name):
     if not recon:
         sys.exit("ERROR: stage 4 recon meshes missing — run stage 4 first")
 
+    # Which planes this stage cuts on, in priority order: the ones a review
+    # handed back, else the ones Stage 3 detected. --no-cut defers entirely, so
+    # the uncut solid is published and nothing is cut until a person confirms.
+    cut_planes = None
+    if not getattr(args, "no_cut", False):
+        cut_planes = _review_planes(args)
+        if cut_planes is None:
+            detected = os.path.join(src_dir(args, name, 3), "debug",
+                                    "cutting_line_levelled.json")
+            if os.path.exists(detected):
+                with open(detected) as planes_file:
+                    cut_planes = json.load(planes_file).get("markers", [])
+            else:
+                # Stage 3 found no marker planes, so there is nothing to cut and
+                # the whole object is the measurement. That is an empty list, not
+                # None: None is reserved for a cut deliberately deferred, which
+                # must produce no measurement at all.
+                cut_planes = []
+
     d = stage_dir(name, 5)
     _clear_meshes(d)
-    scene, wt = watertight_stage(recon, d)
+    scene, wt = watertight_stage(recon, d, cut_planes=cut_planes,
+                                 height_axis=args.segment_height_axis)
 
     lines = ["STAGE 5 — watertight", ""]
     lines += ["  " + _mesh_stats(p) for p in (wt or [])]
@@ -672,36 +742,28 @@ def run_stage5(args, name):
 
 
 def run_stage6(args, name):
+    """Computes real-world volumes, preferring Stage 5's meshes and falling back to Stage 4's."""
     import glob
     from pipeline.stages.volume import compute_volumes
 
     for n in (5, 4):
         prev = os.path.join(src_dir(args, name, n), "mesh")
         meshes = sorted(glob.glob(os.path.join(prev, "*.ply")))
+        # scene* is the merge of the others, and leg_no_cut is the UNCUT limb
+        # published for review. Measuring either reports a volume nobody asked
+        # for -- in leg_no_cut's case, one for a cut nobody has confirmed.
         meshes = [p for p in meshes
-                  if not os.path.basename(p).startswith("scene")]
+                  if not os.path.basename(p).startswith("scene")
+                  and os.path.basename(p) != "leg_no_cut.ply"]
         if meshes:
             break
     if not meshes:
         sys.exit("ERROR: no meshes from stage 4/5 — run those first")
 
     d = stage_dir(name, 6)
-    # PARKED — the marker cross-check that used this was reverted with Stage 6.
-    # Stage 1's pointmap is what let Stage 6 measure the printed markers, the
-    # one length its scale is not calibrated on. Looked up separately from the
-    # meshes because --src redirects every earlier stage at once: re-running
-    # stage 6 alone on a run whose stage 1 lives elsewhere would otherwise pull
-    # that run's meshes in too. See the PARKED block in pipeline/stages/volume.py.
-    #
-    # inference = None
-    # for cand in (args.inference, name, args.src):
-    #     if not cand:
-    #         continue
-    #     cand_dir = stage_dir(cand, 1, create=False)
-    #     if os.path.exists(os.path.join(cand_dir, "predictions.npz")):
-    #         inference = cand_dir
-    #         break
-    df = compute_volumes(meshes, voxel_res=args.voxel_res, auto_res=args.auto_res)
+    df = compute_volumes(meshes, voxel_res=args.voxel_res,
+                         auto_res=args.auto_res,
+                         clean_dir=src_dir(args, name, 3))
     lines = [f"STAGE 6 — volume   (from {prev})", ""]
     if df is not None:
         df.to_csv(os.path.join(d, "volumes.csv"), index=False)
@@ -714,6 +776,7 @@ RUNNERS = {0: run_stage0, 1: run_stage1, 2: run_stage2, 3: run_stage3,
 
 
 def parse_stages(spec):
+    """Expands a stage spec into a list of stage numbers. Accepts '3' or a '2-6' range."""
     if "-" in spec:
         a, b = spec.split("-", 1)
         return list(range(int(a), int(b) + 1))
@@ -721,6 +784,7 @@ def parse_stages(spec):
 
 
 def main():
+    """Parses the stage spec and runs each requested stage in order."""
     p = argparse.ArgumentParser(description="Run pipeline stages individually")
     p.add_argument("stages", help="stage number or range, e.g. 1 or 1-3")
     p.add_argument("-i", "--image_folder", default="./inputs/small_leg/")
@@ -781,14 +845,18 @@ def main():
     p.add_argument("--no-fill", action="store_true")
     p.add_argument("--no-segment-leg", action="store_false", dest="segment_leg")
     p.add_argument("--segment-height-axis", default="z", choices=["x", "y", "z"])
-    p.add_argument("--cut-only", dest="cut_only", action="store_true",
-                   help="stage 3: skip straight to the cut, reusing the uncut "
-                        "result a previous --no-cut run left on disk. Needs "
-                        "--planes.")
+    p.add_argument("--cut-mode", dest="cut_mode", default=None,
+                   choices=["upper", "span", "auto"],
+                   help="stage 3: 'upper' measures everything below the highest "
+                        "valid band (one-band capture); 'span' measures the "
+                        "segment between the outermost two (upper and lower "
+                        "band); 'auto' follows the bands, cutting a span only "
+                        "when Stage 0's band count and Stage 3's plane count "
+                        "both say two. Default: config.MARKER_CUT_MODE (auto).")
     p.add_argument("--no-cut", dest="no_cut", action="store_true",
-                   help="stage 3: detect the cutting planes and publish them, "
-                        "but do not cut. The uncut cloud is measured instead, "
-                        "so a review can approve the cut before it is applied.")
+                   help="defer the cut: Stage 3 publishes the detected planes "
+                        "and Stage 5 leaves the limb uncut, so a review can "
+                        "approve where it falls before anything is measured.")
     p.add_argument("--planes", default=None,
                    help="JSON of cutting planes in levelled space to use instead "
                         "of the detected ones (stage 3) — the shape stage 3 "

@@ -4,16 +4,24 @@ Measure an object's real-world volume from a handful of phone photos, using an
 ArUco-marked cube of known size as the scale reference.
 
 Seven stages: **framing gate → VGGT inference → point cloud → segment & detect →
-surface reconstruction → watertight check → real-world volume**, with the marker
-cut applied once a person has confirmed where it falls. Stages 0 and 1 run neural
-networks; the rest is geometry. A cold run is ~80 s on an RTX 4060.
+surface reconstruction → watertight check & cut → real-world volume**. Stages 0
+and 1 run neural networks; the rest is geometry. A cold run is ~80 s on an
+RTX 4060.
 
 Two stages stop for a decision. **Stage 0** refuses a capture it cannot frame — a
 photo that clips the reference cube corrupts the scale of every number the run
 reports, with no visible sign. **Stage 3** detects the cutting plane but does not
 apply it, so no volume is ever produced from a cut nobody approved.
 
-**It reads 1.7% against water displacement** on four limb captures — see
+**The cut is applied in Stage 5, to the watertight mesh** — not to the point
+cloud. Placing a cut on a solid surface is far easier than placing it on a
+scatter of points, which is what the person confirming it actually has to do.
+Stage 5 publishes both `leg_no_cut.ply`, the solid the cut is placed on, and
+`leg_cut.ply`, the result; Stage 6 measures only the second. Because the cut is
+a plane slice through geometry that already exists, re-cutting re-runs stages
+5-6 alone and costs a few seconds rather than a second reconstruction.
+
+**It reads 3.3% against water displacement** on four limb captures — see
 [Accuracy](#accuracy--measured-2026-08-27). Two of the five have residuals under
 2%, one is unresolved at +19.4%, and a sixth capture is excluded because its
 reconstruction failed.
@@ -193,6 +201,7 @@ so you can see what VGGT actually produced rather than infer it.
 | `--recon-method` | `poisson` | also `alpha_shape`, `poisson_omp1`, `box_primitive`. **Does not affect the reference cube** — use `--box-recon-method` for that |
 | `--box-recon-method` / `--obj-recon-method` | — | per-object override |
 | `--no-segment-leg` | off | **required** for objects with no marker band |
+| `--cut-mode` | `auto` | what the bands bound. `upper` measures everything **below** the highest band (one-band capture); `span` measures the segment **between** an upper and a lower band; `auto` cuts a span when two marker planes survive Stage 3's gates. **Pass it explicitly when the run has to match a ground truth measured a particular way** — the table above was measured foot-to-upper-band |
 | `--no-fill` | off | skip bottom cap and floor extend |
 | `--no-watertight` | off | publish the Stage 4 recon as the final meshes |
 | `--voxel-res` | 150 | voxel cross-check resolution |
@@ -207,8 +216,8 @@ the measurement that set it.
 ## Viewing
 
 ```bash
-python viewer.py output/leg_mesh.ply
-python viewer.py output/scene_mesh.ply --info
+python pipeline/tools/viewer.py output/leg_mesh.ply
+python pipeline/tools/viewer.py output/scene_mesh.ply --info
 ```
 
 ---
@@ -240,18 +249,66 @@ python viewer.py output/scene_mesh.ply --info
 
 ## Accuracy — measured, 2026-08-27
 
-**The pipeline reads 1.7% mean absolute error against water displacement**, on
-four limb captures with a 10 cm 3D-printed reference. This is the project's
-first accuracy figure; everything before it was the system checking itself.
+**The pipeline reads 3.3% mean absolute error against water displacement**, on
+four limb captures with a 10 cm 3D-printed reference.
 
-| capture | measured | displacement | error |
-|---|---|---|---|
-| `orange shirt` | 4094 cm³ | 4090 | **+0.1%** |
-| `keng` | 2249 cm³ | 2210 | **+1.8%** |
-| `black shirt` | 3648 cm³ | 3510 | **+3.9%** |
-| `sunshine` | 3093 cm³ | 3130 | **−1.2%** |
-| `champ` | 3354 cm³ | 2810 | **+19.4%** — unresolved, below |
-| `blue shirt` | — | 3420 | capture unusable, `inputs/blue shirt/UNUSABLE.md` |
+**Three pipelines, measured on the same captures.** `old pipeline` is the tree
+at `bab2bbc`, before Stage 0 framing existed. `Stage 3 cut` cut the point cloud
+and reconstructed what survived. `Stage 5 cut` is current: it reconstructs the
+whole limb and cuts the watertight solid. All three were run against the same
+photographs, with `--cut-mode upper` where that flag exists:
+
+| capture | displacement | old pipeline | error | Stage 3 cut | error | Stage 5 cut | error |
+|---|---|---|---|---|---|---|---|
+| `orange shirt` | 4090 cm³ | 5395 cm³ | +31.9% | 4094 cm³ | +0.1% | 4098 cm³ | **+0.2%** |
+| `keng` | 2210 cm³ | 2490 cm³ | +12.7% | 2249 cm³ | +1.8% | 2287 cm³ | **+3.5%** |
+| `black shirt` | 3510 cm³ | 3119 cm³ | −11.1% | 3648 cm³ | +3.9% | 3656 cm³ | **+4.2%** |
+| `sunshine` | 3130 cm³ | 4161 cm³ | +32.9% | 3093 cm³ | −1.2% | 3298 cm³ | **+5.4%** |
+| `champ` | 2810 cm³ | 2432 cm³ | −13.5% | 3354 cm³ | +19.4% | 3371 cm³ | **+20.0%** — unresolved, below |
+| `blue shirt` | 3420 cm³ | — | — | — | — | — | capture unusable |
+| **mean abs. error** | | | **22.17%** | | **1.75%** | | **3.29%** |
+
+Mean excludes `champ`, unresolved under all three (n = 4).
+
+**The old column is not one variable apart from the others.** That tree had no
+Stage 0 framing gate, so VGGT centre-cropped the raw photographs itself; it
+predates the marker-detection rewrite, the ghost chain and the levelling gates.
+It also could not close most of its meshes: four of the five fell back to
+`warp+floodfill`, which leaks through an open surface, and its errors run in
+both directions — +32.9% on `sunshine`, −11.1% on `black shirt` — which is what
+an unreliable volume *method* looks like rather than a geometric bias. Both
+current pipelines report `watertight` on every capture, so their errors are
+comparable to each other in a way the old column's are not.
+
+**Stage 3 against Stage 5 is the clean comparison**, since only the cut moved.
+It costs 1.75% → 3.29%, and every mesh-cut figure is higher than its cloud-cut
+counterpart — none reads low. The reason is that Stage 4 must now reconstruct
+the whole limb including the region above the cut, which is the far end of the
+capture and its worst-reconstructed part; the old order discarded that region
+before Stage 4 ever saw it. The trade was made deliberately: a clinician places
+the cut, and placing it on a solid surface is far easier than on a scatter of
+points.
+
+**This is worse than the 1.7% the cloud cut read, and the reason is understood.**
+Until 2026-08-31 Stage 3 cut the point cloud and Stage 4 reconstructed only what
+survived the cut. The cut now happens in Stage 5, on the mesh, so Stage 4 has to
+reconstruct the *whole* limb — including the region above the cut, which is the
+far end of the capture and the worst-reconstructed part of it. Where that
+reconstruction fails, Stage 4 falls back to an alpha shape that has to open to
+40x point spacing before it seals, and a wrap that loose reads high. Every mesh
+-cut figure above is higher than its cloud-cut counterpart; none reads low.
+
+The trade was made deliberately: a clinician places the cut, and placing it on a
+solid surface is far easier than on a scatter of points. `sunshine` carries most
+of the cost. Closing the limb's upper end before reconstruction recovered about
+a third of it (5.4% from 10.1%); the rest needs the uncut reconstruction itself
+to improve.
+
+**These numbers were measured foot-to-upper-band, so reproducing them now needs
+`--cut-mode upper`.** The default became `auto` on 2026-08-29, and auto cuts a
+span wherever two marker planes survive Stage 3's gates — which `champ` does, so
+under the default it now reports the segment between its two bands (~2377 cm³)
+rather than the 3354 cm³ above. That is a different quantity, not a correction.
 
 Verified on a full cold run — Stage 0's detectors, a fresh VGGT pass, every
 stage after it — which reproduces the cached-stage-1 numbers to seven
@@ -262,10 +319,10 @@ seed, which is what makes an error bar worth quoting.
 
 - **n = 4, one subject class, one floor, one cord colour.** This is
   repeatability, not generality.
-- **±1.7% sits on the ~1–2% surface-noise floor** measured independently as
-  local shell thickness. The two agreeing is corroboration, not coincidence,
-  but it also means the pipeline cannot currently resolve better than its own
-  noise.
+- **The ~1–2% surface-noise floor**, measured independently as local shell
+  thickness, is below the current 3.3%. The cloud cut used to sit on that
+  floor at 1.7%; the mesh cut does not, so the gap is reconstruction error
+  rather than the noise limit, and it is addressable.
 - **`REFERENCE_REAL_SIZE_CM = 10.0` is a design dimension, not a caliper
   reading.** Printed parts shrink 0.3–0.8%; at 10 cm a 2 mm error is 2.0%
   linear and **6.1% of volume**, which would dominate the residual above.
@@ -290,8 +347,6 @@ seed, which is what makes an error bar worth quoting.
 ```
 run.py            full pipeline, stages 0-6
 stagerun.py       per-stage runner with caching and metrics
-viewer.py         PLY/STL viewer
-volume.py         standalone volume CLI
 serve.sh          starts the web app and the compute service together
 
 pipeline/
@@ -300,17 +355,18 @@ pipeline/
   config.py         every tunable constant, with its justification
   ghost.py          the whole ghost chain: voxel dedup, normal-aware
                     filter, and MLS surface projection
-  multiview.py      multi-view consistency (written, not wired into Stage 2)
-  core/             cluster, faces, fill, filters, markers3d, mesh, plane,
-                    segmentation, vlm_detect
+  core/             bands3d, cluster, crosssection, fill, filters, mesh,
+                    plane, segmentation, vlm_detect
   stages/           prep, inference, pointcloud, clean, reconstruct,
                     watertight, volume
+  workers/          recons_methods_worker, meshfix_worker — the two
+                    subprocess workers Stages 4 and 5 spawn
+  tools/            viewer (PLY/STL), volume (standalone volume CLI),
+                    com_vol, cut_circumference
   utils/            seeding, runlog
 
-workers/          recons_methods_worker.py, meshfix_worker.py
 service/          HTTP front end: upload, run, serve artifacts
 web/              viewer and review UI (Next.js)
-tools/            com_vol.py
 inputs/           sample image sets
 work/             stagerun and web-job outputs (gitignored)
 ```

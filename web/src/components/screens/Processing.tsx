@@ -42,6 +42,7 @@ export function Processing({
     if (!jobId) return;
     let live = true;
 
+    // Polls the job while stages run, advancing the progress display until it finishes or fails.
     const tick = async () => {
       try {
         const j = await getJob(jobId);

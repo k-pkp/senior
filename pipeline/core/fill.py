@@ -108,6 +108,7 @@ def _footprint_polygon(xy, alpha, label=""):
     pad = 0.02 * span.max()
 
     def usable(poly):
+        """Returns True if the polygon is a finite, non-empty Polygon inside the padded bounds."""
         if poly is None or poly.is_empty or poly.geom_type != "Polygon":
             return False
         b = np.asarray(poly.bounds, dtype=np.float64)

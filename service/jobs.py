@@ -52,6 +52,7 @@ LOG_TAIL = 40
 
 @dataclass
 class Job:
+    """One measurement job: its state, the stage it reached, and its recent log lines."""
     id: str
     state: str = "queued"
     stage: int = 0
@@ -66,15 +67,18 @@ class Job:
 
     @property
     def dir(self) -> str:
+        """The job's working directory under work/."""
         return os.path.join(WORK, self.id)
 
     def touch(self, **kw):
+        """Applies the given field updates, stamps the update time, and saves to disk."""
         for k, v in kw.items():
             setattr(self, k, v)
         self.updated = time.time()
         self.save()
 
     def save(self):
+        """Writes job.json atomically, via a temp file and os.replace."""
         os.makedirs(self.dir, exist_ok=True)
         tmp = os.path.join(self.dir, "job.json.tmp")
         with open(tmp, "w") as f:
@@ -102,6 +106,7 @@ class Registry:
     """
 
     def __init__(self):
+        """Loads jobs mirrored on disk and starts the single background worker thread."""
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue()
@@ -112,6 +117,7 @@ class Registry:
     # ── lookup ──
 
     def get(self, job_id: str) -> Job | None:
+        """Returns the job, reading job.json from disk if it is not in memory after a restart."""
         with self._lock:
             job = self._jobs.get(job_id)
         if job is not None:
@@ -132,11 +138,17 @@ class Registry:
         return job
 
     def put(self, job: Job):
+        """Registers a job in memory and writes it to disk."""
         with self._lock:
             self._jobs[job.id] = job
         job.save()
 
     def _restore(self):
+        """Reloads jobs from disk at startup, marking anything mid-flight as failed.
+
+        A job that was running when the service stopped cannot be resumed: its
+        subprocess is gone and its stage directories are half-written.
+        """
         if not os.path.isdir(WORK):
             return
         for name in os.listdir(WORK):
@@ -160,13 +172,19 @@ class Registry:
 
     def submit(self, job: Job, stages: str, extra: list[str],
                running_state: str, done_state: str):
+        """Queues a job to run the given stage range, and resets its state and log."""
         job.touch(state="queued", error=None, log=[])
         self._queue.put((job.id, stages, extra, running_state, done_state))
 
     def depth(self) -> int:
+        """Returns how many jobs are waiting in the queue."""
         return self._queue.qsize()
 
     def _run_forever(self):
+        """The worker loop: takes jobs off the queue one at a time, forever.
+
+        A crash inside one job marks that job failed rather than killing the worker.
+        """
         while True:
             item = self._queue.get()
             try:
@@ -179,6 +197,11 @@ class Registry:
                 self._queue.task_done()
 
     def _run_one(self, job_id, stages, extra, running_state, done_state):
+        """Runs each stage of one job in order, stopping at the first non-zero exit.
+
+        After the last stage it checks the postcondition, so a stage that exits
+        zero without producing its output still fails the job.
+        """
         job = self.get(job_id)
         if job is None:
             return
@@ -216,10 +239,17 @@ def _postcondition(job: Job, extra: list[str], done_state: str) -> str | None:
     if "--no-cut" not in extra:
         return None
 
-    leaked = os.path.join(job.dir, "03_clean", "objects", "leg_cut.ply")
-    if os.path.exists(leaked):
-        return ("deferred-cut violation: leg_cut.ply exists after a --no-cut "
-                "pass, so the subject was measured before the cut was confirmed")
+    # The cut now happens in Stage 5, on the repaired solid, so the thing that
+    # must not exist after a deferred pass is a cut MESH. Stage 3 publishes only
+    # leg.ply and box.ply and has no way to cut anything, which is why there is
+    # no longer a check against its objects directory.
+    for stage_dir_name in ("04_recon", "05_watertight"):
+        for mesh_name in ("leg_cut.ply", "leg_cut_recon.ply"):
+            cut_mesh = os.path.join(job.dir, stage_dir_name, "mesh", mesh_name)
+            if os.path.exists(cut_mesh):
+                return (f"deferred-cut violation: {stage_dir_name}/mesh/{mesh_name} "
+                        f"exists after a --no-cut pass, so a cut was applied "
+                        f"before it was confirmed")
 
     csv_path = os.path.join(job.dir, "06_volume", "volumes.csv")
     if os.path.exists(csv_path):
@@ -235,6 +265,7 @@ def _postcondition(job: Job, extra: list[str], done_state: str) -> str | None:
 
 
 def _expand(spec: str) -> list[int]:
+    """Expands a stage spec into a list of stage numbers. Accepts '3' or a '2-6' range."""
     if "-" in spec:
         a, b = spec.split("-", 1)
         return list(range(int(a), int(b) + 1))

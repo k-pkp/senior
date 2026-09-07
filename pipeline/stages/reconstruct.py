@@ -11,7 +11,8 @@ from pipeline.core.mesh import merge_meshes, clean_merged_scene
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
-_RECONS_WORKER = os.path.join(_PROJECT_ROOT, "workers", "recons_methods_worker.py")
+_RECONS_WORKER = os.path.join(_PROJECT_ROOT, "pipeline", "workers",
+                              "recons_methods_worker.py")
 # Poisson for both objects, chosen 2026-08-23 after Stage 5 was fixed to call
 # PyMeshFix's `repair()` rather than `fill_holes()` alone.
 #
@@ -76,7 +77,7 @@ def _survives_repair(recon_ply):
     """
     try:
         import trimesh
-        from workers.meshfix_worker import _pymeshfix_repair, _o3d_fill_holes
+        from pipeline.workers.meshfix_worker import _pymeshfix_repair, _o3d_fill_holes
 
         mesh = o3d.io.read_triangle_mesh(recon_ply)
         verts = np.asarray(mesh.vertices)

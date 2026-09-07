@@ -17,6 +17,7 @@ const MeshView = dynamic(
 
 type View = "object" | "scene";
 
+// Final screen: the measured volume, the mesh, and the run's numbers.
 export function Result({
   dataset,
   onBack,

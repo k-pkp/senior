@@ -40,6 +40,7 @@ FINAL_NAMES = {"leg_cut": "leg_mesh", "obj": "leg_mesh",
 
 
 def _print_banner(args, device):
+    """Prints the run's configuration banner before any stage starts."""
     print(f"╔{'═' * 58}╗")
     print(f"║  VGGT Full Pipeline                                      ║")
     print(f"╠{'═' * 58}╣")
@@ -57,6 +58,12 @@ def _print_banner(args, device):
     print(f"║  Watertight    : {str(not args.no_watertight):<40}║")
     print(f"║  Seed          : {args.seed:<40}║")
     print(f"║  Leg segment   : {str(args.segment_leg):<40}║")
+    from pipeline.stages.clean import resolve_cut_mode
+    cut_label = {"upper": "upper (below top band)",
+                 "span": "span (between bands)",
+                 "auto": "auto (follows the bands found)"}[
+        resolve_cut_mode(getattr(args, "cut_mode", None))]
+    print(f"║  Cut mode      : {cut_label:<40}║")
     print(f"╚{'═' * 58}╝")
 
 
@@ -111,6 +118,7 @@ def _copy_images_to_target(image_folder, target_images_dir):
 def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
                    recon_mesh_paths, scene_wt_path, wt_mesh_paths,
                    npz_path2, target_dir, target_images_dir):
+    """Prints the closing summary: timings, every output path, and viewer commands."""
     print()
     print(f"╔{'═' * 58}╗")
     print(f"║  Pipeline Complete                                       ║")
@@ -135,15 +143,15 @@ def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
     print(f"╚{'═' * 58}╝")
     print()
     print("To view results interactively:")
-    print(f"  python viewer.py {ply_path}")
+    print(f"  python pipeline/tools/viewer.py {ply_path}")
     if scene_recon_path:
-        print(f"  python viewer.py {scene_recon_path}  # recon scene")
+        print(f"  python pipeline/tools/viewer.py {scene_recon_path}  # recon scene")
     for p in recon_mesh_paths:
-        print(f"  python viewer.py {p}")
+        print(f"  python pipeline/tools/viewer.py {p}")
     if scene_wt_path:
-        print(f"  python viewer.py {scene_wt_path}  # watertight scene")
+        print(f"  python pipeline/tools/viewer.py {scene_wt_path}  # watertight scene")
     for p in wt_mesh_paths:
-        print(f"  python viewer.py {p}")
+        print(f"  python pipeline/tools/viewer.py {p}")
     print()
     print("To use with demo_gradio.py:")
     print(f"  The predictions are saved at: {target_dir}/predictions.npz")
@@ -151,6 +159,7 @@ def _print_summary(total_time, inference_time, ply_path, scene_recon_path,
 
 
 def main():
+    """Runs Stages 0-6 end to end, then publishes the final meshes and writes the run log."""
     args = parse_args()
     device = get_device()
     total_t0 = time.time()
@@ -196,6 +205,8 @@ def main():
         # to re-take.
         inference_input = args.image_folder
         marker_colour = None
+        n_bands = None
+        manifest = None
         if getattr(args, "prep", True):
             from pipeline.stages.prep import prepare_frames
             prep_images = os.path.join(stage_dirs[0], "images")
@@ -216,6 +227,10 @@ def main():
             # Stage 3 uses the colour Stage 0 measured, so a marker of any
             # colour works without editing the config's khaki defaults.
             marker_colour = manifest.get("marker_colour")
+            # How many bands Stage 0 counted, for --cut-mode auto. Absent on a
+            # manifest written before multi-band detection, and None there means
+            # "unknown", not "none" — see clean.resolve_cut_mode.
+            n_bands = manifest.get("bands")
 
         # Record what VGGT was actually shown. This used to copy the submitted
         # folder, which stopped being the same thing once Stage 0 could rewrite
@@ -240,6 +255,17 @@ def main():
         ply_path = export_ply(predictions, stage_dirs[2], args)
         print(f"[DBG-stage] stage2 export_ply: {time.time() - _dbg_t:.2f}s")
 
+        # Planes projected from Stage 0's band boxes through Stage 1's own
+        # pointmap. A second source for the cut, independent of colour, merged
+        # with the colour planes inside Stage 3 — see core/bands3d.py.
+        band_planes = []
+        if getattr(args, "prep", True) and manifest is not None:
+            from pipeline.core.bands3d import band_planes_from_arrays
+            band_planes = band_planes_from_arrays(
+                manifest, predictions["world_points"],
+                predictions["world_points_conf"],
+                height_axis=args.segment_height_axis)
+
         # ── Stages 3-5: Clean + Reconstruct + Watertight ──
         scene_recon_path = None
         recon_mesh_paths = []
@@ -253,7 +279,10 @@ def main():
                 segment_leg=args.segment_leg,
                 segment_height_axis=args.segment_height_axis,
                 fill_enabled=not args.no_fill,
-                marker_colour=marker_colour)
+                marker_colour=marker_colour,
+                cut_mode=getattr(args, "cut_mode", None),
+                n_bands=n_bands,
+                band_planes=band_planes)
             print(f"[DBG-stage] stage3 clean_and_extract: {time.time() - _dbg_t:.2f}s")
             if object_paths:
                 _dbg_t = time.time()
@@ -266,8 +295,22 @@ def main():
 
                 if recon_mesh_paths and not args.no_watertight:
                     _dbg_t = time.time()
+                    # Stage 3 detects the planes and publishes them; Stage 5 is
+                    # where they are actually applied, to the repaired solid.
+                    detected_planes_path = os.path.join(
+                        stage_dirs[3], "debug", "cutting_line_levelled.json")
+                    # An empty list means there was nothing to cut, so the whole
+                    # object is measured. run.py never defers, so this is never
+                    # None here.
+                    cut_planes = []
+                    if os.path.exists(detected_planes_path):
+                        import json as _json
+                        with open(detected_planes_path) as planes_file:
+                            cut_planes = _json.load(planes_file).get("markers", [])
                     scene_wt_path, wt_mesh_paths = watertight_stage(
-                        recon_mesh_paths, stage_dirs[5])
+                        recon_mesh_paths, stage_dirs[5],
+                        cut_planes=cut_planes,
+                        height_axis=args.segment_height_axis)
                     print(f"[DBG-stage] stage5 watertight: {time.time() - _dbg_t:.2f}s")
         else:
             print("\n  (Skipping mesh stages — --skip_mesh was set)")
@@ -276,12 +319,10 @@ def main():
         vol_objects = wt_mesh_paths or recon_mesh_paths
         if vol_objects:
             _dbg_t = time.time()
-            # PARKED — inference_dir=stage_dirs[1] fed Stage 6's marker
-            # cross-check, reverted with Stage 6. See the PARKED block in
-            # pipeline/stages/volume.py.
             vol_df = compute_volumes(vol_objects,
                                      voxel_res=args.voxel_res,
-                                     auto_res=args.auto_res)
+                                     auto_res=args.auto_res,
+                                     clean_dir=stage_dirs[3])
             print(f"[DBG-stage] stage6 volumes: {time.time() - _dbg_t:.2f}s")
             if vol_df is not None:
                 vol_df.to_csv(os.path.join(stage_dirs[6], "volumes.csv"), index=False)

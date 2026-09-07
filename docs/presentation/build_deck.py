@@ -57,6 +57,7 @@ def textbox(slide, x, y, w, h, blocks, align=PP_ALIGN.LEFT):
 
 
 def heading(slide, eyebrow, title):
+    """Adds a title block to the slide, with an optional smaller eyebrow line above it."""
     blocks = []
     if eyebrow:
         blocks.append((eyebrow, 18, True, MUTED, 0))
@@ -65,6 +66,7 @@ def heading(slide, eyebrow, title):
 
 
 def bullets(slide, lines, x=MARGIN, y=BODY_Y, w=COLUMN_W, size=19):
+    """Adds a bulleted text box. Each line is either a string or a (text, colour) pair."""
     blocks = []
     for index, line in enumerate(lines):
         text, colour = line if isinstance(line, tuple) else (line, INK)
@@ -93,11 +95,13 @@ def fit(path, x, y, w, h):
 
 
 def picture(slide, path, x, y, w, h):
+    """Adds a picture scaled to fit inside the given box while keeping its aspect ratio."""
     px, py, pw, ph = fit(path, x, y, w, h)
     return slide.shapes.add_picture(path, Emu(px), Emu(py), Emu(pw), Emu(ph))
 
 
 def table(slide, rows, x, y, w, col_widths=None, size=16, header=True):
+    """Adds a table sized to its row count, optionally styling the first row as a header."""
     row_h = int(size * 12700 * 2.6)
     shape = slide.shapes.add_table(len(rows), len(rows[0]),
                                    Emu(x), Emu(y), Emu(w),
@@ -134,6 +138,7 @@ blank = presentation.slide_layouts[6] if len(presentation.slide_layouts) > 6 \
 
 
 def find(slide, name):
+    """Returns the shape on the slide with this name, or None if there is no such shape."""
     for shape in slide.shapes:
         if shape.name == name:
             return shape

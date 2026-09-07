@@ -8,6 +8,7 @@ export const panel: CSSProperties = {
   borderRadius: "var(--radius)",
 };
 
+// Bordered content panel with configurable padding.
 export function Panel({
   children,
   style,
@@ -20,6 +21,7 @@ export function Panel({
   return <div style={{ ...panel, padding: pad, ...style }}>{children}</div>;
 }
 
+// Button in one of the shared visual variants.
 export function Button({
   children,
   onClick,
@@ -72,6 +74,7 @@ export function Button({
   );
 }
 
+// Small muted caption above a value.
 export function Label({ children }: { children: ReactNode }) {
   return (
     <div
@@ -87,6 +90,7 @@ export function Label({ children }: { children: ReactNode }) {
   );
 }
 
+// Labelled numeric readout with an optional unit.
 export function Stat({
   label,
   value,
@@ -159,6 +163,7 @@ export function Caveat({ children }: { children: ReactNode }) {
   );
 }
 
+// Labelled range slider reporting its value as it moves.
 export function Slider({
   label,
   value,

@@ -12,6 +12,7 @@ const DETAIL: Record<number, string> = {
   6: "A closed mesh has an exact volume: sum the signed tetrahedron volumes over its triangles, no voxel approximation. Real-world size comes from the reference cube — the ratio of its true 2744 cm³ to its measured mesh volume. If a mesh is not closed the stage falls back to flooding a voxel grid, which over-reads and can leak.",
 };
 
+// Static help screen explaining how to photograph an object.
 export function How() {
   return (
     <div className="fadein" style={{ display: "grid", gap: 16, maxWidth: 760 }}>

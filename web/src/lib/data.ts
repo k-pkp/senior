@@ -41,24 +41,23 @@ export const SAMPLES: SampleDataset[] = [
  * The pipeline runs in two passes with the user in between, so the same stage
  * numbers mean different things either side of the review. Naming them by what
  * they produce in THAT pass is the only honest labelling: on the first pass
- * stages 4-6 measure the reference cube and nothing else, because the object's
- * extent is not known until the cut is confirmed. */
+ * stages 4-6 build the limb's solid and measure the reference cube, but do not
+ * measure the limb: its extent is not known until the cut is confirmed. */
 export const MEASURE_STAGES = [
   { n: 1, label: "VGGT inference", out: "predictions.npz", seconds: 50 },
   { n: 2, label: "Point cloud export", out: "points.ply", seconds: 2 },
-  { n: 3, label: "Segment & find the cut", out: "leg_no_cut.ply", seconds: 8 },
-  { n: 4, label: "Reconstruct the reference cube", out: "box_recon.ply", seconds: 6 },
-  { n: 5, label: "Watertight check", out: "box.ply", seconds: 1 },
+  { n: 3, label: "Segment & find the cut", out: "leg.ply", seconds: 8 },
+  { n: 4, label: "Surface reconstruction", out: "leg_recon.ply", seconds: 8 },
+  { n: 5, label: "Watertight solid, left uncut", out: "leg_no_cut.ply", seconds: 2 },
   { n: 6, label: "Measure the reference", out: "volumes.csv", seconds: 2 },
 ] as const;
 
-/** The second pass: the cut the user confirmed, then the object itself. Stages
- *  1 and 2 do not appear — their output is already on disk and is not touched
- *  by where the cut goes. */
+/** The second pass: the cut the user confirmed, then the object itself. Only
+ *  stages 5 and 6 appear. The cut is a plane slice through the watertight solid
+ *  Stage 5 already built, so neither the segmentation nor the surface
+ *  reconstruction is repeated — an edit costs seconds. */
 export const CUT_STAGES = [
-  { n: 3, label: "Apply the confirmed cut", out: "leg_cut.ply", seconds: 1 },
-  { n: 4, label: "Surface reconstruction", out: "leg_cut_recon.ply", seconds: 6 },
-  { n: 5, label: "Watertight check", out: "leg_cut.ply", seconds: 1 },
+  { n: 5, label: "Apply the confirmed cut", out: "leg_cut.ply", seconds: 3 },
   { n: 6, label: "Volume by surface integration", out: "volumes.csv", seconds: 2 },
 ] as const;
 
@@ -72,8 +71,11 @@ export function parseVolumesCsv(text: string): VolumeRow[] {
     .filter((l) => l.trim())
     .map((line) => {
       const cells = line.split(",");
+      // True when the CSV carries this column.
       const has = (k: string) => cols.indexOf(k) >= 0;
+      // Raw cell text for this column on the current row.
       const get = (k: string) => cells[cols.indexOf(k)];
+      // Cell parsed as a number, falling back to 0 when it is not finite.
       const num = (k: string) => {
         const v = parseFloat(get(k));
         return Number.isFinite(v) ? v : 0;
@@ -106,6 +108,7 @@ export function parseVolumesCsv(text: string): VolumeRow[] {
     });
 }
 
+// Fetches and parses a run's volumes.csv.
 export async function loadVolumes(url: string): Promise<VolumeRow[]> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`volumes.csv ${res.status}`);
@@ -148,26 +151,39 @@ export function linearScale(rows: VolumeRow[]): number | null {
 }
 
 let planeSeq = 0;
+// Returns a fresh unique id for a newly added plane.
 export function newPlaneId() {
   return `p${++planeSeq}`;
 }
 
+// Fetches the detected cutting planes, returning an empty list when there are none yet.
 export async function loadCutPlanes(url: string): Promise<CutPlane[]> {
   try {
     const res = await fetch(url);
     if (!res.ok) return [];
     const json = await res.json();
-    return (json.markers ?? []).map((m: any) => ({
-      id: newPlaneId(),
-      centroid: m.centroid as [number, number, number],
-      normal: m.normal as [number, number, number],
-      npts: m.npts ?? 0,
-      source: "detected" as const,
-      origin: {
+    // "candidates" is every band detection validated; "markers" is the subset
+    // the run happened to cut on, which --cut-mode upper trims to one even on a
+    // two-band capture. The reviewer is choosing what to cut, so they get the
+    // full set. Older files carry only "markers" — fall back to it.
+    const raw = json.candidates?.length ? json.candidates : (json.markers ?? []);
+    // Lowest first, so a caller picking "the outermost two" can take the ends.
+    // The pipeline already writes candidates in this order; sorting here means
+    // an older file, or a hand-edited one, cannot quietly break that.
+    return raw
+      .slice()
+      .sort((a: any, b: any) => a.centroid[2] - b.centroid[2])
+      .map((m: any) => ({
+        id: newPlaneId(),
         centroid: m.centroid as [number, number, number],
         normal: m.normal as [number, number, number],
-      },
-    }));
+        npts: m.npts ?? 0,
+        source: "detected" as const,
+        origin: {
+          centroid: m.centroid as [number, number, number],
+          normal: m.normal as [number, number, number],
+        },
+      }));
   } catch {
     return [];
   }

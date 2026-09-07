@@ -16,7 +16,7 @@ from pipeline.core.plane import (
 )
 from pipeline.core.cluster import detect_top_k_objects
 from pipeline.core.segmentation import (segment_point_cloud, apply_marker_cut,
-                                        MAX_MARKERS)
+                                        MAX_MARKERS, AXIS_MAP)
 from pipeline.config import (MARKER_MIN_HEIGHT_FRAC, MARKER_MIN_HEIGHT_CUBES,
                              MARKER_CUT_MODE,
                              MARKER_MAX_AXIS_ANGLE_DEG)
@@ -85,6 +85,115 @@ def _split_into_objects(dense_cloud, num_objects):
         object_cluster = None
         print("  Only 1 cluster on dense — treating as box")
     return box_cluster, object_cluster
+
+
+CUT_MODES = ("upper", "span", "auto")
+
+
+def resolve_cut_mode(cut_mode, n_bands=None, n_planes=None):
+    """Which cut this run makes: the caller's choice, else the config default.
+
+        "upper" — keep what is BELOW the highest valid plane
+        "span"  — keep what lies BETWEEN the outermost two valid planes
+        "auto"  — span when two marker planes survive Stage 3's gates,
+                  upper otherwise
+
+    None means "whatever config says", so an existing call site keeps behaving
+    as configured.
+
+    **What auto reads.** `n_planes` is how many marker planes Stage 3 fitted
+    and then gated — at least one reference-cube height above the floor and
+    within MARKER_MAX_AXIS_ANGLE_DEG of perpendicular to the limb's own axis.
+    Those gates are the measured discriminator (genuine bands 2.4-27 degrees
+    off the axis, false planes fitted to shorts and floor junctions 53-89), and
+    a plane is the only thing that can actually cut, so the plane count decides.
+
+    `n_bands` is Stage 0's count from the photographs, and it is a cross-check
+    rather than a vote. It is not used to veto a span, because it is measured to
+    UNDER-count: on inputs/sunshine2, a capture wearing an ankle cord and a
+    below-knee cord, GroundingDINO returns the upper cord on 1 frame of 8 and
+    below the corroboration bar, so requiring both sources to agree would make a
+    span unreachable on the one capture that needs it. When the two disagree the
+    run says so and keeps going — the disagreement is worth a reviewer's eye,
+    not a silent override.
+
+    The mode is still a claim about what was physically measured, and auto only
+    infers it from what the pipeline can see. A capture compared against a
+    ground truth taken foot-to-band must be run with an explicit --cut-mode
+    upper even when two planes survive.
+    """
+    mode = (MARKER_CUT_MODE if cut_mode is None else cut_mode).lower()
+    if mode not in CUT_MODES:
+        raise ValueError(f"cut_mode must be one of {CUT_MODES}, got {cut_mode!r}")
+    if mode != "auto":
+        return mode
+
+    if n_planes is None:
+        # Called before detection has run — the banner, a summary line. Report
+        # the configured intent rather than pretending to know the answer.
+        return "auto"
+    if n_planes < 2:
+        # A span needs two planes to cut between, whatever Stage 0 saw.
+        if n_bands is not None and n_bands >= 2:
+            print(f"  Cut mode auto → upper: Stage 0 counted {n_bands} bands "
+                  f"but only {n_planes} plane(s) survived Stage 3's gates, and "
+                  f"a span has to be bounded by two")
+        return "upper"
+    if n_bands is not None and n_bands < 2:
+        print(f"  Cut mode auto → span: {n_planes} gated planes. Stage 0 "
+              f"counted {n_bands} band(s) in the photographs — worth a look at "
+              f"the review, since the two disagree")
+    else:
+        print(f"  Cut mode auto → span: {n_planes} gated planes"
+              + (f", and Stage 0 counted {n_bands} bands"
+                 if n_bands is not None else ""))
+    return "span"
+
+
+# How close two planes' centroids may sit, along the height axis, before they
+# are taken to be the same band seen twice. In VGGT world units, where a 10 cm
+# reference cube is about 0.13 across, so 0.02 is roughly 1.5 cm -- wider than
+# the disagreement between a colour fit and a projected fit on one cord, far
+# narrower than the gap between two cords bounding a measured segment.
+SAME_BAND_DISTANCE = 0.02
+
+
+def _merge_projected_planes(colour_planes, band_planes, height_axis):
+    """Add planes projected from Stage 0's boxes that colour detection missed.
+
+    Additive by construction: a colour plane is never dropped or moved, so a
+    capture cannot end up with fewer planes, or different ones, than it has
+    today. What it can gain is a band the colour rule could not see -- which is
+    the common failure, since the rule needs the cord and the limb to be
+    chromatically separable and refuses outright below MARKER_MIN_AXIS.
+
+    Where both sources found the same band, the colour plane wins. It is fitted
+    to the cord's own points; the projected one is fitted to a slab of limb
+    surface centred on the cord, which is the right plane but a blunter
+    instrument for locating it.
+    """
+    if not band_planes:
+        return colour_planes
+
+    axis_idx = AXIS_MAP[height_axis.lower()]
+    merged = list(colour_planes)
+    for candidate in band_planes:
+        height = float(candidate["centroid"][axis_idx])
+        twin = next((m for m in colour_planes
+                     if abs(float(m["centroid"][axis_idx]) - height)
+                     < SAME_BAND_DISTANCE), None)
+        if twin is not None:
+            print(f"  Band projection: {candidate['npts']:,}-pt plane agrees "
+                  f"with a {twin['npts']}-pt colour plane — keeping the colour "
+                  f"fit")
+            continue
+        merged.append({"centroid": np.asarray(candidate["centroid"], dtype=np.float64),
+                       "normal": np.asarray(candidate["normal"], dtype=np.float64),
+                       "npts": int(candidate["npts"]),
+                       "source": "projected"})
+        print(f"  Band projection: adding a plane colour detection missed "
+              f"({candidate['npts']:,} pts, {candidate['frames']} frames)")
+    return merged
 
 
 def _detect_marker_planes(object_cluster, height_axis, marker_colour):
@@ -357,7 +466,8 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
                         marker_colour=None,
                             segment_leg=False, segment_height_axis="z",
                             fill_enabled=True, apply_cut=True,
-                            override_planes=None):
+                            override_planes=None, cut_mode=None, n_bands=None,
+                            band_planes=None):
     """Cluster-first clean pipeline.
 
     Phase A: Segment the dense cloud once (floor removal + DBSCAN), detect
@@ -407,6 +517,7 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     markers = []
     if segment_leg:
         markers = _detect_marker_planes(obj_dense, segment_height_axis, marker_colour)
+        markers = _merge_projected_planes(markers, band_planes, segment_height_axis)
 
     _save_cluster_debug(debug_dir_out, obj_dense, box_dense, markers)
 
@@ -451,8 +562,9 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     # Rotate the marker planes into levelled space. This happens before any
     # cutting so the planes can be published for review whether or not the cut
     # is applied here.
-    leg_no_cut_path = os.path.join(objects_dir, "leg_no_cut.ply")
+    leg_path = os.path.join(objects_dir, "leg.ply")
     markers_rotated = []
+    candidates = []
     if len(markers) > 0:
         # Rotate EVERY candidate first, gate them, and only then cap the count.
         #
@@ -472,7 +584,8 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
             norm_r = (R_total @ norm).astype(np.float64)
             norm_r /= np.linalg.norm(norm_r) + 1e-8
             markers_rotated.append({"centroid": cen_r.tolist(), "normal": norm_r.tolist(),
-                                    "npts": m.get("npts", 0)})
+                                    "npts": m.get("npts", 0),
+                                    "source": m.get("source", "colour")})
 
         # Drop planes sitting in the bottom fraction of the object. Feet, arch
         # shadows and the floor junction all live there, and a cut line that low
@@ -504,7 +617,22 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
             if min_z is not None:
                 keep_m, drop_m = [], []
                 for mr in markers_rotated:
-                    (keep_m if mr["centroid"][2] >= min_z else drop_m).append(mr)
+                    # A plane projected from Stage 0's boxes is exempt. This
+                    # gate rejects UNCORROBORATED blobs near the floor — feet,
+                    # arch shadows, the floor junction — and a band the
+                    # detector saw on most of the photographs is precisely the
+                    # corroboration it was standing in for. It is also what
+                    # would throw the low band away: on the capture this was
+                    # built for, the real ankle cord sits at 0.66 cube heights
+                    # against a 1.0 floor.
+                    low = mr["centroid"][2] < min_z
+                    if low and mr.get("source") == "projected":
+                        h = (mr["centroid"][2] - lo) / span if span > 0 else 0.0
+                        print(f"  Marker kept at {h*100:.0f}% of height despite "
+                              f"{rule} — projected from Stage 0's band boxes, "
+                              f"which is the corroboration the gate wants")
+                        low = False
+                    (drop_m if low else keep_m).append(mr)
                 for mr in drop_m:
                     h = (mr["centroid"][2] - lo) / span if span > 0 else 0.0
                     print(f"  Marker rejected: {h*100:.0f}% of height, "
@@ -542,24 +670,59 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
         # the ruler measured the whole leg below the knee or only the segment
         # between the two, and guessing from the band count answers a different
         # question from the one the ground truth answers.
+        #
+        # `cut_mode` is the per-run answer to that question and defaults to
+        # MARKER_CUT_MODE, so one capture set can hold both a single-band
+        # subject and a two-band one without editing config between runs.
+        #
+        # Every survivor of the gates is kept as a CANDIDATE regardless of what
+        # the mode then selects, and published alongside the selection. The two
+        # answer different questions: "which planes did this run cut on" and
+        # "which bands does this capture actually have". The review screen needs
+        # the second — seeded from the selection alone, a two-band capture run
+        # in 'upper' mode showed the reviewer one plane, and re-adding the other
+        # by hand replaced a fitted marker plane with a guess at mid-height.
+        candidates = sorted(markers_rotated, key=lambda m: m["centroid"][2])
+
+        mode = resolve_cut_mode(cut_mode, n_bands=n_bands,
+                                n_planes=len(markers_rotated))
         if len(markers_rotated) > 1:
-            ordered = sorted(markers_rotated, key=lambda m: m["centroid"][2])
-            if MARKER_CUT_MODE == "upper":
+            ordered = candidates
+            if mode == "upper":
                 markers_rotated = [ordered[-1]]
                 dropped = ", ".join(f"{m['npts']} pts" for m in ordered[:-1])
-                print(f"  Markers: {len(ordered)} valid — cutting on the "
-                      f"UPPERMOST only (keep below); not cutting on {dropped}")
+                print(f"  Markers: {len(ordered)} valid — cut mode 'upper', "
+                      f"cutting on the UPPERMOST only (keep below); not "
+                      f"cutting on {dropped}")
             else:
                 markers_rotated = [ordered[0], ordered[-1]]
-                print(f"  Markers: {len(ordered)} valid — keeping the outermost "
-                      f"{MAX_MARKERS} (keep between)")
+                print(f"  Markers: {len(ordered)} valid — cut mode 'span', "
+                      f"keeping the outermost {MAX_MARKERS} (keep between)")
+        elif len(markers_rotated) == 1 and mode == "span":
+            # Saying so matters: 'span' names a segment bounded at both ends,
+            # and one plane cannot bound it. The run still measures something
+            # — everything below the single plane — but that is a different
+            # quantity from the one asked for, and a silent substitution here
+            # would be read as the segment volume.
+            print("  Markers: 1 valid — cut mode 'span' asks for the segment "
+                  "BETWEEN two planes, but only one survived the gates. "
+                  "Cutting on it alone (keep below); this is NOT a span "
+                  "measurement.")
 
         # Also publish the planes in LEVELLED space. cutting_line.json is written
         # pre-levelling, but leg_no_cut.ply is post-levelling, so the two do not
         # share a frame — anything drawing them together (a UI, a debug viewer)
         # needs this version, and "height along Z" only means something here.
+        #
+        # "markers" keeps its meaning byte for byte — the planes this run cut on
+        # — because Stage 6 reads it to report a circumference per cutting
+        # plane, and a candidate that did not cut has no cut face to measure.
+        # "candidates" is additive: every gated survivor, lowest first.
         with open(os.path.join(debug_dir_out, "cutting_line_levelled.json"), "w") as _f:
-            _json.dump({"markers": markers_rotated, "space": "levelled"}, _f, indent=2)
+            _json.dump({"markers": markers_rotated,
+                        "candidates": candidates,
+                        "cut_mode": mode,
+                        "space": "levelled"}, _f, indent=2)
 
     # Publish the levelling rotation itself. Stage 1's pointmap lives in the
     # unlevelled frame while every exported cloud and mesh lives in this one, so
@@ -598,8 +761,14 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
                                     "npts": int(m.get("npts", 0))})
         print(f"Markers: {len(markers_rotated)} supplied by review "
               f"(detection found {len(markers)})")
+        # Detection's candidates travel with the review's choice. The review
+        # copy is what the UI reloads after an edit, so dropping them here would
+        # lose the detected bands the moment the user cut once — the reviewer
+        # could no longer put back a plane they had removed.
         with open(os.path.join(debug_dir_out, "cutting_line_review.json"), "w") as _f:
-            _json.dump({"markers": markers_rotated, "space": "levelled",
+            _json.dump({"markers": markers_rotated,
+                        "candidates": candidates,
+                        "space": "levelled",
                         "source": "review"}, _f, indent=2)
 
     # ── Close whatever the cut actually leaves open ──
@@ -644,18 +813,41 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
                     .astype(np.uint8) if p.has_colors() else cols)
         return out_pts, out_cols
 
-    # The cut operates on the OPEN cloud — floor-cut but not yet floor-closed —
-    # and only then closes what the cut leaves open. Saving it is what lets a
-    # deferred cut reproduce this pass exactly instead of approximating it by
-    # cutting the closed cloud, which carries a fabricated skirt the real path
-    # never cuts through.
-    _quick_save_ply(leg_pts_rot, leg_cols_arr,
-                    os.path.join(objects_dir, "leg_open.ply"))
+    def _close_top(pts, cols):
+        """Cap the limb's open upper end, the way the bottom is capped.
 
-    # Complete but uncut — the review cloud. Always floor-closed.
+        The limb does not end at the top; the reconstruction simply stops where
+        the frame did, leaving an open tube. Poisson wants a closed surface, and
+        on an open one it returns chi=-2 -- not a single closed solid -- which
+        sends Stage 4 to its alpha-shape fallback. That ladder has to open to 40x
+        point spacing before it seals, and a wrap that loose reads volume high:
+        it is what put inputs/sunshine 10% over its displacement volume.
+
+        This did not arise while Stage 3 cut the cloud, because Stage 4 then only
+        ever saw a limb whose top was the cut face, already capped. Now that the
+        UNCUT limb is what gets reconstructed, its top has to be closed here.
+        """
+        if not fill_enabled or len(pts) == 0:
+            return pts, cols
+        height_index = {"x": 0, "y": 1, "z": 2}[segment_height_axis]
+        plane_normal = [0.0, 0.0, 0.0]
+        plane_normal[height_index] = 1.0
+        top_height = float(np.asarray(pts)[:, height_index].max())
+        plane_point = [0.0, 0.0, 0.0]
+        plane_point[height_index] = top_height
+        return cap_points_on_plane(pts, cols, plane_point, plane_normal,
+                                   label="limb top")
+
+    # The complete limb, closed at both ends. Stage 3 publishes exactly one limb
+    # cloud now: the open/closed pair existed only because the cut used to happen
+    # here and had to run on the open cloud before closing what it left open. The
+    # cut is applied to Stage 5's solid instead, so there is nothing left to
+    # sequence around -- but the limb must now be closed at the top as well as
+    # the bottom, because it is reconstructed uncut.
     nc_pts, nc_cols = _close_to_floor(leg_pts_rot, leg_cols_arr)
-    _quick_save_ply(nc_pts, nc_cols, leg_no_cut_path)
-    print(f"Saved (complete, uncut): {leg_no_cut_path} ({len(nc_pts):,} pts)")
+    nc_pts, nc_cols = _close_top(nc_pts, nc_cols)
+    _quick_save_ply(nc_pts, nc_cols, leg_path)
+    print(f"Saved (complete limb): {leg_path} ({len(nc_pts):,} pts)")
 
     n_markers = len(markers_rotated)
     if apply_cut and n_markers > 0 and len(leg_pts_rot) > 0:
@@ -694,14 +886,16 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     box_path = os.path.join(objects_dir, "box.ply")
     merged_path = os.path.join(objects_dir, "merged.ply")
 
-    # leg_cut + box
+    # the limb + box
     #
-    # With the cut deferred there is deliberately no leg_cut.ply. Writing the
-    # uncut cloud under that name would send stages 4-6 off to reconstruct and
-    # integrate a limb whose extent nobody has agreed to yet, and every second
-    # of that is thrown away the moment the cut is confirmed. The reference cube
-    # still goes through, because its measurement does not depend on the cut and
-    # the review needs its edge length to show anything in centimetres.
+    # Stage 3 no longer cuts: it hands the UNCUT limb forward so Stage 4 can
+    # reconstruct it and Stage 5 can cut the resulting solid. That is what puts a
+    # surface in front of the person placing the cut, instead of a point cloud,
+    # and it leaves no reconstruction step between the cut and the measurement.
+    #
+    # No leg_cut.ply is written here in either case. Stage 6 measures the cut
+    # solid Stage 5 produces, so a cut cloud under that name would be a second,
+    # unmeasured answer to the same question.
     output_paths = []
     if apply_cut and len(o3d_leg.points) > 0:
         o3d.io.write_point_cloud(leg_cut_path, o3d_leg)
@@ -710,7 +904,9 @@ def _segment_and_export(dense_ply, output_dir, num_objects=2, seed=42,
     elif not apply_cut:
         if os.path.exists(leg_cut_path):
             os.remove(leg_cut_path)   # a stale one would be measured instead
-        print("Deferred: leg_cut.ply not written — awaiting the confirmed cut")
+        if os.path.exists(leg_path):
+            output_paths.append(leg_path)
+        print("Stage 3 deferred the cut — passing the uncut limb to Stage 4")
     if len(o3d_box.points) > 0:
         o3d.io.write_point_cloud(box_path, o3d_box)
         output_paths.append(box_path)
@@ -758,8 +954,9 @@ def _array_to_o3d(points, colors_uint8):
 
 def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
                       segment_leg=False, segment_height_axis="z",
-                      fill_enabled=True, clean_ply_path=None, apply_cut=True,
-                      marker_colour=None, override_planes=None):
+                      fill_enabled=True, clean_ply_path=None, apply_cut=False,
+                      marker_colour=None, override_planes=None, cut_mode=None,
+                      n_bands=None, band_planes=None):
     """Pipeline wrapper. clean_ply_path is accepted for call-site compatibility
     and ignored — Stage 3 derives its own ghost-filtered clouds from ply_path."""
     print()
@@ -780,6 +977,9 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
             apply_cut=apply_cut,
             marker_colour=marker_colour,
             override_planes=override_planes,
+            cut_mode=cut_mode,
+            n_bands=n_bands,
+            band_planes=band_planes,
         )
         print(f"  Extracted {len(object_paths)} objects:")
         for p in object_paths:
@@ -791,100 +991,3 @@ def clean_and_extract(ply_path, output_dir, num_objects=2, seed=42,
         print(f"  ERROR during stage 3: {e}")
         return None
 
-
-def cut_only(stage3_dir, planes, fill_enabled=True):
-    """Apply confirmed cutting planes to a stage 3 output that deferred its cut.
-
-    This is the second half of a split Stage 3. The first half did all the
-    expensive work — SOR, RANSAC, DBSCAN, ghost filtering, MLS, levelling,
-    marker detection — and saved the levelled limb in the exact state the cut
-    operates on (`leg_open.ply`: floor-cut, not yet floor-closed). None of that
-    depends on where the cut goes, so none of it is repeated here.
-
-    The steps below are the same ones, in the same order, that
-    `_segment_and_export` runs after its own detection. They have to be: the
-    whole point of splitting is that confirming the detected plane must give
-    the identical answer to never having split at all.
-
-    `planes` are {"centroid", "normal"} in LEVELLED space. An empty list means
-    the user chose to measure the object whole.
-    """
-    import json as _json
-
-    objects_dir = os.path.join(stage3_dir, "objects")
-    debug_dir_out = os.path.join(stage3_dir, "debug")
-    open_path = os.path.join(objects_dir, "leg_open.ply")
-    box_path = os.path.join(objects_dir, "box.ply")
-    if not os.path.exists(open_path):
-        raise SystemExit(
-            f"ERROR: {open_path} missing — run stage 3 with --no-cut first, so "
-            f"there is a detected-but-uncut result to apply a cut to")
-
-    with open(os.path.join(debug_dir_out, "levelling.json")) as f:
-        floor_z = _json.load(f).get("floor_z")
-
-    pcd = o3d.io.read_point_cloud(open_path)
-    pts = np.asarray(pcd.points, dtype=np.float32)
-    cols = ((np.clip(np.asarray(pcd.colors, dtype=np.float32), 0, 1) * 255)
-            .astype(np.uint8) if pcd.has_colors() else None)
-    print(f"Loaded uncut limb: {len(pts):,} pts")
-
-    markers = []
-    for m in list(planes)[:MAX_MARKERS]:
-        n = np.asarray(m["normal"], dtype=np.float64)
-        n = n / (np.linalg.norm(n) + 1e-8)
-        markers.append({"centroid": np.asarray(m["centroid"], dtype=np.float64).tolist(),
-                        "normal": n.tolist(), "npts": int(m.get("npts", 0))})
-
-    def _close_to_floor(p_pts, p_cols):
-        if not fill_enabled or floor_z is None or len(p_pts) == 0:
-            return p_pts, p_cols
-        p = _array_to_o3d(p_pts, p_cols)
-        p = extend_point_cloud_to_floor(p, floor_z, label="obj")
-        p = cap_point_cloud_bottom(p, alpha=2.0)
-        out = np.asarray(p.points, dtype=np.float32)
-        oc = ((np.clip(np.asarray(p.colors, dtype=np.float32), 0, 1) * 255)
-              .astype(np.uint8) if p.has_colors() else p_cols)
-        return out, oc
-
-    if markers:
-        keep, case = apply_marker_cut(pts.astype(np.float64), markers)
-        if int(keep.sum()) >= 50:
-            pts, cols = pts[keep], (None if cols is None else cols[keep])
-            print(f"Marker cut ({case}): leg → {len(pts):,} pts")
-            if fill_enabled:
-                for i, mr in enumerate(markers):
-                    pts, cols = cap_points_on_plane(pts, cols, mr["centroid"],
-                                                    mr["normal"], label=f"marker {i}")
-                pts = pts.astype(np.float32)
-            if len(markers) < 2:
-                pts, cols = _close_to_floor(pts, cols)
-        else:
-            print(f"Marker cut ({case}): only {int(keep.sum())} pts (< 50) — "
-                  f"keeping the whole limb")
-            pts, cols = _close_to_floor(pts, cols)
-    else:
-        print("No cutting planes supplied — measuring the limb whole")
-        pts, cols = _close_to_floor(pts, cols)
-
-    with open(os.path.join(debug_dir_out, "cutting_line_review.json"), "w") as f:
-        _json.dump({"markers": markers, "space": "levelled", "source": "review"},
-                   f, indent=2)
-
-    leg_cut_path = os.path.join(objects_dir, "leg_cut.ply")
-    o3d_leg = _array_to_o3d(pts, cols)
-    o3d.io.write_point_cloud(leg_cut_path, o3d_leg)
-    print(f"Saved: {leg_cut_path} ({len(pts):,} pts)")
-
-    out = [leg_cut_path]
-    if os.path.exists(box_path):
-        out.append(box_path)
-        box = o3d.io.read_point_cloud(box_path)
-        merged = o3d.geometry.PointCloud()
-        merged.points = o3d.utility.Vector3dVector(
-            np.vstack([np.asarray(o3d_leg.points), np.asarray(box.points)]))
-        if o3d_leg.has_colors() and box.has_colors():
-            merged.colors = o3d.utility.Vector3dVector(
-                np.vstack([np.asarray(o3d_leg.colors), np.asarray(box.colors)]))
-        o3d.io.write_point_cloud(os.path.join(objects_dir, "merged.ply"), merged)
-    return out

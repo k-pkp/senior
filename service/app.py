@@ -86,7 +86,14 @@ ARTIFACTS = {
     "scene_mesh.ply":   ["05_watertight/mesh/scene_colour.ply",
                          "05_watertight/mesh/scene.ply",
                          "04_recon/mesh/scene_recon.ply"],
-    "leg_no_cut.ply":   ["03_clean/objects/leg_no_cut.ply"],
+    # The uncut limb the review screen draws and the surgeon places the cut
+    # on. Stage 5's watertight solid comes first: a surface is far easier to
+    # place a cut on than a point cloud, and it is the same geometry Stage 5
+    # actually cuts. The Stage 3 cloud remains as a fallback for jobs measured
+    # before the cut moved.
+    "leg_no_cut.ply":   ["05_watertight/mesh/leg_no_cut.ply",
+                         "03_clean/objects/leg.ply",
+                         "03_clean/objects/leg_no_cut.ply"],
     "volumes.csv":      ["06_volume/volumes.csv"],
     # The levelled file, never the other one: cutting_line.json is written
     # before levelling while every mesh is written after, so the two do not
@@ -95,6 +102,12 @@ ARTIFACTS = {
     "cutting_line.json": ["03_clean/debug/cutting_line_review.json",
                           "03_clean/debug/cutting_line_levelled.json"],
     "prep/framing.json": ["00_prep/framing.json"],
+    # What the image-cut view needs to line the mesh up with a photograph:
+    # VGGT's per-frame camera, and the rotation Stage 3 levelled the scene by.
+    # Together they take a levelled mesh vertex back to pixel coordinates in the
+    # frame VGGT actually saw.
+    "cameras.json":     ["01_inference/raw/cameras.json"],
+    "levelling.json":   ["03_clean/debug/levelling.json"],
 }
 
 
@@ -102,21 +115,25 @@ class RunRequest(BaseModel):
     # True refuses to measure a set stage 0 rejected. False is the user
     # overruling that after seeing the overlays — the pipeline still runs, but
     # VGGT does its own centre crop on the frames we could not frame.
+    """Body of a run request. `strict` False lets the user overrule Stage 0's rejection."""
     strict: bool = True
 
 
 class Plane(BaseModel):
+    """One cutting plane, as the review UI sends it back: centroid, normal, supporting point count."""
     centroid: tuple[float, float, float]
     normal: tuple[float, float, float]
     npts: int = 0
 
 
 class RecutRequest(BaseModel):
+    """Body of a recut request: the planes the user confirmed or moved."""
     planes: list[Plane] = []
 
 
 @app.get("/health")
 def health():
+    """Liveness probe. Returns ok plus the current queue depth."""
     return {"ok": True, "queue": REGISTRY.depth()}
 
 
@@ -165,6 +182,7 @@ async def create_job(files: list[UploadFile] = File(...)):
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
+    """Returns the job's current state, stage, and framing verdict."""
     job = _lookup(job_id)
     return {
         "job_id": job.id,
@@ -228,8 +246,10 @@ def run_job(job_id: str, req: RunRequest):
 def recut(job_id: str, req: RecutRequest):
     """Re-measure with cutting planes the user placed.
 
-    Stages 3-6 only. Stage 1's predictions.npz is already on disk and is by far
-    the expensive part, so an edit costs seconds rather than a whole run.
+    Stages 5-6 only. The cut is applied to the watertight solid Stage 5 already
+    built, so an edit re-runs neither the segmentation nor the surface
+    reconstruction -- measured at about 7 seconds against the whole of stages
+    3-6 before. Nothing before Stage 5 depends on where the planes go.
     """
     job = _lookup(job_id)
     if not job.measured or job.state not in ("awaiting-cut", "done", "failed"):
@@ -246,16 +266,24 @@ def recut(job_id: str, req: RecutRequest):
         json.dump({"markers": [p.model_dump() for p in req.planes],
                    "space": "levelled"}, f, indent=2)
 
-    # --cut-only reuses everything the measuring pass already computed: the
-    # levelled, filtered limb is on disk exactly as the cut operates on it, and
-    # nothing before the cut depends on where the planes go.
-    REGISTRY.submit(job, "3-6", ["--cut-only", "--planes", path],
+    # Stage 5 holds the repaired solid, so the cut is a plane slice on geometry
+    # that already exists. Everything before it -- segmentation, marker
+    # detection, reconstruction -- is independent of where the planes go and is
+    # not repeated.
+    REGISTRY.submit(job, "5-6", ["--planes", path],
                     running_state="running", done_state="done")
     return {"job_id": job.id, "state": "queued", "planes": len(req.planes)}
 
 
 @app.get("/jobs/{job_id}/files/{path:path}")
 def get_file(job_id: str, path: str):
+    """Serves one named artifact from the job directory.
+
+    The requested name is mapped through ARTIFACTS rather than used as a path,
+    and every resolved path is checked to be inside the job directory, so a
+    crafted name cannot escape it. Responses are marked no-store because a
+    recut rewrites these files in place.
+    """
     job = _lookup(job_id)
     root = os.path.realpath(job.dir)
 
@@ -283,6 +311,7 @@ def get_file(job_id: str, path: str):
 
 
 def _lookup(job_id: str) -> Job:
+    """Returns the job, or raises 404 if there is no such job."""
     job = REGISTRY.get(job_id)
     if job is None:
         raise HTTPException(404, "no such job")

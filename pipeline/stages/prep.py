@@ -56,13 +56,33 @@ MARKER_CM = 6.3
 # on a capture with no cord its best candidate is the leg. Measured band/limb
 # area ratios: real bands on inputs/small_leg 0.04-0.07; false positives on
 # inputs/est_325 1.23 and inputs/short_leg 2.19-2.91. 0.35 is five times the
-# largest real band and a third of the smallest false one. See _band_bbox.
+# largest real band and a third of the smallest false one. See _band_bboxes.
 BAND_MAX_LIMB_FRAC = 0.35
+
+# Most marker bands one capture can wear. Two is what a cut can use: one plane
+# keeps what is below it, two keep what lies between them, and a third can only
+# contradict one of those (core/segmentation.py:MAX_MARKERS). Detecting more
+# than two would give the review a choice the pipeline cannot act on.
+MAX_BANDS = 2
+
+# Two band boxes whose centres sit closer than this, as a fraction of the limb
+# box's height, are the same cord. IoU suppression in vlm_detect removes boxes
+# that overlap; this removes the ones that do not overlap but still cannot be
+# two cords -- a box on the cord and a box on the shadow immediately under it.
+#
+# 0.12 is a geometric floor rather than a measured separation, and it is stated
+# that way because no capture in hand has yielded two detected bands to measure
+# one from. What it is derived from: a cord's own box is 47-104 px tall on the
+# 1477 px frames of inputs/sunshine2, which is 0.03-0.08 of the limb box, so a
+# second box within 0.12 of the first is inside a cord-width of it and cannot be
+# a separately tied cord. A person ties an upper and a lower band at the two
+# ends of the segment being measured, which is most of the limb apart.
+BAND_MIN_SEPARATION_FRAC = 0.12
 
 # Pad around the limb box before running the band detector on a crop of it. The
 # band sits at the leg's edge, so a tight box would cut it off, and the pad keeps
 # the leg context the prompt ("on the leg") relies on. As a fraction of the box's
-# larger side. See _band_bbox.
+# larger side. See _band_bboxes.
 BAND_CROP_PAD_FRAC = 0.2
 
 # What fraction of the submitted frames must independently show the band before
@@ -178,6 +198,7 @@ def _frame_verdict(cube_seen, band_seen, cube_ok, band_ok):
     notes, severity, verdict = [], None, PASS
 
     def escalate(level, note, sev):
+        """Records a note and raises the run's verdict to the given level if it is worse."""
         nonlocal verdict, severity
         notes.append(note)
         if _VERDICT_RANK[level] > _VERDICT_RANK[verdict]:
@@ -290,7 +311,7 @@ def _mask_bbox(mask):
     return np.array([cols[0], rows[0], cols[-1], rows[-1]], dtype=float)
 
 
-def _debug_overlay(img, window, cube, band, ok, mode, notes, max_side=1200,
+def _debug_overlay(img, window, cube, bands, ok, mode, notes, max_side=1200,
                    effective=None, limb=None, verdict=None):
     """Annotated copy of the source frame, for inspection only.
 
@@ -309,6 +330,7 @@ def _debug_overlay(img, window, cube, band, ok, mode, notes, max_side=1200,
     out = img.copy()
 
     def rect(box, colour, thickness):
+        """Draws one debug rectangle onto the overlay image. Does nothing for a missing box."""
         if box is None:
             return
         p0 = (int(round(box[0])), int(round(box[1])))
@@ -330,7 +352,13 @@ def _debug_overlay(img, window, cube, band, ok, mode, notes, max_side=1200,
     # you cannot tell whether the detector found the wrong thing or nothing.
     rect(limb, (0, 140, 255), 6)         # limb
     rect(cube, (255, 0, 255), 8)         # reference cube
-    rect(band, (0, 255, 0), 8)           # marker band
+    # Every band, numbered from the top. A pair drawn without labels is hard to
+    # read back against the log line, which counts them.
+    for band_index, band in enumerate(bands or []):
+        rect(band, (0, 255, 0), 8)       # marker band
+        cv2.putText(out, f"band {band_index + 1}",
+                    (int(round(band[0])), max(14, int(round(band[1])) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     scale = max_side / float(max(out.shape[:2]))
     if scale < 1.0:
@@ -399,8 +427,8 @@ def _leg_mask(image_pil, cube):
     return mask, box
 
 
-def _band_bbox(image_pil, bgr, leg_box, limb_mask=None):
-    """The marker band, located by description rather than by colour.
+def _band_bboxes(image_pil, bgr, leg_box, limb_mask=None):
+    """Every marker band on the limb, located by description rather than colour.
 
     The previous rule was 2G - R - B > 10, which encodes one khaki band: its own
     config notes that raising the threshold lost the only marker in the dataset,
@@ -408,7 +436,17 @@ def _band_bbox(image_pil, bgr, leg_box, limb_mask=None):
     band works whatever colour it is -- measured on inputs/small_leg it is found
     on 6 of 6 frames at 0.81-0.84, including both frames the colour rule missed.
 
-    Two guards, and the second was added after it went wrong:
+    Plural, because the count is a fact about the capture and not a detail of
+    the detector. Taking the detector's best box alone cannot tell a limb
+    wearing one band from a limb wearing two, so a two-band subject was framed
+    around whichever band scored higher: the crop window was sized to hold that
+    one, and the other could fall outside it with nothing said. What the count
+    then means is decided downstream -- one band bounds the limb from above,
+    two bound a segment between them.
+
+    Boxes come back best-score first with duplicates already suppressed by IoU
+    (`core/vlm_detect.py:detect_all`), and each must pass three guards, of which
+    the first two were measured on captures that got them wrong:
 
     1. The box must overlap the limb, so a band-like object elsewhere in the
        scene cannot win.
@@ -416,6 +454,10 @@ def _band_bbox(image_pil, bgr, leg_box, limb_mask=None):
        detector always returns its best candidate for "cord", and on a capture
        with no cord at all its best candidate is the leg itself -- which passes
        guard 1 trivially, because the leg is entirely on the leg.
+    3. It must sit clear of the bands already accepted. IoU suppression removes
+       boxes that overlap; two boxes on one cord need not overlap -- the cord
+       and the shadow under it are a real pair -- and counting those as two
+       bands would put every one-band capture into a two-band cut.
 
     Guard 2 is measured, not guessed. Band area as a fraction of the limb's mask
     area, over three datasets:
@@ -426,7 +468,7 @@ def _band_bbox(image_pil, bgr, leg_box, limb_mask=None):
 
     A cord tied around a limb cannot be larger than the limb. BAND_MAX_LIMB_FRAC
     sits at 0.35 -- five times the largest real band seen, and a third of the
-    smallest false positive.
+    smallest false one.
 
     What this cost before it was fixed: on inputs/short_leg the hallucinated band
     inflated the crop window until nothing fit, and Stage 0 rejected 5 of 8
@@ -434,40 +476,59 @@ def _band_bbox(image_pil, bgr, leg_box, limb_mask=None):
     `trace_band_colour` a box that is mostly skin, so the "band" colour handed to
     Stage 3 was the limb's own colour -- leaving the discriminant with no
     contrast to separate them by.
+
+    Returns a list of boxes, topmost in the frame first, at most MAX_BANDS long.
     """
-    box, score = vlm.detect(image_pil, vlm.BAND_PROMPT)
+    found = []
     if leg_box is not None:
-        # Re-run on a padded crop of the limb. The full-image pass is the
-        # fallback: it keeps distractors (a houseplant, another limb) in view,
-        # and cropping removes them. The crop is padded, not tight, so the band
-        # at the leg's edge survives and the "on the leg" context is retained.
+        # Prefer a padded crop of the limb. The full-image pass is the fallback:
+        # it keeps distractors (a houseplant, another limb) in view, and cropping
+        # removes them. The crop is padded, not tight, so a band at the leg's
+        # edge survives and the "on the leg" context the prompt relies on is
+        # retained.
         crop_box = _grow(leg_box, BAND_CROP_PAD_FRAC)
         l, t = int(max(0, crop_box[0])), int(max(0, crop_box[1]))
         r, b = int(min(image_pil.size[0], crop_box[2])), int(min(image_pil.size[1], crop_box[3]))
         if r - l > 16 and b - t > 16:
-            cbox, cscore = vlm.detect(image_pil.crop((l, t, r, b)), vlm.BAND_PROMPT)
-            if cbox is not None:
-                box = [cbox[0] + l, cbox[1] + t, cbox[2] + l, cbox[3] + t]
-                score = cscore
-    if box is None:
-        return None
-    if leg_box is not None:
-        # Must overlap the limb it is supposed to be on.
-        ix0, iy0 = max(box[0], leg_box[0]), max(box[1], leg_box[1])
-        ix1, iy1 = min(box[2], leg_box[2]), min(box[3], leg_box[3])
-        inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
-        area = max(1e-6, (box[2] - box[0]) * (box[3] - box[1]))
-        if inter / area < 0.5:
-            return None
-    if limb_mask is not None and limb_mask.any():
-        band_area = (box[2] - box[0]) * (box[3] - box[1])
-        ratio = band_area / float(limb_mask.sum())
-        if ratio > BAND_MAX_LIMB_FRAC:
-            print(f"  band rejected: {ratio:.2f}x the limb's area "
-                  f"(max {BAND_MAX_LIMB_FRAC}) — the detector returned the limb, "
-                  f"not a cord on it")
-            return None
-    return np.array(box, dtype=float)
+            found = [([cb[0] + l, cb[1] + t, cb[2] + l, cb[3] + t], cs)
+                     for cb, cs in vlm.detect_all(image_pil.crop((l, t, r, b)),
+                                                  vlm.BAND_PROMPT)]
+    if not found:
+        found = vlm.detect_all(image_pil, vlm.BAND_PROMPT)
+
+    limb_height = None if leg_box is None else float(leg_box[3] - leg_box[1])
+    kept = []
+    for box, score in found:
+        if len(kept) >= MAX_BANDS:
+            break
+        if leg_box is not None:
+            # Must overlap the limb it is supposed to be on.
+            ix0, iy0 = max(box[0], leg_box[0]), max(box[1], leg_box[1])
+            ix1, iy1 = min(box[2], leg_box[2]), min(box[3], leg_box[3])
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            area = max(1e-6, (box[2] - box[0]) * (box[3] - box[1]))
+            if inter / area < 0.5:
+                continue
+        if limb_mask is not None and limb_mask.any():
+            band_area = (box[2] - box[0]) * (box[3] - box[1])
+            ratio = band_area / float(limb_mask.sum())
+            if ratio > BAND_MAX_LIMB_FRAC:
+                print(f"  band rejected: {ratio:.2f}x the limb's area "
+                      f"(max {BAND_MAX_LIMB_FRAC}) — the detector returned the limb, "
+                      f"not a cord on it")
+                continue
+        if limb_height and limb_height > 0 and kept:
+            centre = (box[1] + box[3]) / 2.0
+            too_close = min(abs(centre - (k[1] + k[3]) / 2.0) for k in kept)
+            if too_close < BAND_MIN_SEPARATION_FRAC * limb_height:
+                print(f"  band merged: {too_close / limb_height:.2f} of the limb's "
+                      f"height from a stronger box (min "
+                      f"{BAND_MIN_SEPARATION_FRAC}) — the same cord seen twice")
+                continue
+        kept.append(box)
+
+    kept.sort(key=lambda b: b[1])
+    return [np.array(b, dtype=float) for b in kept]
 
 
 def _square_window(union, shape, cube, pad=PAD_FRAC,
@@ -534,7 +595,8 @@ def _box_fits_inside(window, box, margin_frac):
                 and box[3] <= window[3] - margin + tolerance)
 
 
-def _average_band_colour(per_frame_colours, total_frames=None, min_frac=None):
+def _average_band_colour(per_frame_colours, total_frames=None, min_frac=None,
+                         frames_with_band=None):
     """One marker colour for the capture, from the per-frame traces.
 
     Median rather than mean across frames: a frame where the trace wandered off
@@ -547,15 +609,23 @@ def _average_band_colour(per_frame_colours, total_frames=None, min_frac=None):
     returned, so Stage 3 falls back to finding no band at all. For a capture
     with no band that is the right answer, and it is safe besides: the cut is
     placed by a person in the review step either way.
+
+    `frames_with_band` counts FRAMES, where `per_frame_colours` now counts
+    traces: a two-band capture contributes two colours per frame, and comparing
+    that against the frame count would let a single frame showing two bands
+    corroborate itself. The rule asks whether most of the capture agrees, so it
+    has to be given frames.
     """
     if not per_frame_colours:
         return None
     if total_frames:
         frac = BAND_MIN_FRAME_FRAC if min_frac is None else min_frac
         needed = int(math.ceil(frac * total_frames))
-        if len(per_frame_colours) < needed:
+        seen = (len(per_frame_colours) if frames_with_band is None
+                else frames_with_band)
+        if seen < needed:
             print(f"  marker colour DISCARDED: the band was found on "
-                  f"{len(per_frame_colours)} of {total_frames} frames, and "
+                  f"{seen} of {total_frames} frames, and "
                   f"{needed} are needed ({frac:.0%}) to corroborate it. A "
                   f"minority detection is not evidence — Stage 3 will look for "
                   f"no band, and the cut is placed by hand.")
@@ -581,6 +651,31 @@ def _average_band_colour(per_frame_colours, total_frames=None, min_frac=None):
         "hsv": per_frame_colours[len(per_frame_colours) // 2]["hsv"],
         "n_frames": len(per_frame_colours),
     }
+
+
+def _capture_band_count(per_frame_counts, total_frames=None, min_frac=None):
+    """How many bands this capture wears, from the per-frame counts.
+
+    The same corroboration rule the colour uses, asked of the count: a capture
+    wears two bands when most of its frames saw two. Deciding from a single
+    frame would let one duplicate detection turn a below-the-band measurement
+    into a between-the-bands one, which is not a small difference -- it is a
+    different quantity, and nothing downstream could tell it had happened.
+
+    Frames where a band is occluded by the limb itself are normal, which is why
+    the bar is a fraction of the frames and not all of them.
+    """
+    if not per_frame_counts:
+        return 0
+    frac = BAND_MIN_FRAME_FRAC if min_frac is None else min_frac
+    total = len(per_frame_counts) if total_frames is None else total_frames
+    if total <= 0:
+        return 0
+    needed = int(math.ceil(frac * total))
+    for n in range(MAX_BANDS, 0, -1):
+        if sum(1 for c in per_frame_counts if c >= n) >= needed:
+            return n
+    return 0
 
 
 def _write_frame_for_vggt(image, window, should_crop, output_size, out_path):
@@ -649,38 +744,45 @@ def _locate_subject(image_bgr, image_pil):
     whose band detects perfectly well at 0.74 confidence -- it had simply never
     been looked for. They are independent measurements and are taken as such.
 
-    Returns (cube face quads, cube box, limb mask, band box, band colour).
+    Returns (cube face quads, cube box, limb mask, band boxes, band colours).
+    Bands come back topmost first, and each has its own traced colour: a capture
+    can wear two cords, and nothing guarantees they are the same colour.
     """
     grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     face_quads = _cube_faces(grey)
     cube_box = _cube_bbox(grey, image_pil)
 
     limb_mask, limb_box = _leg_mask(image_pil, cube_box)
-    band_box = _band_bbox(image_pil, image_bgr, limb_box, limb_mask)
+    band_boxes = _band_bboxes(image_pil, image_bgr, limb_box, limb_mask)
 
-    band_colour = None
-    if band_box is not None:
-        band_colour = vlm.trace_band_colour(image_bgr, band_box)
-    return face_quads, cube_box, limb_mask, band_box, band_colour
+    band_colours = [vlm.trace_band_colour(image_bgr, b) for b in band_boxes]
+    band_colours = [c for c in band_colours if c]
+    return face_quads, cube_box, limb_mask, band_boxes, band_colours
 
 
-def _subject_bounds(cube_box, band_box, limb_mask, band_heights, pad):
-    """The region a crop has to keep: the cube, the band, and the limb between.
+def _subject_bounds(cube_box, band_boxes, limb_mask, band_heights, pad):
+    """The region a crop has to keep: the cube, the bands, and the limb between.
 
-    The limb is included only over the span from the band down to the cube's
-    base. Its full mask reaches the thigh and the torso, and a square containing
-    those is larger than the photograph.
+    The limb is included only over the span from the topmost band down to the
+    cube's base. Its full mask reaches the thigh and the torso, and a square
+    containing those is larger than the photograph.
+
+    EVERY band goes into the union, not just the highest. A capture wearing an
+    upper and a lower band is measured between them, so a window that holds only
+    one of them crops away half of what is being measured — and the frame would
+    have passed the gate, because the gate checks the bands the window was built
+    from.
 
     When no band was found its height is estimated from the cube instead: the
     cube stands on the floor so its base fixes floor level and its height fixes
     the scale, and the band is tied at one place on the limb.
     """
     cube_height = cube_box[3] - cube_box[1]
-    band_top = (band_box[1] if band_box is not None
+    band_top = (min(float(b[1]) for b in band_boxes) if band_boxes
                 else cube_box[3] - band_heights * cube_height)
 
     bounds = _grow(cube_box, pad)
-    if band_box is not None:
+    for band_box in band_boxes:
         padded_band = _grow(band_box, pad)
         bounds = np.array([min(bounds[0], padded_band[0]),
                            min(bounds[1], padded_band[1]),
@@ -724,6 +826,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
     os.makedirs(debug_dir, exist_ok=True)
     records = []
     band_colours = []
+    band_counts = []
     print("=" * 60)
     print(f"STAGE 0: framing {len(paths)} frames  "
           f"(band={band_heights} cube heights, pad={pad:.0%}, "
@@ -744,7 +847,8 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
                 "index": frame_index + 1, "source": os.path.basename(path),
                 "overlay": None, "reasons": ["file unreadable — cannot be decoded"],
                 "output": None, "frame_size": None, "window": [0, 0, 0, 0],
-                "cube_bbox": None, "band_bbox": None, "clipped": False,
+                "cube_bbox": None, "band_bbox": None, "band_bboxes": [],
+                "clipped": False,
                 "offset_px": 0.0, "mode": "unreadable",
                 "cube_ok": False, "band_ok": False,
                 "cube_seen": False, "band_seen": False,
@@ -753,12 +857,13 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             continue
         frame_height, frame_width = img.shape[:2]
         image_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        faces, cube, leg, band, colour = _locate_subject(img, image_pil)
-        if colour:
-            band_colours.append(colour)
+        faces, cube, leg, bands, colours = _locate_subject(img, image_pil)
+        band = bands[0] if bands else None      # topmost, for the one-band paths
+        band_colours.extend(colours)
+        band_counts.append(len(bands))
 
         if cube is not None:
-            union = _subject_bounds(cube, band, leg, band_heights, pad)
+            union = _subject_bounds(cube, bands, leg, band_heights, pad)
             window, clipped = _square_window(union, (frame_height, frame_width),
                                              cube, pad,
                                              centre_on_subject)
@@ -782,6 +887,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
         # keep everything that matters. So: prefer our window, fall back to
         # VGGT's, and reject only when the reference survives neither.
         def _fits(window, box):
+            """Returns True when the box lies inside the window with the configured padding."""
             return _box_fits_inside(window, box, pad)
 
         visible_face_corners = np.concatenate(faces) if faces else None
@@ -796,20 +902,23 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
         # stage silently degraded to VGGT's own centre crop, which is the exact
         # failure Stage 0 exists to prevent. The stage's own rejection table has
         # always said a missing band "costs the cut, not the scale".
+        # Every band has to fit, not just the one the window was built around:
+        # a two-band capture is measured between its bands, so losing the lower
+        # one costs the measurement, not the suggestion.
         can_crop = (crop and cube is not None and len(faces) >= 1
                     and _fits(window, cube)
-                    and (band is None or _fits(window, band)))
+                    and all(_fits(window, b) for b in bands))
 
         vggt_win = _vggt_window(img.shape)
         # Uncropped is acceptable when whatever IS visible of the reference
         # survives VGGT's crop, and any band we found does too.
         can_pass_through = (_fits(vggt_win, visible_cube)
-                            and (band is None or _fits(vggt_win, band)))
+                            and all(_fits(vggt_win, b) for b in bands))
 
         usable = bool(can_crop or can_pass_through)
         cube_ok = bool(can_crop or _fits(vggt_win, visible_cube))
-        band_ok = bool(band is None or _fits(window if can_crop else vggt_win,
-                                                    band))
+        band_ok = bool(all(_fits(window if can_crop else vggt_win, b)
+                           for b in bands))
         if can_crop:
             mode = "crop-clipped" if clipped else "crop"
         elif can_pass_through:
@@ -826,13 +935,13 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             mode = f"{mode}->uncropped" if crop else "original"
 
         cube_seen = cube is not None
-        band_seen = band is not None
+        band_seen = len(bands) > 0
         verdict, notes, severity = _frame_verdict(cube_seen, band_seen,
                                                   cube_ok, band_ok)
         cv2.imwrite(
             os.path.join(debug_dir,
                          f"{frame_index:02d}_{os.path.splitext(os.path.basename(path))[0]}.png"),
-            _debug_overlay(img, window, cube, band, usable, mode, notes,
+            _debug_overlay(img, window, cube, bands, usable, mode, notes,
                            effective=(window if can_crop else vggt_win),
                            limb=_mask_bbox(leg), verdict=verdict))
 
@@ -846,7 +955,10 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             "frame_size": [frame_width, frame_height],
             "window": [left, top, right, bottom],
             "cube_bbox": None if cube is None else cube.tolist(),
+            # `band_bbox` is the topmost band, kept for consumers that predate
+            # multi-band detection; `band_bboxes` is all of them, topmost first.
             "band_bbox": None if band is None else band.tolist(),
+            "band_bboxes": [b.tolist() for b in bands],
             "clipped": bool(clipped),
             "offset_px": float(offset_from_centre_px), "mode": mode,
             "cube_ok": cube_ok, "band_ok": band_ok,
@@ -859,7 +971,10 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
               f"{('  [' + severity + ']') if severity else ''}"
               f"{('  ' + '; '.join(notes)) if notes else ''}")
 
-    marker_colour = _average_band_colour(band_colours, total_frames=len(records))
+    marker_colour = _average_band_colour(
+        band_colours, total_frames=len(records),
+        frames_with_band=sum(1 for c in band_counts if c > 0))
+    n_bands = _capture_band_count(band_counts, total_frames=len(records))
 
     # If the capture-level colour was discarded for want of corroboration, then
     # as far as the pipeline is concerned this capture has no band — and the one
@@ -867,10 +982,12 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
     # clean. Leaving them PASS tells a reviewer the band was fine on that frame,
     # which is the opposite of what was just decided.
     if marker_colour is None:
+        n_bands = 0
         for record in records:
             if record.get("band_seen"):
                 record["band_seen"] = False
                 record["band_bbox"] = None
+                record["band_bboxes"] = []
                 record["verdict"], record["reasons"], record["severity"] = (
                     _frame_verdict(record["cube_seen"], False,
                                    record["cube_ok"], True))
@@ -893,6 +1010,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
         "source": os.path.abspath(image_folder),
         "rejected": [r["source"] for r in bad],
         "marker_colour": marker_colour,
+        "bands": n_bands,
         "band_cube_heights": band_heights,
         "output_size": output_size,
         "pad_frac": pad,
@@ -915,6 +1033,10 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
         "warned": [r["source"] for r in warned],
         "rejected": [r["source"] for r in bad],
         "marker_colour": marker_colour,
+        # How many marker bands this capture wears, agreed across the frames.
+        # It is what a cut is bounded by: one band bounds the limb from above,
+        # two bound the segment between them.
+        "bands": n_bands,
         "frames": [{
             "index": r["index"],
             "source": r["source"],
@@ -927,6 +1049,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             "severity": r["severity"],
             "cube_seen": r["cube_seen"],
             "band_seen": r["band_seen"],
+            "bands_seen": len(r.get("band_bboxes") or []),
             "overlay": r["overlay"],
             "cropped": r["output"],
             # HOW the frame passed, not just whether. A frame can be accepted
@@ -945,6 +1068,12 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
     manifest["rejected_detail"] = [
         {"index": r["index"], "source": r["source"],
          "cube_ok": r["cube_ok"], "band_ok": r["band_ok"]} for r in bad]
+
+    if n_bands:
+        agreeing = sum(1 for c in band_counts if c >= n_bands)
+        print(f"  Bands: {n_bands} on {agreeing} of {len(records)} frames — "
+              f"{'the limb is measured BELOW this band' if n_bands == 1 else 'the limb is measured BETWEEN these bands'} "
+              f"unless --cut-mode says otherwise")
 
     if not band_colours:
         print("\n  WARNING: the marker band was not found on any frame. Stage 3 "
@@ -990,6 +1119,7 @@ def prepare_frames(image_folder, out_dir, band_heights=LIMB_BAND_CUBE_HEIGHTS,
             by_sev.setdefault(r["severity"], []).append(r)
 
         def _listing(rows):
+            """Prints one line per rejected frame, giving its index and source filename."""
             for r in rows:
                 print(f"    img{r['index']}  ({r['source']})")
             print()

@@ -34,19 +34,6 @@ def _extract_base_cloud(predictions, args):
     conf_thresh = adaptive_confidence_filter(conf_flat, args.conf_thres)
     conf_mask = (conf_raw >= conf_thresh) & (conf_raw > 1e-5)
 
-    # Multi-view consistency — the only filter that removes ghost sheets, which
-    # are parallel duplicates the geometric filters downstream cannot see.
-    from pipeline.config import MULTIVIEW_MIN_VIEWS, MULTIVIEW_REL_THRESHOLD
-    min_views = getattr(args, "multiview_min_views", MULTIVIEW_MIN_VIEWS)
-    if min_views and min_views > 0 and predictions.get("depth") is not None:
-        from pipeline.multiview import multiview_mask
-        mv = multiview_mask(world_points, predictions["depth"],
-                            predictions["extrinsic"], predictions["intrinsic"],
-                            min_views=min_views,
-                            rel_threshold=MULTIVIEW_REL_THRESHOLD)
-        before = int(conf_mask.sum())
-        conf_mask &= mv
-        print(f"    combined with confidence: {before:,} → {int(conf_mask.sum()):,}")
 
     if getattr(args, "mask_black_bg", False):
         brightness = colors_4d.reshape(-1, 3).astype(np.float32).mean(axis=1)
